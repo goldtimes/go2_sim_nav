@@ -1,0 +1,79 @@
+cmake_minimum_required(VERSION 3.16)
+
+project(lightning)
+
+# Default to C++17
+if (NOT CMAKE_CXX_STANDARD)
+    set(CMAKE_CXX_STANDARD 17)
+endif ()
+
+# set to release by default
+set(CMAKE_BUILD_TYPE Release)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# -------------------------------------------------------------
+# 导入第三方库，同时做一些全局编译选项配置
+add_definitions("-DPCL_NO_PRECOMPILE")
+# 关闭 spdlog 编译期级别门控（否则 DEBUG/TRACE 宏被编译为空，无法运行期配置）
+add_definitions("-DSPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE")
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC -fopenmp")
+#  Release 模式下不需要启用完整的调试符号（-g -ggdb），否则会卡在编译81%处并因内存耗尽而终止
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS} -O2")# -g -ggdb")
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS} -ggdb -g")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC")
+
+
+if (CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    add_compile_options(-Wall -Wextra -Wpedantic)
+endif ()
+
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/bin)
+# set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/libs)
+# set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/libs)
+
+list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
+include(cmake/packages.cmake)
+
+# msg 和 srv
+set(MY_MSG_FILES "")
+set(MSG_DIR ${PROJECT_SOURCE_DIR}/msg)
+file(GLOB_RECURSE MSG_SRC_FILES ${MSG_DIR}/*.msg)
+foreach (MSG_FILE ${MSG_SRC_FILES})
+    file(RELATIVE_PATH MSG_REL_PATH ${MSG_DIR} ${MSG_FILE})
+    list(APPEND MY_MSG_FILES ${PROJECT_SOURCE_DIR}:msg/${MSG_REL_PATH})
+endforeach ()
+
+set(MY_SRV_FILES "")
+set(SRC_DIR ${PROJECT_SOURCE_DIR}/srv)
+file(GLOB_RECURSE SRC_FILES ${SRC_DIR}/*.srv)
+foreach (SRC_FILE ${SRC_FILES})
+    file(RELATIVE_PATH REL_PATH ${SRC_DIR} ${SRC_FILE})
+    list(APPEND MY_SRV_FILES ${PROJECT_SOURCE_DIR}:srv/${REL_PATH})
+endforeach ()
+
+rosidl_generate_interfaces(${PROJECT_NAME}
+        ${MY_SRV_FILES}
+        ${MY_MSG_FILES}
+        ${MY_ACTION_FILES}
+        DEPENDENCIES std_msgs geometry_msgs sensor_msgs nav_msgs
+)
+
+include_directories(
+        ${CMAKE_CURRENT_BINARY_DIR}/rosidl_generator_cpp
+)
+
+install(DIRECTORY config
+        DESTINATION lib/${PROJECT_NAME}/
+)
+
+# launch 文件（ros2 launch lightning <name>.launch.py）
+install(DIRECTORY launch
+        DESTINATION share/${PROJECT_NAME}/
+)
+
+add_subdirectory(thirdparty/livox_ros_driver)
+
+add_subdirectory(src)
+
+ament_package()

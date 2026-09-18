@@ -1,0 +1,66 @@
+{
+  "session_name": "mobilebase",
+  "windows": [
+    {
+      "window_name": "dev window 1",
+      "layout": "tiled",
+      "shell_command_before": [
+        "source ~/r41_ws/install/setup.bash"
+      ],
+      "panes": [
+        {
+          "shell_command": [
+            "sleep 1"
+          ]
+        },
+        {
+          "shell_command": [
+            "sleep 4",
+            "ros2 launch lightning r41_online_slam.launch.py"
+          ]
+        },
+        {
+          "shell_command": [
+            "sleep 8",
+            "rviz2 -d ~/r41_ws/src/slam/lightning-lm/config/showbodypc.rviz"
+          ]
+        },
+        {
+          "shell_command": [
+            "# 数据回放（实车时不用）：取消注释后回车执行",
+            "# ros2 bag play ~/r41_ws/lio0902"
+          ]
+        }
+      ]
+    },
+    {
+      "window_name": "dev window 2",
+      "layout": "tiled",
+      "shell_command_before": [
+        "source ~/r41_ws/install/setup.bash"
+      ],
+      "panes": [
+        {
+          "shell_command": [
+            "# 定位模式：先在window1停掉slam再启动，避免slam/loc同时抢占点云",
+            "# ros2 launch lightning r41_online_loc.launch.py"
+          ]
+        },
+        {
+          "shell_command": [
+            "# 定位模式rviz",
+            "# rviz2 -d ~/r41_ws/src/slam/lightning-lm/config/showglobalmap.rviz"
+          ]
+        },
+        {
+          "shell_command": [
+            "# 保存轨迹: ros2 service call /lightning/save_path lightning/srv/SavePath \"{file_path: 'data/traj.txt'}\""
+          ]
+        },
+        {
+          "shell_command": []
+        }
+      ]
+    }
+  ]
+}

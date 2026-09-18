@@ -1,0 +1,10 @@
+# 设置定位初始位姿（base_link 在地图中的位姿；程序内部转成 IMU 系，经 NDT（必要时 xy+yaw 搜索）校验后初始化定位）
+# ros2 service call /lightning/set_initpose lightning/srv/SetInitPose "{x: 0.0, y: 0.0, z: 0.0, yaw: 0.0, z_valid: false}"
+float64 x       # 初始位置（map系，base_link）
+float64 y
+float64 z       # z；若 z_valid=false 则自动取参考高度（当前定位高度/地图起始功能点）
+float64 yaw     # 初始偏航角（rad，绕 map z 轴）
+bool z_valid    # false=自动取高
+---
+bool success      # 是否成功接受
+string message    # 结果说明

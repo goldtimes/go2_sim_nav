@@ -1,0 +1,69 @@
+{
+  "session_name": "mobilebase",
+  "windows": [
+    {
+      "window_name": "dev window 1",
+      "layout": "tiled",
+      "shell_command_before": [
+        "source ~/r41_ws/install/setup.bash",
+        "export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp",
+        "export CYCLONEDDS_URI=~/r41_ws/src/bringup/cyclonedds.xml"
+      ],
+      "panes": [
+        {
+          "shell_command": [
+            "sleep 1",
+            "ros2 launch gazebo_sim launch.py sensors:=true world:=warehouse.sdf"
+          ]
+        },
+        {
+          "shell_command": [
+            "sleep 8",
+            "# ros2 launch lightning go2_sim_slam.launch.py"
+          ]
+        },
+        {
+          "shell_command": [
+            "sleep 8",
+            "# rviz2 -d ~/r41_ws/src/slam/lightning-lm/config/showbodypc.rviz"
+          ]
+        },
+        {
+          "shell_command": [
+            "# 数据回放（实车时不用）：取消注释后回车执行",
+            "ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r /cmd_vel:=/robot1/cmd_vel"
+          ]
+        }
+      ]
+    },
+    {
+      "window_name": "dev window 2",
+      "layout": "tiled",
+      "shell_command_before": [
+        "source ~/r41_ws/install/setup.bash"
+      ],
+      "panes": [
+        {
+          "shell_command": [
+            "# 定位模式：先在window1停掉slam再启动，避免slam/loc同时抢占点云",
+            "# ros2 launch lightning r41_online_loc.launch.py"
+          ]
+        },
+        {
+          "shell_command": [
+            "# 定位模式rviz",
+            "# rviz2 -d ~/r41_ws/src/slam/lightning-lm/config/showglobalmap.rviz"
+          ]
+        },
+        {
+          "shell_command": [
+            "# 保存轨迹: ros2 service call /lightning/save_path lightning/srv/SavePath \"{file_path: 'data/traj.txt'}\""
+          ]
+        },
+        {
+          "shell_command": []
+        }
+      ]
+    }
+  ]
+}

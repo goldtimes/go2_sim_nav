@@ -1,0 +1,13 @@
+.venv
+.zcode
+build
+data
+go2_bag
+lio0902
+lio*
+install
+log
+src/pnc_3d/*
+src/slam/lio_slam
+result_cleaned.bt
+

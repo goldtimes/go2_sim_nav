@@ -1,0 +1,43 @@
+{
+    // 关闭微软C/C++插件的智能提示，交给clangd接管
+    "C_Cpp.intelliSenseEngine": "disabled",
+    "C_Cpp.autocomplete": "disabled",
+    "C_Cpp.errorSquiggles": "disabled",
+    // clangd可执行文件路径，PATH正常时可省略
+    // "clangd.path": "/usr/bin/clangd",
+    "clangd.arguments": [
+        "--compile-commands-dir=/home/gmd/r41_ws/build", // 指定编译命令目录，默认当前工作目录
+        "--background-index", // 后台建立全项目索引，大幅提升跳转速度
+        "--clang-tidy", // 开启静态代码检查
+        "--completion-style=detailed", // 详细的代码补全提示
+        "--header-insertion=never", // 自动建议添加头文件
+        "--all-scopes-completion", // 跨文件符号补全
+        "-j=4", // 索引线程数，根据CPU核心调整
+        "--log=error", // 日志等级，verbose可用于排错
+        // 编译数据库里用的是 /usr/bin/c++ 和 /usr/bin/cc（符号链接到 g++/gcc），
+        // 必须把这些也加入白名单，clangd 才能探测到标准库头文件路径，否则满屏红
+        "--query-driver=/usr/bin/g++,/usr/bin/c++,/usr/bin/gcc,/usr/bin/cc"
+    ],
+    // 使用clangd作为C++格式化工具
+    "[cpp]": {
+        "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd"
+    },
+    "[c]": {
+        "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd"
+    },
+    "editor.formatOnSave": true,
+    "todo-tree.ripgrep.ripgrep": "/usr/bin/rg",
+    "workbench.colorCustomizations": {
+        "activityBar.background": "#580D3B",
+        "titleBar.activeBackground": "#7B1252",
+        "titleBar.activeForeground": "#FFFCFD",
+        "titleBar.inactiveBackground": "#580D3B",
+        "titleBar.inactiveForeground": "#FFFCFD",
+        "statusBar.background": "#580D3B",
+        "statusBar.foreground": "#FFFCFD",
+        "statusBar.debuggingBackground": "#580D3B",
+        "statusBar.debuggingForeground": "#FFFCFD",
+        "statusBar.noFolderBackground": "#580D3B",
+        "statusBar.noFolderForeground": "#FFFCFD"
+    }
+}

@@ -1,0 +1,15 @@
+# 运行时切换地图
+#
+# ros2 service call /lightning/load_map lightning/srv/LoadMap "{map_path: '/home/gmd/rcs/maps/factory'}"
+#
+# 语义：accepted=true 表示请求已被受理（此时才开始换图），并不代表已经换完。
+# 完成与否看 lightning/map_state 话题（latched）：
+#   0 = kIdle   1 = kRunning（地图可用）   2 = kSwitching   3 = kError（地图不可用）
+#
+# 换图完成后定位**不会自动恢复**：lidar_loc_ 是全新对象，需要重新给初值
+# （rviz2 "2D Pose Estimate" 或 lightning/set_initpose）。
+# 期间 lightning/loc_state 会从 GOOD(2) 变成 INITIALIZING(1)，可作为“请给初值”的信号。
+string map_path        # 目标地图目录（含 index.txt 与 <id>.pcd）。空 = 用 yaml 的 system.map_path
+---
+bool accepted          # 是否受理（受理≠完成；完成看 lightning/map_state）
+string message         # 结果说明（预检失败原因 / 已受理的地图路径等）

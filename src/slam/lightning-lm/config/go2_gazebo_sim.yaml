@@ -1,0 +1,277 @@
+# ============ Go2 + gz-sim(Ignition Fortress) 仿真专用配置 ============
+# 由 go2_sim.yaml 复制而来，只改了「数据源 + 雷达类型 + 外参」这几项，其余参数保持一致。
+# 用法：ros2 launch lightning r41_online_slam.launch.py config:=<本文件路径>
+#
+# 与真实雷达配置的关键差异：
+#   lidar_type: 5  → PointCloudPreprocess::SimulatedHandler
+#   gz-sim 的 gpu_lidar 是“一个仿真步内把整帧射线一次投完”的瞬时扫描，
+#   输出的 PointCloud2 只有 x/y/z/intensity(/ring)，**没有逐点 time**，
+#   也没有任何运动畸变。lidar_type=5 会把每点时间置 0，避免被误当真实
+#   扫描时序去做去畸变（详见该函数的注释）。
+common:
+  # 日志配置（spdlog）：level 可选 trace/debug/info/warn/error/critical/off
+  # module_levels 可按模块覆盖，如 lidar_loc: debug
+  log:
+    level: "info"
+    log_dir: "./log"      # 置空则不落盘
+    max_size_mb: 50
+    max_files: 5
+  dataset: "velodyne"
+  # 仿真：gazebo_sim 的 ros_gz_bridge 把 gz 的 gpu_lidar 桥出来
+  #   /robot1/velodyne        → LaserScan
+  #   /robot1/velodyne/points → PointCloud2（x/y/z/intensity/ring，无 time）
+  lidar_topic: "/robot1/velodyne/points"
+  # 仿真里没有 Livox 驱动，这个 CustomMsg 订阅路径故意指向一个不存在的话题，
+  # 避免同域内真起了 livox 驱动时两种点云混进 LIO。
+  livox_lidar_topic: "/sim/unused_livox_custom"
+  # 与 velodyne 同平台、原点与 velodyne 重合的仿真 IMU（声明 200Hz）
+  imu_topic: "/robot1/velodyne_imu"
+
+# fasterlio 参数
+fasterlio:
+  # 5 = 仿真雷达（gz-sim gpu_lidar，瞬时扫描、无逐点时间）
+  # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 4 for robosense
+  lidar_type: 5
+  scan_line: 16
+  blind: 0.5                # 盲区，小于盲区距离的不会处理（gz 的 range.min = 0.3）
+  time_scale: 1e-3             # 兼容不同数据集的时间单位，仅对Velodyne LiDAR(lidar_type=2)生效
+
+  skip_lidar_num: 0 # 点云的跳帧情况
+  # 仿真单帧 640×16 = 10240 点；取 2 抽样后约 5k 点/帧（再扣除 inf/NaN 与盲区）。
+  # 真实雷达用 6，是因为帧点数远多于仿真。想让 LIO 更准可以改 1（CPU 翻倍）。
+  point_filter_num: 2 # 点云采样参数
+  max_iteration: 3 # 最大迭代次数
+  filter_size_scan: 0.2 # 对scan进行的降采样（LIO 前端用）
+  filter_size_map: 0.3
+  # 关键帧点云的存储分辨率（米），0 = 存原始去畸变扫描。
+  # 必须与存图分辨率（GetGlobalMap 的 res，当前固定 0.1）保持一致，
+  # 这样存图时那一次逐帧体素滤波会被完全跳过。
+  #
+  # 【重要】不只是提速，更是内存：scan_undistort_ 有 ~14400 点/帧（point_filter_num=6 抽点后），
+  # 按 PointXYZIT 32B 算就是 ~450KB/帧 —— 跑 1687 个关键帧要 **~760MB**。
+  # 改成 0.1 后约 2500 点/帧（~80KB），1687 帧只要 ~134MB，省 600MB 以上。
+  #
+  # 影响面（本项目 with_loop_closing/with_g2p5 都关着，只影响存图）：
+  #   - 回环：submap 本来还会再 VoxelGrid(r*0.1)，0.1 存完全够用
+  #   - g2p5：2.5D 投影栅格，0.1 存不影响占据判定
+  #   - save_map 导出的 keyframes/kf_*.pcd：变成 0.1 分辨率（文件更小）
+  kf_cloud_res: 0.1
+
+  ivox_grid_resolution: 0.5        # default=0.2 (已弃用，改用 ikd-Tree)
+  ivox_nearby_type: 18             # 6, 18, 26 (已弃用，改用 ikd-Tree)
+  cube_len: 1000.0                 # 局部地图 cube 边长(m)
+  esti_plane_threshold: 0.1        # default=0.1
+
+  use_aa: false  # use anderson-acceleration (esekfom 忽略)
+
+  acc_cov: 0.1
+  gyr_cov: 0.1
+  b_acc_cov: 0.01
+  b_gyr_cov: 0.01
+  extrinsic_est_en: false      # true: enable the online estimation of IMU-LiDAR extrinsic
+  extrinsic_T: [ 0, 0, 0 ]
+  extrinsic_R: [ 1, 0, 0,
+                 0, 1, 0,
+                 0, 0, 1 ]
+
+  keep_first_imu_estimation: false
+  kf_dis_th: 1.0
+  kf_angle_th: 2.0
+
+  enable_icp_part: false       # esekfom 前端忽略
+  plane_icp_weight: 1000.0
+  min_pts: 500
+  imu_filter: false            # esekfom 前端忽略
+  proj_kfs: false
+
+# 默认不启用 g2p5 栅格地图，效果不好
+g2p5:
+  esti_floor: false   # 是否动态估计地面
+  lidar_height: 0.5   # 雷达安装高度
+  floor_height: -0.6   # 默认地面高度
+  min_th_floor: 0.1  # 距离地面这个高度的障碍物被扫入栅格地图中
+  max_th_floor: 1.0  # 距离地面这个高度的障碍物被扫入栅格地图中
+  grid_map_resolution: 0.05 # 栅格地图分辨率
+
+system:
+  with_loop_closing: false # 是否需要回环检测 (r41 旋转主导，回环虚假约束污染轨迹，验证关闭)
+  with_ui: true # 是否需要3D UI
+  with_2dui: false # 是否需要2D UI
+  with_g2p5: false # 是否需要栅格地图
+  step_on_kf: false # 是否在关键帧处暂停 (false=不阻塞，回放用)
+
+  enable_lidar_loc_skip: false
+  enable_lidar_loc_rviz: true
+  enable_lidar_odom_skip: false
+  lidar_loc_skip_num: 4
+  # 向感知模块发布 map 系点云与雷达位姿（供 plan_env/GridMap 等下游使用）
+  enable_perception_pub: true
+  lidar_odom_skip_num: 0
+  # ===== 建图保存根目录（SLAM 侧）=====
+  # 地图保存到 <map_root>/<map_id>/，map_id 来自 lightning/save_map 服务请求。
+  # 留空 = $HOME/rcs/maps；支持 "~/" 前缀；可用 launch 的 map_root:=<dir> 覆盖。
+  map_root: ""
+  # ===== 定位加载目录（LOC 侧，指向具体某张地图）=====
+  # 必须含 index.txt 与 <id>.pcd；可用 launch 的 map_path:=<dir> 覆盖。
+  # 用 "~/" 开头：本配置在多台机器（用户名不同）共用，不能写死 /home/<user>/...
+  # 注意 YAML 里必须加引号，否则 ~ 会被解析为 null。
+  map_path: "~/r41iws0916_factory"
+  pub_tf: true
+  # 本体(base_link)与IMU 外参（lightning 状态/位姿为 IMU 系，base_link 需用它归算；imu→lidar 复用 fasterlio.extrinsic，单位阵）
+  # 仿真 URDF(robot_VLP_D435i.xacro)：
+  #   base_link → velodyne      : xyz(0.22, 0, 0.09) rpy(0,0,0)
+  #   velodyne  → velodyne_imu  : 单位阵（两 link 完全重合）
+  #   → base→imu = (0.22, 0, 0.09)，R = I（REP-103，X前Y左Z上）
+  extrinsic_base_imu_T: [0.22, 0, 0.09]
+  extrinsic_base_imu_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+  with_pcd2pgm: true # 保存地图时由全局地图生成2D栅格（pcd2pgm逻辑，倾斜安装安全）
+  pub_odom: true # 是否发布odom与nav_state话题
+  log_pose_opt: false # 是否在终端打印位姿与速度
+  log_lidar_time: true # 是否逐帧打印雷达处理耗时（点数/LIO耗时/端到端延迟）
+  # LIO 工作线程的 nice 值（-20~19，仅建图模式生效）。
+  # nice 只在“有竞争”时起作用：x86 上 LIO 仅占 ~4% 单核 → 设 0；
+  # RK3588 单帧 LIO 占单核 30~70% → 保持 10，避免饿死回调线程。
+  # 可用 launch 的 lio_worker_nice:=0 覆盖。
+  lio_worker_nice: 0
+  # ===== 全局地图 lightning/global_map（仅供 rviz 看）=====
+  #
+  # 发布模式：
+  #   incremental（默认）只发“新出现的关键帧”，由 rviz 自己累积成整图。
+  #               跨调用做体素去重（同一体素只发一次），所以 rviz 最终看到的
+  #               点云密度与以前的整图完全一样，但单次成本 = O(新增关键帧) ≈ 亚毫秒，
+  #               与地图大小无关。**要求 rviz 里该显示项的 Decay Time 设为 0**（永不衰减）。
+  #   full        每次重算整张图。实测 1663 kf 时单次 ~500ms（P95 950ms），
+  #               会周期性堵住 worker。只在需要拿到完整点云时用（init_selftest / pcd2pgm）。
+  #   off         不发布。
+  global_map_pub_mode: "incremental"
+  # 发布间隔（秒），0 = 不发布。增量模式下可以放小，单次几乎不花时间。
+  # 只在有订阅者时才计算/发布。
+  global_map_pub_interval: 1.0
+  # 增量发布时的体素分辨率 = rviz 最终看到的点云密度。
+  # 0.1 与整图路径（GetGlobalMap 默认值）一致；调大可显著降低 rviz 负担。
+  # 注：只影响“看”，不影响存图（存图始终用 0.1）。
+  global_map_pub_res: 0.1
+  # 单次增量发布最多处理多少个关键帧（限流），0 = 不限（默认）。
+  # 平时每秒只新增几个关键帧，这个上限不起作用；
+  # 它只影响「rviz 中途连上，要补发全部历史关键帧」这一种情况。
+  #   0  = 一次性把地图补齐 —— 只埋一次 arrival_dt 警告，但停顿随地图大小增长
+  #        （约 0.4ms/关键帧：800 个 ≈ 0.3s，4000 个 ≈ 3s）。
+  #   32 = 每次发布只多花 ~20ms（低于 30ms 预警阈值，不再报警），
+  #        代价是地图要几十秒才能“长”完。
+  global_map_pub_max_kf: 0
+  # 轨迹 lightning/path 的最小发布间隔（秒），0 = 不发布。
+  # path_ 无界增长，每帧 publish 要序列化整个 vector（O(n)/帧，O(n²) 累计）：
+  # 实测 3190 帧时 PublishMappingTf 已从 0.311ms 涨到 0.989ms。
+  # 只在有订阅者时按此间隔发布；path_ 本身仍每帧累积（save_path 导出轨迹要用）。
+  path_pub_interval: 1.0
+  enable_path_rviz: true # 是否发布Path话题
+  rviz_current_scan_topic: "lightning/current_scan" # rviz当前扫描话题
+  rviz_global_map_topic: "lightning/global_map" # rviz全局地图话题
+
+# pcd2pgm：保存时2D栅格生成参数（世界系z高度带，与雷达安装倾斜无关；缺省用默认值）
+# 雷达起点离地约0.5~0.6m → 地面点z≈-0.5，高度带[0, 2]排除地面、保留墙体
+pcd2pgm:
+  thre_z_min: 0.0       # 高度带下沿（起点传感器高度处z≈0）
+  thre_z_max: 2.0       # 高度带上沿，带内点视为障碍
+  thre_radius: 0.2      # 半径去噪搜索半径（m）
+  thres_point_count: 10 # 邻居数低于此值的点被剔除
+  map_resolution: 0.05  # 栅格分辨率（m/格）
+
+loop_closing:
+  loop_kf_gap: 20       # 每隔多少个关键帧检查一次
+  min_id_interval: 20   # 被检查的关键帧ID间隔
+  closest_id_th: 50     # 历史关键帧与当前帧的ID间隔
+  max_range: 30.0       # 候选帧的最大距离
+  ndt_score_th: 1.5     # ndt位姿分值
+  with_height: false
+
+
+### localization ================================================================================================
+lidar_loc:
+  enable_dynamic_polygon: false
+  enable_parking_static: true
+  enable_icp_adjust: false
+  filter_intensity_max: 100.0
+  filter_intensity_min: 10.0
+  filter_z_max: 30.0
+  filter_z_min: -1.0
+  # 注意：r41 雷达为倾斜安装（extrinsic_base_imu_R 含 Rx(150°)），map 系下 roll/pitch 天生非 0，
+  # 开 force_2d 会把 scan 摆到与地图不一致的姿态，导致匹配持续低分、位姿帧间跳变——必须保持 false
+  force_2d: false
+  grid_search_angle_range: 90.0
+  grid_search_angle_step: 10
+  lidar_loc_odom_th: 0.5
+  init_with_fp: false
+  # 配准已由 NDT 替换为 small_gicp（GICP），分值为内点比例（[0,1]，越大越好）：
+  #   confidence = num_inliers / 降采样后源点数
+  min_init_confidence: 0.75  # 初始化接受阈值（GICP内点比例，越高越严）
+  # 初始化容错搜索：手动/外部初值分数不足时在 seed 附近做 xy+yaw 搜索，达标才接受、可提前退出
+  # 注意：GICP 的 yaw 捕获域约 max_corr_dist/场景半径（0.5m/20m ≈ 1.5°），
+  # 搜索步长需小于细 GICP 收敛域，否则候选会落在真值旁边却拉不回去
+  init_search_enable: true
+  init_search_xy_grid: 3     # xy 候选 3×3
+  init_search_xy_step: 0.5   # xy 间距 m（细 GICP 平移捕获域 ~0.5m）
+  init_search_yaw_range: 18.0 # yaw 搜索范围 deg（冷启动朝向完全未知时改回 360）
+  init_search_yaw_step: 2   # yaw 步长 deg
+  init_search_stop_conf: 0.85  # 粗搜 conf≥此值即提前退出（好就停；粗搜 max_corr 大、打分偏饱和，不宜设太低）
+  # small_gicp 配准参数（细=常规定位/精配准，粗=初始化网格搜索快速打分）
+  gicp_fine_target_res: 0.3     # 细匹配目标地图降采样分辨率 m
+  gicp_fine_max_corr_dist: 0.5  # 细匹配最大对应距离 m（越小打分对 yaw 越敏感、配准越挑剔）
+  gicp_fine_max_iterations: 50  # 细匹配最大迭代数
+  gicp_rough_target_res: 2.0    # 粗匹配目标地图降采样分辨率 m
+  gicp_rough_max_corr_dist: 4.0 # 粗匹配最大对应距离 m（区分度不足时可降到 2.0）
+  gicp_rough_max_iterations: 10 # 粗匹配最大迭代数
+  gicp_source_res: 0.3          # 源点云降采样分辨率 m
+  gicp_num_threads: 4           # 配准线程数
+  # 局部 yaw 精搜索：在配准结果附近 ±range 内按 step 扫 yaw，逐候选细 GICP 取最优
+  # 初始化时必跑（补偿 GICP 收敛域不足的 yaw 残差）；运行中 conf 低于 trigger 时按 interval 节流触发
+  yaw_refine_enable: true
+  yaw_refine_range: 5.0        # 搜索范围 ±deg（先小范围；若残差更大可加大，耗时线性增加）
+  yaw_refine_step: 0.5         # 步长 deg（需小于细 GICP yaw 收敛域 ~1.5°）
+  yaw_refine_trigger_conf: 0.85 # 运行中触发阈值（低于才触发）
+  yaw_refine_interval: 1.0     # 运行中触发最小间隔 s
+  update_dynamic_cloud: false
+  update_err_h: 0.2
+  update_err_v: 0.2
+  update_kf_dis: 2.0
+  update_lidar_loc_score: 0.9   # 动态图层更新分值门槛（GICP内点比例，[0,1]）
+  loc_on_kf: false
+  try_self_extrap: false
+maps:
+  delete_when_unload: false
+  dyn_cloud_policy: persistent
+  load_dyn_cloud: true
+  load_map_size: 2
+  max_pts_dyn_chunk: 100000
+  save_dyn_when_quit: true
+  save_dyn_when_unload: false
+  unload_map_size: 4
+  with_dyn_area: false
+pgo:
+  dr_ang_noise: 0.5
+  dr_pos_noise: 1.0
+  dr_pos_noise_ratio: 1.0
+  lidar_loc_ang_noise: 1.0
+  lidar_loc_outlier_th: 5.0
+  lidar_loc_pos_noise: 0.3
+  lidar_odom_ang_noise: 1.0
+  lidar_odom_pos_noise: 0.3
+  pgo_frame_converge_ang_th: 1.0
+  pgo_frame_converge_pos_th: 0.05
+  rtk_fix_ang_noise: 2.0
+  rtk_fix_pos_noise: 1.0
+  rtk_height_noise_ratio: 10.0
+  rtk_other_ang_noise: 10.0
+  rtk_other_pos_noise: 5.0
+  rtk_outlier_th: 1.0
+  smooth_factor: 0.01
+roi:
+  height_max: 10.0
+  height_min: -10.0
+  range_max: 70
+  range_min: 0.5
+ui:
+  car_length: 2.0
+  car_width: 1.6
+  car_height: 1.7
+  scans: 1

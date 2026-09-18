@@ -39,5 +39,6 @@
         "statusBar.debuggingForeground": "#FFFCFD",
         "statusBar.noFolderBackground": "#580D3B",
         "statusBar.noFolderForeground": "#FFFCFD"
-    }
+    },
+    "cmake.sourceDirectory": "/home/gmd/go2_sim_nav/src/perception"
 }

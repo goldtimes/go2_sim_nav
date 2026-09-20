@@ -4,10 +4,10 @@ build
 data
 go2_bag
 lio0902
-lio*
 install
 log
+lio0902
+lio_*
 src/pnc_3d/*
 src/slam/lio_slam
 result_cleaned.bt
-

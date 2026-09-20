@@ -1,0 +1,58 @@
+#######################################################################
+# 全局地图服务器（map_server）
+#
+# 地图以“目录”为单位管理，与 lightning 的 map_path 用**同一个目录**：
+#   ~/rcs/maps/<站点>/map.yaml + map.pgm     （2D，本期）
+#   ~/rcs/maps/<站点>/global.pcd / 0.pcd     （3D，后续）
+#
+# 换图三件套必须同源：lightning 的 map_path / 本节点 map_dir / perception。
+#   运行时切图：ros2 service call /global_map/load_map nav2_msgs/srv/LoadMap \
+#                "{map_url: /home/gmd/rcs/maps/<站点>}"
+#######################################################################
+map_server:
+  ros__parameters:
+    use_sim_time: false
+
+    # ---- 地图来源（map_yaml 非空时优先）----
+    map_dir: "/home/gmd/rcs/maps/go2_sim_factory"
+    map_yaml: ""
+
+    # ---- 输出 ----
+    # 静态图用 latched(transient_local) 发布；另外每 republish_interval 秒重发一次，
+    # 让 Durability=Volatile 的订阅者（RViz Map 显示项的默认值）也能拿到。
+    frame_id: "map"
+    topic_occupancy: "global_map/occupancy"     # nav_msgs/OccupancyGrid
+    topic_metadata: "global_map/metadata"       # nav_msgs/MapMetaData
+    publish_metadata: true
+    republish_interval: 1.0                     # 0 = 不重发（只靠 latched）
+
+    # ---- 地图语义 ----
+    # 实测：现有 map.pgm 只含黑(0)+灰(205)，**没有白色(254) 空闲像素**：
+    #   go2_sim_factory 黑 6.5%/灰 93.5%；r41iws_0917 黑 10.3%/灰 89.7%
+    #   → 即“除了障碍物全是未知”。
+    #
+    # 【已定策略】全局图里**把灰色（未知）当作白色（可通行）**，因为全局图是稀疏先验，
+    # 没观测到的区域不应该挡住全局规划（nav2 costmap 的 track_unknown_space=false 同理）。
+    # 注意：置 true 后发布的图上就不会再出现 -1，未知信息只在文件里保留。
+    # 若某天想区分“观测过空闲”与“从未观测”，应在地图生成端把可通行区标成白色(254)。
+    # ⚠ 与官方 nav2_map_server 逐格比对时必须置 false（否则必然在图语义上有差异）。
+    unknown_as_free: true
+
+    # ---- 运行时换图服务 ----
+    srv_load_map: "global_map/load_map"         # nav2_msgs/LoadMap
+
+    # ==================================================================
+    # 3D 地图（M3 接口；本期只接线，不实现内容）
+    # ==================================================================
+    # 设计：3D 地图与 2D 在**同一个地图目录**（global.pcd），跟着同一个 load_map
+    # 服务一起加载 → 不会出现"换图三件套不同源". 所以不需要额外的服务类型。
+    # 打开 publish_3d 后：
+    #   · 启动时创建话题 topic_cloud_3d（latched，与 2D 同为 transient_local）
+    #   · 载图成功才发布；载入失败只 WARN（不连累 2D），require_3d=true 时才报错中止
+    #   · PCD 解析尚未实现 → 现在会看到 WARN，且话题上无数据
+    publish_3d: false
+    pcd_file: ""                     # 空 = <map_dir>/global.pcd；也可直接给 .pcd 路径
+    topic_cloud_3d: "global_map/cloud"   # sensor_msgs/PointCloud2
+    cloud_frame_id: "map"            # 默认与 frame_id 一致；点云常来自别的源，可单独指定
+    cloud_voxel_leaf: 0.0            # 预留：发布前体素降采样（m，0 = 不降采样）
+    require_3d: false               # true = 3D 加载失败时整次 load_map 报错

@@ -1114,9 +1114,8 @@ void GridMap::visCallback() {
       return md_.occupancy_buffer_[a] >= mp_.min_occupancy_log_;
     });
   if (md_.infl_idx_list_.size() > 40000)
-    compact_idx(md_.infl_idx_list_, md_.infl_idx_flag_, [&](int a) {
-      return md_.occupancy_buffer_inflate_[a] != 0;
-    });
+    compact_idx(md_.infl_idx_list_, md_.infl_idx_flag_,
+                [&](int a) { return md_.occupancy_buffer_inflate_[a] != 0; });
 
   if (mp_.verify_occ_idx_)
     verifyOccIdx();
@@ -1489,10 +1488,12 @@ void GridMap::build2DLayer() {
 
   if (!full) {
     /* ---------- footprint 离开区域的重扫修正 ----------
-       机器人移动后，**上一帧**被 footprint mask 抹成“空闲”的格子如果本帧不再被抹，
-       它们的真实投影值就没人重扫 → 会永久留下假空闲（自检能抓到：期望 100 实际 0，
-       且提示“本帧未重扫”）。这里把上一帧 footprint 覆盖的列全部标脏，让它们重扫回
-       真实投影；本帧仍在 footprint 内的格子随后会被 applyFootprintClear() 再抹一遍，
+       机器人移动后，**上一帧**被 footprint mask
+       抹成“空闲”的格子如果本帧不再被抹， 它们的真实投影值就没人重扫 →
+       会永久留下假空闲（自检能抓到：期望 100 实际 0，
+       且提示“本帧未重扫”）。这里把上一帧 footprint
+       覆盖的列全部标脏，让它们重扫回 真实投影；本帧仍在 footprint
+       内的格子随后会被 applyFootprintClear() 再抹一遍，
        所以多标一点没有副作用。代价只有矩形内几十格。
        ⚠ 下标必须用**本帧** anchor 换算：数组此时已经平移到新窗口坐标系了。 */
     const FootprintPose &fprev = md_.fp_prev_;
@@ -1517,7 +1518,10 @@ void GridMap::build2DLayer() {
     }
   }
 
-  /* ---------- 3) 重扫：全量所有列，或只扫脏列 ---------- */  /// toAddress 的布局是 lx*(ny*nz) + ly*nz +
+  /* ---------- 3) 重扫：全量所有列，或只扫脏列 ---------- */ /// toAddress
+                                                              /// 的布局是
+                                                              /// lx*(ny*nz) +
+                                                              /// ly*nz +
   /// lz，这里把不随格子变化的量提到循环外
   std::vector<int> kz_local;
   kz_local.reserve(static_cast<size_t>(kz1 - kz0 + 1));
@@ -1648,22 +1652,20 @@ void GridMap::applyFootprintClear() {
      0.5*hypot(L,W)，用后者会漏掉边缘几格没抹（自检能抓到，实测过）。 */
   const double half_diag = footprintCircumradius();
   const FootprintPose &fp = md_.fp_cur_;
-  const int ix0 =
-      std::max(0, static_cast<int>(std::floor((fp.cx - half_diag) *
-                                              mp_.resolution_inv_)) -
-                      anchor(0));
+  const int ix0 = std::max(0, static_cast<int>(std::floor(
+                                  (fp.cx - half_diag) * mp_.resolution_inv_)) -
+                                  anchor(0));
   const int ix1 = std::min(
-      nx - 1, static_cast<int>(std::ceil((fp.cx + half_diag) *
-                                         mp_.resolution_inv_)) -
-                  anchor(0));
-  const int iy0 =
-      std::max(0, static_cast<int>(std::floor((fp.cy - half_diag) *
-                                              mp_.resolution_inv_)) -
-                      anchor(1));
+      nx - 1,
+      static_cast<int>(std::ceil((fp.cx + half_diag) * mp_.resolution_inv_)) -
+          anchor(0));
+  const int iy0 = std::max(0, static_cast<int>(std::floor(
+                                  (fp.cy - half_diag) * mp_.resolution_inv_)) -
+                                  anchor(1));
   const int iy1 = std::min(
-      ny - 1, static_cast<int>(std::ceil((fp.cy + half_diag) *
-                                         mp_.resolution_inv_)) -
-                  anchor(1));
+      ny - 1,
+      static_cast<int>(std::ceil((fp.cy + half_diag) * mp_.resolution_inv_)) -
+          anchor(1));
 
   const int8_t v = footprintValue();
   const bool need_infl = mp_.pub_2d_occupancy_inflate_;

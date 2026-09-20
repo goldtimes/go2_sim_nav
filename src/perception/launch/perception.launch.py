@@ -4,10 +4,13 @@
 
     ros2 launch plan_env perception.launch.py
 
-话题映射（grid_map.cpp 内部用相对名 cloud / sensor_pose / body_pose）：
-    cloud       <- /lightning/perception/cloud    (PointCloud2, frame_id=map)
-    sensor_pose <- /lightning/perception/pose     (Odometry, map -> lidar_link)
-    body_pose    不订阅（滑动地图以 sensor_pose 为中心滚动，不需要它）
+输入话题（由 launch 参数写入 grid_map.topic_* 参数；优先级：launch 参数 >
+perception.yaml 里的同名参数 > 代码默认值）：
+    cloud        <- /lightning/perception/cloud    (PointCloud2, frame_id=map)
+    sensor_pose  <- /lightning/perception/pose     (Odometry, map -> lidar_link)
+    body_pose    滑动地图 TF 原点（默认 body_pose）。上游不发时该 TF 会一直发在
+                 原点，只影响 RViz 视图，不影响栅格内容。
+    map_state    <- /lightning/map_state          (Int32, 换图/失败时清空栅格)
 
 上游需要开启 lightning 配置里的 system.enable_perception_pub。
 """
@@ -33,16 +36,26 @@ def generate_launch_description():
     cloud_arg = DeclareLaunchArgument(
         'cloud_topic',
         default_value='/lightning/perception/cloud',
-        description='map 系点云话题',
+        description='map 系点云话题 -> grid_map.topic_cloud',
     )
     pose_arg = DeclareLaunchArgument(
         'pose_topic',
         default_value='/lightning/perception/pose',
-        description='map -> lidar_link 位姿话题',
+        description='map -> lidar_link 位姿话题 -> grid_map.topic_pose',
+    )
+    body_pose_arg = DeclareLaunchArgument(
+        'body_pose_topic',
+        default_value='body_pose',
+        description='滑动地图 TF 原点话题 -> grid_map.topic_body_pose（上游无此话题时可无视）',
+    )
+    map_state_arg = DeclareLaunchArgument(
+        'map_state_topic',
+        default_value='/lightning/map_state',
+        description='定位阶段话题（换图/失败即清空栅格）-> grid_map.topic_map_state',
     )
     rviz_arg = DeclareLaunchArgument(
         'rviz',
-        default_value='false',
+        default_value='true',
         description='是否同时启动 RViz（默认 false，推荐自己起 showbodypc.rviz 等视图）',
     )
     rviz_config_arg = DeclareLaunchArgument(
@@ -56,10 +69,14 @@ def generate_launch_description():
         executable='perception_node',
         name='perception_node',
         output='screen',
-        parameters=[LaunchConfiguration('config')],
-        remappings=[
-            ('cloud', LaunchConfiguration('cloud_topic')),
-            ('sensor_pose', LaunchConfiguration('pose_topic')),
+        parameters=[
+            LaunchConfiguration('config'),
+            {
+                'grid_map.topic_cloud': LaunchConfiguration('cloud_topic'),
+                'grid_map.topic_pose': LaunchConfiguration('pose_topic'),
+                'grid_map.topic_body_pose': LaunchConfiguration('body_pose_topic'),
+                'grid_map.topic_map_state': LaunchConfiguration('map_state_topic'),
+            },
         ],
     )
 
@@ -73,5 +90,6 @@ def generate_launch_description():
     )
 
     return LaunchDescription(
-        [config_arg, cloud_arg, pose_arg, rviz_arg, rviz_config_arg, perception_node, rviz_node]
+        [config_arg, cloud_arg, pose_arg, body_pose_arg, map_state_arg,
+         rviz_arg, rviz_config_arg, perception_node, rviz_node]
     )

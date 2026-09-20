@@ -14,15 +14,23 @@ perception_node:
     # ==================================================================
     # 地图几何
     # ==================================================================
-    grid_map.resolution: 0.05
-    grid_map.sliding_map_size_x: 10.0
-    grid_map.sliding_map_size_y: 10.0
-    grid_map.sliding_map_size_z: 5.0
+    # ⚠ 分辨率是全局的（3D + 2D 一起变），也是性能的最大杠杆：
+    #   0.05 → 0.10 实测每帧 3D 融合 1854ms → 313ms（体素数 ∝1/res³、射线步数 ∝1/res）。
+    #   代价：障碍边界量化误差 ±2.5→±5cm；薄障碍表观厚度翻倍（实测占据面积 0.09→0.17m²）；
+    #   台阶/降障的高度分辨力减半（3D 规划要留意）；好处是规划搜索节点数 ÷4。
+    grid_map.resolution: 0.10
+    # 窗口尺寸：体素数 = (x/res)*(y/res)*(z/res)，直接决定所有 O(体素数) 操作的开销
+    # （可视化发点云的扫描、每次滑动清图的内存分配/清零、换图时的 fill）。
+    # 10x10x5 → 8x8x4 实测体素数 50万 → 25.6万（-49%）。
+    grid_map.sliding_map_size_x: 8.0
+    grid_map.sliding_map_size_y: 8.0
+    grid_map.sliding_map_size_z: 4.0
     # local_update_range 必须 <= size/2：超出这个范围的点只做无命中射线（清空），
     # 不写入占据，用于把"传感器前方空区"和"远处未知"区分开。
-    grid_map.local_update_range_x: 5.0
-    grid_map.local_update_range_y: 5.0
-    grid_map.local_update_range_z: 2.5
+    # 这是控制"每帧融合多少点"的正规旋钮（与地图大小无关）。
+    grid_map.local_update_range_x: 4.0
+    grid_map.local_update_range_y: 4.0
+    grid_map.local_update_range_z: 2.0
 
     # 滑动地图：以传感器位置为中心滚动。只依赖 sensor_pose，不需要 body_pose
     # （body_pose 仅用于广播 sliding_map TF 帧，见 grid_map.cpp 的 updateSlidingMap）。
@@ -41,12 +49,46 @@ perception_node:
     # 感知输入接口（与 lightning/perception/* 的契约）
     # ==================================================================
     grid_map.sensor_type: lidar
+    # ---- 输入话题（相对名会被解析成 <命名空间>/名字；也可以写绝对名 /xxx）----
+    # 这两项等价于原来写死的 cloud / sensor_pose：改 yaml 即可，不必改代码；
+    # 若 launch 里又做了 remap（-r cloud:=...），remap 优先级更高。
+    grid_map.topic_cloud: "cloud"
+    grid_map.topic_pose: "sensor_pose"
+    # 滑动地图 TF 原点（发 sliding_map_frame_id 那帧 TF 用）。
+    # ⚠ 不能删：删了这帧 TF 就会一直发在原点。上游没有对应话题时可不接。
+    grid_map.topic_body_pose: "body_pose"
+    # 定位阶段（换图/失败 -> 清空栅格，否则旧地图体素会变成“幽灵障碍”）。
+    # 换定位源时记得改这里，否则此机制静默失效。
+    grid_map.topic_map_state: "lightning/map_state"
     # lightning/perception/cloud 已经是 map 系点云 -> 坐标直接当世界系用。
     # 若置 false，点云会被当作 sensor 系再经 ray_q/ray_pos 变换一次，栅格必然错位。
     grid_map.cloud_is_world: true
     # lightning/perception/pose 已经是 map -> lidar_link（T_map_base*T_base_imu*T_imu_lidar）。
     # 若置 true，会在该位姿上再乘一层 lidar_extrinsic_，raycast 起点静默偏掉。
     grid_map.need_extrinsic: false
+
+    # ---- 2D 层 footprint 清除：机器人自身尺寸（换机器只改这里）----
+    # 每帧把机器人自身占的那块矩形从 2D 图上抹掉（占据层 + 膨胀层），
+    # 于是"机器人脚下永远不是障碍"与自车点云从哪来无关（雷达/相机/累积图都一样）。
+    # Nav2 的 local costmap 也是这个做法（每周期清 footprint 区域）。
+    # 矩形定义在**机体系**：length = 前后（x），width = 左右（y）；
+    # 朝向取 sensor_pose 的 yaw（= 机体朝向 ⊗ 雷达安装角；实际朝向不一致时用
+    # yaw_offset_deg 修）。中心对称矩形对 180° 偏差不敏感。
+    # ⚠ 判定按"格与矩形相交"（矩形外扩半格 = resolution/2，当前 0.10m 时即 5cm）：
+    #   直接填**真实机体尺寸**即可，不用自己加余量，也不会沿边缘漏一圈。
+    grid_map.footprint_clear_enable: true
+    grid_map.footprint_length: 0.70   # 机体系 x：前后（m）  ← Go2
+    grid_map.footprint_width: 0.40    # 机体系 y：左右（m）
+    # 雷达不在机体几何中心时，用这两个把矩形挪正（机体系，m）：
+    #   例：雷达装机体前 0.29m 处 → offset_x: -0.29
+    grid_map.footprint_offset_x: 0.0
+    grid_map.footprint_offset_y: 0.0
+    grid_map.footprint_yaw_offset_deg: 0.0
+    grid_map.footprint_clear_as_unknown: false  # true = 抹成未知(-1)，默认抹成空闲(0)
+    # footprint 可视化（MarkerArray：绿色轮廓 + 半透明填充），RViz 里加 MarkerArray
+    # 显示项、话题 grid_map/footprint 即可看到矩形跟着机器人转。
+    grid_map.pub_footprint_viz: true
+    grid_map.topic_footprint_viz: "grid_map/footprint"
 
     # ==================================================================
     # 占据概率模型（log-odds 融合）
@@ -56,7 +98,10 @@ perception_node:
     grid_map.p_min: 0.12
     grid_map.p_max: 0.98
     grid_map.p_occ: 0.80
-    grid_map.max_ray_length: 5.0
+    # 射线上限：直接决定每条射线要步进多少个体素（步数 ∝ 长度/res）。
+    # 5.0 → 2.0 实测每帧 -33~39%。语义变化：更远处不再被清成 free，unknown 会变多
+    # （对雷达有效距离内的避障而言合理）。
+    grid_map.max_ray_length: 2.0
 
     # ==================================================================
     # 障碍膨胀（用于后续规划避障；纯感知验证阶段可保持原值）
@@ -74,7 +119,17 @@ perception_node:
     # 注意 ray_pos 是雷达位置（map 系），不是地图原点，所以这是"传感器上方多少米"。
     # 地图数据本身不受影响：occupancy_buffer_ 完整保留 local_update_range 内的全部高度。
     grid_map.vis_height: 2.0
-    grid_map.show_occ_time: false
+    # true = 每处理一帧打一行计时：点云回调 / 3D 融合 / 2D 层 / 帧间隔 / 点数
+    grid_map.show_occ_time: true
+    # ---- 可视化开销控制 ----
+    # vis_interval：可视化定时器周期（TF/bbox/footprint/2D 都跟它）。
+    grid_map.vis_interval: 0.10
+    # pub_map_interval：那两个“3D 占据/膨胀点云”的发布间隔。
+    # 它们现在走增量占据索引（不再是全图扫描），但收发点云本身仍有成本，
+    # 2~5Hz 足够看，不必与 TF 同频。
+    grid_map.pub_map_interval: 0.25
+    # 占据索引自检（调试用）：每秒用暴力全扫核对一次索引有没有漏记
+    grid_map.verify_occ_idx: false
     # 仅用作 map_origin_ 的 z 初值（grid_map.cpp:88），滑动地图随后会重新居中到传感器，
     # 因此只要不是离传感器太远的值即可。
     grid_map.ground_height: 0.0
@@ -96,7 +151,9 @@ perception_node:
     grid_map.pub_2d_esdf: true
     # 发布节流（秒）。2D 层在每次 3D 融合后重建，但发布不必那么频繁；
     # 0 = 每次 visCallback（20Hz）都发。
-    grid_map.pub_2d_interval: 0.1
+    # 0 = 不额外节流，直接跟 vis_interval（10 Hz）同一个节奏，避免两个 0.1s 撞出
+    # "跳拍"（实测会变成 6.6 Hz、间隔 150ms）。想要更高/更低就改 vis_interval。
+    grid_map.pub_2d_interval: 0.0
 
     # ---- 3D -> 2D 投影高度带（只有带内的体素参与投影）----
     # ⚠ 下沿必须**高于地面**，否则地面被投影成障碍、整张 2D 图会全黑。
@@ -116,6 +173,18 @@ perception_node:
     grid_map.topic_2d_occupancy: "grid_map/occupancy_2d"
     grid_map.topic_2d_occupancy_inflate: "grid_map/occupancy_inflate_2d"
     grid_map.topic_2d_esdf: "grid_map/esdf_2d"
+
+    # ---- 2D 层性能与自检 ----
+    # 2D 层默认走“只重扫变化列”的增量路径（实测 2D 构建 12.4ms -> 3.4ms）。
+    # 它已用内置自检（verify_2d）在合成负载下逐格比对通过（0 失败）；
+    # 上真数据时建议先开一轮 verify_2d 确认。
+    grid_map.force_full_2d: false           # true = 每帧全窗口重扫（最保守，等于改动前的行为）
+    grid_map.refresh_full_2d_interval: 100  # 每 N 次构建做一次全量刷新兼底（0 = 不做），
+                                            # 代价约为全量重扫的 1/N，当保险可留着
+    grid_map.verify_2d: false               # true = 每帧用暴力全扫逐格比对增量结果（很费 CPU，
+                                            #   仅调试/真数据验证时开，失败会打 ERROR 日志）
+    grid_map.esdf2d_query_en: false         # 进程内调 getDistance2D() 且无人订阅 esdf_2d 时必须置 true，
+                                            # 否则 ESDF 会陈旧、查询返回 -1
 
     # ==================================================================
     # 以下为 depth 相机路径参数，sensor_type=lidar 时不生效，

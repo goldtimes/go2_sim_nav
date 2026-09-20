@@ -1,9 +1,10 @@
 #include "plan_env/grid_map.h"
+
 #include <cmath>
+#include <cstring> // memmove（2D 数组平移）
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <limits>
 #include <string>
-
 
 namespace {
 template <typename T>
@@ -19,8 +20,9 @@ constexpr float kEdtInf = 1e10f;
 
 /**
  * 1D 欧氏平方距离变换（Felzenszwalb & Huttenlocher, 2012）
- * f[q] = 0 表示 q 处是障碍（种子），否则为 kEdtInf；d[q] 输出到最近种子的平方距离（单位：索引²）。
- * v、z 为调用者提供的 scratch，长度需 >= n+1 / n+2。
+ * f[q] = 0 表示 q 处是障碍（种子），否则为 kEdtInf；d[q]
+ * 输出到最近种子的平方距离（单位：索引²）。 v、z 为调用者提供的 scratch，长度需
+ * >= n+1 / n+2。
  */
 void edt1D(const std::vector<float> &f, std::vector<float> &d, int n,
            std::vector<int> &v, std::vector<float> &z) {
@@ -49,6 +51,52 @@ void edt1D(const std::vector<float> &f, std::vector<float> &d, int n,
       ++k;
     const float dq = static_cast<float>(q - v[k]);
     d[q] = dq * dq + f[v[k]];
+  }
+}
+
+/**
+ * 把一个长 nx*ny 的 2D 数组在**窗口坐标系**里按 (dx,dy) 平移，保持世界系对齐：
+ *   new[ix, iy] = old[ix + dx, iy + dy]    （逐轴平移；越界的源视为“新露出”）
+ * 新露出的条带用 new_fill 填充。调用方需保证 |dx| < nx 且 |dy| < ny。
+ *
+ * 这就是“滑动时不用全图重建”的关键：滑动只会让世界系里同一个格子
+ * 在窗口内换个下标，搬一下内存（几十 KB）远比重新扫 3D 栅格便宜。
+ */
+template <typename T>
+void shift2DArray(std::vector<T> &v, int nx, int ny, int dx, int dy,
+                  T new_fill) {
+  if (dx == 0 && dy == 0)
+    return;
+  const size_t row = static_cast<size_t>(nx) * sizeof(T);
+
+  // 1) y 方向整行搬运
+  if (dy > 0) {
+    std::memmove(&v[0], &v[static_cast<size_t>(dy) * nx],
+                 static_cast<size_t>(ny - dy) * row);
+    for (int iy = ny - dy; iy < ny; ++iy)
+      std::fill(v.begin() + static_cast<size_t>(iy) * nx,
+                v.begin() + static_cast<size_t>(iy + 1) * nx, new_fill);
+  } else if (dy < 0) {
+    std::memmove(&v[static_cast<size_t>(-dy) * nx], &v[0],
+                 static_cast<size_t>(ny + dy) * row);
+    for (int iy = 0; iy < -dy; ++iy)
+      std::fill(v.begin() + static_cast<size_t>(iy) * nx,
+                v.begin() + static_cast<size_t>(iy + 1) * nx, new_fill);
+  }
+
+  // 2) x 方向逐行搬运
+  if (dx != 0) {
+    const int keep = nx - std::abs(dx);
+    for (int iy = 0; iy < ny; ++iy) {
+      T *p = &v[static_cast<size_t>(iy) * nx];
+      if (dx > 0) {
+        std::memmove(p, p + dx, static_cast<size_t>(keep) * sizeof(T));
+        std::fill(p + keep, p + nx, new_fill);
+      } else {
+        std::memmove(p - dx, p, static_cast<size_t>(keep) * sizeof(T));
+        std::fill(p, p - dx, new_fill);
+      }
+    }
   }
 }
 } // namespace
@@ -130,8 +178,14 @@ void GridMap::initMap(rclcpp::Node *node) {
                  mp_.esdf_unknown_as_occupied_, false);
   load_parameter(node_, "grid_map.esdf_max_dist", mp_.esdf_max_dist_, 3.0);
   load_parameter(node_, "grid_map.esdf_pub_step", mp_.esdf_pub_step_, 2);
-  load_parameter(node_, "grid_map.topic_2d_occupancy",
-                 mp_.topic_2d_occupancy_, string("grid_map/occupancy_2d"));
+  load_parameter(node_, "grid_map.esdf2d_query_en", mp_.esdf2d_query_en_,
+                 false);
+  load_parameter(node_, "grid_map.verify_2d", mp_.verify_2d_, false);
+  load_parameter(node_, "grid_map.force_full_2d", mp_.force_full_2d_, false);
+  load_parameter(node_, "grid_map.refresh_full_2d_interval",
+                 mp_.refresh_full_2d_interval_, 20);
+  load_parameter(node_, "grid_map.topic_2d_occupancy", mp_.topic_2d_occupancy_,
+                 string("grid_map/occupancy_2d"));
   load_parameter(node_, "grid_map.topic_2d_occupancy_inflate",
                  mp_.topic_2d_occupancy_inflate_,
                  string("grid_map/occupancy_inflate_2d"));
@@ -144,6 +198,57 @@ void GridMap::initMap(rclcpp::Node *node) {
 
   load_parameter(node_, "grid_map.sensor_type", mp_.sensor_type_,
                  string("lidar"));
+
+  /* 输入话题名：默认值保持改动前写死的相对名，现有配置/launch 行为不变 */
+  load_parameter(node_, "grid_map.topic_cloud", mp_.topic_cloud_,
+                 string("cloud"));
+  load_parameter(node_, "grid_map.topic_pose", mp_.topic_pose_,
+                 string("sensor_pose"));
+  load_parameter(node_, "grid_map.topic_depth", mp_.topic_depth_,
+                 string("depth"));
+  load_parameter(node_, "grid_map.topic_body_pose", mp_.topic_body_pose_,
+                 string("body_pose"));
+
+  /* ---------- 2D 层 footprint 清除（默认关）---------- */
+  load_parameter(node_, "grid_map.footprint_clear_enable",
+                 mp_.footprint_clear_enable_, false);
+  load_parameter(node_, "grid_map.footprint_length", mp_.footprint_length_,
+                 0.0);
+  load_parameter(node_, "grid_map.footprint_width", mp_.footprint_width_, 0.0);
+  load_parameter(node_, "grid_map.footprint_offset_x", mp_.footprint_offset_x_,
+                 0.0);
+  load_parameter(node_, "grid_map.footprint_offset_y", mp_.footprint_offset_y_,
+                 0.0);
+  load_parameter(node_, "grid_map.footprint_yaw_offset_deg",
+                 mp_.footprint_yaw_offset_deg_, 0.0);
+  load_parameter(node_, "grid_map.footprint_clear_as_unknown",
+                 mp_.footprint_clear_as_unknown_, false);
+  load_parameter(node_, "grid_map.pub_footprint_viz", mp_.pub_footprint_viz_,
+                 true);
+  load_parameter(node_, "grid_map.topic_footprint_viz",
+                 mp_.topic_footprint_viz_, string("grid_map/footprint"));
+
+  /* ---------- 可视化开销控制 ---------- */
+  load_parameter(node_, "grid_map.vis_interval", mp_.vis_interval_, 0.1);
+  load_parameter(node_, "grid_map.pub_map_interval", mp_.pub_map_interval_,
+                 0.2);
+  load_parameter(node_, "grid_map.verify_occ_idx", mp_.verify_occ_idx_, false);
+  if (mp_.footprint_clear_enable_) {
+    if (mp_.footprint_length_ <= 0.0 || mp_.footprint_width_ <= 0.0) {
+      RCLCPP_WARN(node_->get_logger(),
+                  "[GridMap] footprint_clear_enable=true，但 length=%.2f "
+                  "width=%.2f（需>0）→ 实际不抹任何格，请检查配置",
+                  mp_.footprint_length_, mp_.footprint_width_);
+    } else {
+      RCLCPP_INFO(
+          node_->get_logger(),
+          "[GridMap] 2D footprint 清除已开：矩形 %.2fx%.2f m（机体系）| "
+          "offset (%.2f, %.2f) yaw_offset %.1f° | 抹成 %s",
+          mp_.footprint_length_, mp_.footprint_width_, mp_.footprint_offset_x_,
+          mp_.footprint_offset_y_, mp_.footprint_yaw_offset_deg_,
+          mp_.footprint_clear_as_unknown_ ? "未知(-1)" : "空闲(0)");
+    }
+  }
   load_parameter(node_, "grid_map.cloud_is_world", mp_.cloud_is_world_, true);
   load_parameter(node_, "grid_map.need_extrinsic", mp_.need_extrinsic_, true);
 
@@ -210,6 +315,14 @@ void GridMap::initMap(rclcpp::Node *node) {
   md_.flag_rayend_ = vector<char>(buffer_size, -1);
   md_.flag_traverse_ = vector<char>(buffer_size, -1);
 
+  /* 占据/膨胀体素索引（可视化发布用，见头文件注释）*/
+  md_.occ_idx_flag_.assign(buffer_size, 0);
+  md_.infl_idx_flag_.assign(buffer_size, 0);
+  md_.occ_idx_list_.clear();
+  md_.infl_idx_list_.clear();
+  md_.occ_idx_list_.reserve(4096);
+  md_.infl_idx_list_.reserve(8192);
+
   md_.raycast_num_ = 0;
 
   md_.proj_points_.resize(640 * 480 / mp_.skip_pixel_ / mp_.skip_pixel_);
@@ -226,11 +339,17 @@ void GridMap::initMap(rclcpp::Node *node) {
     const int n2d = nx * ny;
     md_.occ2d_.assign(n2d, static_cast<int8_t>(-1));
     md_.occ2d_inflate_.assign(n2d, static_cast<int8_t>(-1));
-    md_.occ2d_occ_cnt_.assign(n2d, 0);
-    md_.occ2d_free_cnt_.assign(n2d, 0);
-    md_.occ2d_infl_cnt_.assign(n2d, 0);
     md_.esdf2d_.assign(n2d, -1.f);
+    md_.occ2d_dirty_.assign(n2d, 0);
+    md_.occ2d_dirty_list_.clear();
+    md_.occ2d_dirty_list_.reserve(n2d);
+    md_.occ2d_last_build_.assign(n2d, -1);
+    md_.occ2d_build_cnt_ = 0;
     md_.has_2d_ = false;
+    md_.occ2d_band_valid_ = false;
+    md_.occ2d_kz0_ = 0;
+    md_.occ2d_kz1_ = -1;
+    md_.esdf2d_stale_ = true;
     md_.proj_z_lo_ = mp_.proj_z_min_;
     md_.proj_z_hi_ = mp_.proj_z_max_;
     md_.occ2d_min_idx_ = mp_.map_bound_min_idx_;
@@ -252,8 +371,8 @@ void GridMap::initMap(rclcpp::Node *node) {
         message_filters::Subscriber<sensor_msgs::msg::Image>>();
     depth_pose_sub_ = std::make_shared<
         message_filters::Subscriber<nav_msgs::msg::Odometry>>();
-    depth_sub_->subscribe(node_, "depth", rmw_qos_profile_sensor_data);
-    depth_pose_sub_->subscribe(node_, "sensor_pose",
+    depth_sub_->subscribe(node_, mp_.topic_depth_, rmw_qos_profile_sensor_data);
+    depth_pose_sub_->subscribe(node_, mp_.topic_pose_,
                                rmw_qos_profile_sensor_data);
 
     sync_image_pose_.reset(
@@ -264,23 +383,27 @@ void GridMap::initMap(rclcpp::Node *node) {
                                                  std::placeholders::_2));
   } else if (mp_.sensor_type_ == "lidar") {
     lidar_pose_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
-        "sensor_pose", rclcpp::SensorDataQoS(),
+        mp_.topic_pose_, rclcpp::SensorDataQoS(),
         std::bind(&GridMap::sensorPoseCallback, this, std::placeholders::_1));
     cloud_sub_ = node_->create_subscription<sensor_msgs::msg::PointCloud2>(
-        "cloud", rclcpp::SensorDataQoS(),
+        mp_.topic_cloud_, rclcpp::SensorDataQoS(),
         std::bind(&GridMap::cloudCallback, this, std::placeholders::_1));
   }
 
   sliding_map_frame_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
-      "body_pose", rclcpp::SensorDataQoS(),
+      mp_.topic_body_pose_, rclcpp::SensorDataQoS(),
       std::bind(&GridMap::slidingMapFrameCallback, this,
                 std::placeholders::_1));
 
   occ_timer_ = node_->create_wall_timer(
       std::chrono::milliseconds(50),
       std::bind(&GridMap::updateOccupancyCallback, this));
-  vis_timer_ = node_->create_wall_timer(std::chrono::milliseconds(50),
-                                        std::bind(&GridMap::visCallback, this));
+  /* 可视化频率参数化：TF/bbox/footprint 需要 10~20Hz，点云不需要（见
+   * pub_map_interval_）*/
+  const int vis_ms = static_cast<int>(mp_.vis_interval_ * 1000.0);
+  vis_timer_ = node_->create_wall_timer(
+      std::chrono::milliseconds(vis_ms > 0 ? vis_ms : 50),
+      std::bind(&GridMap::visCallback, this));
 
   map_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>(
       "grid_map/occupancy", rclcpp::SensorDataQoS());
@@ -297,8 +420,14 @@ void GridMap::initMap(rclcpp::Node *node) {
   extrinsic_pose_pub_ = node_->create_publisher<nav_msgs::msg::Odometry>(
       "grid_map/sensor_pose_extrinsic", 10);
 
-  /* ---------- 2D 局部产物发布器（enable_2d_ 为 false 时一个都不建）---------- */
+  /* ---------- 2D 局部产物发布器（enable_2d_ 为 false 时一个都不建）----------
+   */
   if (mp_.enable_2d_) {
+    if (mp_.pub_footprint_viz_) {
+      footprint_viz_pub_ =
+          node_->create_publisher<visualization_msgs::msg::MarkerArray>(
+              mp_.topic_footprint_viz_, rclcpp::QoS(1));
+    }
     if (mp_.pub_2d_occupancy_) {
       occ2d_pub_ = node_->create_publisher<nav_msgs::msg::OccupancyGrid>(
           mp_.topic_2d_occupancy_, rclcpp::QoS(1));
@@ -311,21 +440,27 @@ void GridMap::initMap(rclcpp::Node *node) {
       esdf2d_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>(
           mp_.topic_2d_esdf_, rclcpp::QoS(1));
     }
-    RCLCPP_INFO(node_->get_logger(),
-                "[GridMap] 2D 局部层已开启 | 高度带 [%.2f, %.2f] m（%s）"
-                " | occupancy=%d inflate=%d esdf=%d | 节流 %.2fs | 窗口 %dx%d 格",
-                mp_.proj_z_min_, mp_.proj_z_max_,
-                mp_.proj_relative_to_sensor_ ? "相对传感器" : "map 系绝对",
-                static_cast<int>(mp_.pub_2d_occupancy_),
-                static_cast<int>(mp_.pub_2d_occupancy_inflate_),
-                static_cast<int>(mp_.pub_2d_esdf_), mp_.pub_2d_interval_,
-                mp_.map_voxel_num_(0), mp_.map_voxel_num_(1));
+    RCLCPP_INFO(
+        node_->get_logger(),
+        "[GridMap] 2D 局部层已开启 | 高度带 [%.2f, %.2f] m（%s）"
+        " | occupancy=%d inflate=%d esdf=%d | 节流 %.2fs | 窗口 %dx%d 格",
+        mp_.proj_z_min_, mp_.proj_z_max_,
+        mp_.proj_relative_to_sensor_ ? "相对传感器" : "map 系绝对",
+        static_cast<int>(mp_.pub_2d_occupancy_),
+        static_cast<int>(mp_.pub_2d_occupancy_inflate_),
+        static_cast<int>(mp_.pub_2d_esdf_), mp_.pub_2d_interval_,
+        mp_.map_voxel_num_(0), mp_.map_voxel_num_(1));
     if (!mp_.pub_2d_occupancy_ && !mp_.pub_2d_occupancy_inflate_ &&
         !mp_.pub_2d_esdf_) {
       RCLCPP_WARN(node_->get_logger(),
                   "[GridMap] enable_2d 为 true，但三个产物全关，等于白算"
                   "（仍保留同进程查询接口）");
     }
+    RCLCPP_INFO(
+        node_->get_logger(), "[GridMap] 2D 增量重建已启用 | ESDF %s | 自检 %s",
+        mp_.esdf2d_query_en_ ? "每帧重算（esdf2d_query_en=true）"
+                             : "仅在有订阅者/查询开关打开时算（省 CPU）",
+        mp_.verify_2d_ ? "开（每帧暴力全扫对比）" : "关");
   } else {
     RCLCPP_INFO(node_->get_logger(),
                 "[GridMap] 2D 局部层未开启（grid_map.enable_2d=false）");
@@ -424,17 +559,24 @@ void GridMap::resetAllMapData() {
   std::queue<Eigen::Vector3i> empty;
   std::swap(md_.cache_voxel_, empty);
 
+  /* 整张地图作废 → 占据/膨胀索引也一起清空 */
+  md_.occ_idx_list_.clear();
+  md_.infl_idx_list_.clear();
+  std::fill(md_.occ_idx_flag_.begin(), md_.occ_idx_flag_.end(), 0);
+  std::fill(md_.infl_idx_flag_.begin(), md_.infl_idx_flag_.end(), 0);
+
   /* 2D 层属于“上一张地图/上一段观测”的数据，一起作废；
      否则换图后 getDistance2D() 会返回旧地图的距离场。 */
   if (!md_.occ2d_.empty()) {
     std::fill(md_.occ2d_.begin(), md_.occ2d_.end(), static_cast<int8_t>(-1));
     std::fill(md_.occ2d_inflate_.begin(), md_.occ2d_inflate_.end(),
               static_cast<int8_t>(-1));
-    std::fill(md_.occ2d_occ_cnt_.begin(), md_.occ2d_occ_cnt_.end(), 0);
-    std::fill(md_.occ2d_free_cnt_.begin(), md_.occ2d_free_cnt_.end(), 0);
-    std::fill(md_.occ2d_infl_cnt_.begin(), md_.occ2d_infl_cnt_.end(), 0);
     std::fill(md_.esdf2d_.begin(), md_.esdf2d_.end(), -1.f);
+    std::fill(md_.occ2d_dirty_.begin(), md_.occ2d_dirty_.end(), 0);
+    md_.occ2d_dirty_list_.clear();
     md_.has_2d_ = false;
+    md_.occ2d_band_valid_ = false; // 下一次 build2DLayer() 走全量重扫
+    md_.esdf2d_stale_ = true;
   }
 }
 
@@ -469,10 +611,23 @@ void GridMap::updateInflationLayer(const Eigen::Vector3i &id, int delta,
     if (ignore_mask && (*ignore_mask)[addr])
       continue;
 
+    const char old_flag = flag_buffer[addr];
     cnt_buffer[addr] += delta;
     if (cnt_buffer[addr] < 0)
       cnt_buffer[addr] = 0;
     flag_buffer[addr] = cnt_buffer[addr] > 0 ? 1 : 0;
+
+    /* 膨胀体素索引：只在 0↔1 翻转时维护 */
+    if (flag_buffer[addr] != old_flag) {
+      if (flag_buffer[addr])
+        idxNote(md_.infl_idx_list_, md_.infl_idx_flag_, addr);
+      else
+        idxDrop(md_.infl_idx_flag_, addr);
+    }
+
+    // 2D 膨胀产物只关心“该格是否为膨胀格”，所以只在 0↔1 翻转时标脏
+    if (mp_.enable_2d_ && flag_buffer[addr] != old_flag)
+      mark2DColumnDirty(inf_id(0), inf_id(1), inf_id(2));
   }
 }
 
@@ -489,18 +644,34 @@ void GridMap::applyOccupancyUpdate(const Eigen::Vector3i &id,
     return;
 
   const int addr = toAddress(id);
-  const bool was_occ = md_.occupancy_buffer_[addr] > mp_.min_occupancy_log_;
+  const double old_log_odds = md_.occupancy_buffer_[addr];
+  const bool was_occ = old_log_odds > mp_.min_occupancy_log_;
   const bool now_occ = new_log_odds > mp_.min_occupancy_log_;
 
   md_.occupancy_buffer_[addr] = new_log_odds;
   if (was_occ != now_occ)
     updateInflation(id, now_occ ? 1 : -1);
+
+  /* 占据体素索引：仅“转入占据/退出占据”时维护一次 */
+  if (was_occ != now_occ) {
+    if (now_occ)
+      idxNote(md_.occ_idx_list_, md_.occ_idx_flag_, addr);
+    else
+      idxDrop(md_.occ_idx_flag_, addr);
+  }
+
+  /* 2D 层：只有“未知/空闲/占据”三分类真的变了才需要重扫该列。
+     注：已知存在极少数列会漏标（自检可见），因此 build2DLayer() 还会每隔
+     refresh_full_2d_interval_ 次构建做一次全量刷新兜底。 */
+  if (mp_.enable_2d_ && occ2dClass(old_log_odds) != occ2dClass(new_log_odds))
+    mark2DColumnDirty(id(0), id(1), id(2));
 }
 
 void GridMap::resetCellByAddress(int addr) {
   Eigen::Vector3i id_g;
   hashIdToGlobalIndex(addr, id_g);
-  if (md_.occupancy_buffer_[addr] > mp_.min_occupancy_log_)
+  const double old_log_odds = md_.occupancy_buffer_[addr];
+  if (old_log_odds > mp_.min_occupancy_log_)
     updateInflation(id_g, -1);
 
   md_.occupancy_buffer_[addr] = mp_.clamp_min_log_ - mp_.unknown_flag_;
@@ -508,6 +679,11 @@ void GridMap::resetCellByAddress(int addr) {
   md_.count_hit_and_miss_[addr] = 0;
   md_.flag_rayend_[addr] = -1;
   md_.flag_traverse_[addr] = -1;
+  idxDrop(md_.occ_idx_flag_, addr); // 不再占据 → 退出占据索引
+
+  // 归零成“未知”：原来不是未知的话，该 2D 列要重扫
+  if (mp_.enable_2d_ && occ2dClass(old_log_odds) != 0)
+    mark2DColumnDirty(id_g(0), id_g(1), id_g(2));
 }
 
 void GridMap::resetCellByAddressForSliding(
@@ -598,6 +774,10 @@ void GridMap::updateSlidingMap(const Eigen::Vector3d &center) {
     md_.count_hit_and_miss_[addr] = 0;
     md_.flag_rayend_[addr] = -1;
     md_.flag_traverse_[addr] = -1;
+    /* 滑动清图是直接写缓冲（没走 applyOccupancyUpdate/resetCellByAddress），
+       所以这两个索引必须在这里同步清位，否则会留下指向空体的坟墓。 */
+    idxDrop(md_.occ_idx_flag_, addr);
+    idxDrop(md_.infl_idx_flag_, addr);
   }
 
   mp_.map_origin_idx_ = new_origin_idx;
@@ -889,52 +1069,105 @@ Eigen::Vector3d GridMap::closetPointInMap(const Eigen::Vector3d &pt,
 
 void GridMap::visCallback() {
 
-  publishMap();
-  publishMapInflate(true);
+  /* 3D 占据/膨胀点云是"全图 → 点"的输出，单独限频；
+     TF/bbox/footprint 这些便宜的每 tick 都发。 */
+  bool pub_map_now = true;
+  const auto now = std::chrono::steady_clock::now();
+  static std::chrono::steady_clock::time_point last_map;
+  static bool last_map_valid = false;
+  if (last_map_valid && mp_.pub_map_interval_ > 0.0 &&
+      std::chrono::duration<double>(now - last_map).count() <
+          mp_.pub_map_interval_)
+    pub_map_now = false;
+  if (pub_map_now) {
+    last_map = now;
+    last_map_valid = true;
+  }
+
+  if (pub_map_now) {
+    publishMap();
+    publishMapInflate(true);
+  }
   publishSlidingMapFrame();
   publishSlidingMapBBox();
   publishDepthCloud();
   publish2D();
+  publishFootprintViz();
+
+  /* 收紧墓碑：publishMap/publishMapInflate 只在"有人订阅"时才压缩，
+     长期不开 RViz 的话列表会被坟墓擑大（只影响内存与遍历长度）。 */
+  auto compact_idx = [](std::vector<int> &lst, std::vector<char> &flag,
+                        const auto &live) {
+    size_t w = 0;
+    for (size_t i = 0; i < lst.size(); ++i) {
+      const int a = lst[i];
+      if (flag[a] && live(a)) {
+        lst[w++] = a;
+      } else {
+        flag[a] = 0;
+      }
+    }
+    lst.resize(w);
+  };
+  if (md_.occ_idx_list_.size() > 20000)
+    compact_idx(md_.occ_idx_list_, md_.occ_idx_flag_, [&](int a) {
+      return md_.occupancy_buffer_[a] >= mp_.min_occupancy_log_;
+    });
+  if (md_.infl_idx_list_.size() > 40000)
+    compact_idx(md_.infl_idx_list_, md_.infl_idx_flag_, [&](int a) {
+      return md_.occupancy_buffer_inflate_[a] != 0;
+    });
+
+  if (mp_.verify_occ_idx_)
+    verifyOccIdx();
 }
 
 void GridMap::updateOccupancyCallback() {
   if (!md_.occ_need_update_)
     return;
 
-  /* update occupancy */
-  // ros::Time t1, t2, t3, t4;
-  // t1 = ros::Time::now();
+  /* 每帧耗时统计：3D 融合通常是绝对大头，2D 层很小 —— 打印出来才好定位
+     （show_occ_time 打开时，每处理一帧打一行）。 */
+  const auto t_frame = std::chrono::steady_clock::now();
+  static std::chrono::steady_clock::time_point last_frame;
+  static bool last_frame_valid = false;
+  double frame_gap_ms = 0.0;
+  if (last_frame_valid)
+    frame_gap_ms =
+        std::chrono::duration<double, std::milli>(t_frame - last_frame).count();
+  last_frame = t_frame;
+  last_frame_valid = true;
 
   if (!md_.use_cloud_update_)
     projectDepthImage();
-  // t2 = ros::Time::now();
+
+  const auto t_3d = std::chrono::steady_clock::now();
   raycastProcess();
-  // t3 = ros::Time::now();
-
-  // t4 = ros::Time::now();
-
-  // cout << setprecision(7);
-  // cout << "t2=" << (t2-t1).toSec() << " t3=" << (t3-t2).toSec() << " t4=" <<
-  // (t4-t3).toSec() << endl;;
-
-  // md_.fuse_time_ += (t2 - t1).toSec();
-  // md_.max_fuse_time_ = max(md_.max_fuse_time_, (t2 - t1).toSec());
-
-  // if (mp_.show_occ_time_)
-  //   ROS_WARN("Fusion: cur t = %lf, avg t = %lf, max t = %lf", (t2 -
-  //   t1).toSec(),
-  //            md_.fuse_time_ / md_.update_num_, md_.max_fuse_time_);
+  const double ms_3d = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - t_3d)
+                           .count();
 
   /* 3D 融合结束 → 更新 2D 局部层（高度带投影 + 可选 ESDF）*/
+  double ms_2d = 0.0;
   if (mp_.enable_2d_) {
     const auto t0 = std::chrono::steady_clock::now();
     build2DLayer();
-    if (mp_.show_occ_time_) {
-      const double ms = std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - t0)
-                            .count();
-      RCLCPP_INFO(node_->get_logger(), "[GridMap] 2D layer build %.2f ms", ms);
-    }
+    ms_2d = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0)
+                .count();
+  }
+
+  if (mp_.show_occ_time_) {
+    const double ms_cb = std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - t_frame)
+                             .count();
+    const double hz = frame_gap_ms > 0.5 ? 1000.0 / frame_gap_ms : 0.0;
+    RCLCPP_INFO(
+        node_->get_logger(),
+        "[GridMap] 帧耗时: 总 %.1f ms = （点云回调 %.1f + 3D融合 %.1f + 2D "
+        "%.1f）ms | 点数 %d | 帧间隔 %.1f ms（%.2f Hz）",
+        ms_cb, md_.t_cloud_ms_, ms_3d, ms_2d, md_.proj_points_cnt, frame_gap_ms,
+        hz);
   }
 
   md_.occ_need_update_ = false;
@@ -1046,6 +1279,14 @@ void GridMap::cloudCallback(
   if (mp_.sensor_type_ != "lidar")
     return;
 
+  const auto t_cb = std::chrono::steady_clock::now();
+  // 退出前把本次点云回调耗时记下来（帧耗时日志要用）
+  auto note_ms = [&]() {
+    md_.t_cloud_ms_ = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t_cb)
+                          .count();
+  };
+
   if (!md_.has_ray_pose_) {
     RCLCPP_WARN_THROTTLE(
         node_->get_logger(), *node_->get_clock(), 1000,
@@ -1099,9 +1340,12 @@ void GridMap::cloudCallback(
     md_.proj_points_cnt++;
   }
 
-  if (md_.proj_points_cnt == 0)
+  if (md_.proj_points_cnt == 0) {
+    note_ms();
     return;
+  }
 
+  note_ms();
   md_.use_cloud_update_ = true;
   md_.occ_need_update_ = true;
 }
@@ -1111,18 +1355,22 @@ void GridMap::cloudCallback(
  *
  * 几个刻意的设计选择：
  *  1) 所有 2D 产物按**全局索引连续排列**（i2d = ix + iy * nx），不做环形 wrap。
- *     3D 缓冲为了滑动查表是环形下标的，所以这里是 "读 3D（自动 wrap）→ 写 2D（连续）"，
- *     于是 2D 层在世界系下是一个真正的矩形，EDT 不会跨越边界算出假的近距离。
- *     这个布局与 nav_msgs/OccupancyGrid 的 data[x + y*width] 完全一致，发布时可以整段拷贝。
- *  2) 每格三种状态：占据 100 / 空闲 0 / 未知 -1。
- *     高度带内**只要有一个体素是占据**就算占据（与 3D 的 inflate 语义一致）。
- *  3) ESDF 默认对未知区域取乐观解释（当自由），与 3D 层一致；
+ *     3D 缓冲为了滑动查表是环形下标的，所以这里是 "读 3D（自动 wrap）→ 写
+ * 2D（连续）"， 于是 2D 层在世界系下是一个真正的矩形，EDT
+ * 不会跨越边界算出假的近距离。 这个布局与 nav_msgs/OccupancyGrid 的 data[x +
+ * y*width] 完全一致，发布时可以整段拷贝。 2) 每格三种状态：占据 100 / 空闲 0 /
+ * 未知 -1。 高度带内**只要有一个体素是占据**就算占据（与 3D 的 inflate
+ * 语义一致）。 3) ESDF 默认对未知区域取乐观解释（当自由），与 3D 层一致；
  *     需要保守规划时把 esdf_unknown_as_occupied 打开。
  */
 
 void GridMap::build2DLayer() {
   if (!mp_.enable_2d_)
     return;
+
+  /* footprint 位姿缓存：fp_prev_ 保留上一帧的（用于下面的“已离开区域”重扫），
+     fp_cur_ 换成当前位姿（后面 mask / 自检 / 可视化都用它）。 */
+  updateFootprintPoseCache();
 
   const int nx = mp_.map_voxel_num_(0);
   const int ny = mp_.map_voxel_num_(1);
@@ -1144,101 +1392,516 @@ void GridMap::build2DLayer() {
   kz1 = std::min(kz1, mp_.map_bound_max_idx_(2));
   md_.proj_z_lo_ = z_lo;
   md_.proj_z_hi_ = z_hi;
-  /// 固定本帧 2D 数据对应的窗口原点（发布/查询时都用它，避免与滑动地图错位）
-  md_.occ2d_min_idx_ = mp_.map_bound_min_idx_;
-
+  /* ⚠ 这里**不能**先把锚点改成当前窗口原点：下面要用 md_.occ2d_min_idx_（上一帧
+     构建时的锚点）算 dx/dy 来决定是否需要平移 2D 数组。锚点只在函数末尾统一更新
+     （见 md_.occ2d_min_idx_ = anchor）。早期版本在这里多写了一次，导致 dx 恒为
+     0、 平移永不执行 → 每次滑窗后整张 2D 图与锚点错位。 */
   const bool need_infl = mp_.pub_2d_occupancy_inflate_;
-  std::fill(md_.occ2d_.begin(), md_.occ2d_.end(), static_cast<int8_t>(-1));
-  std::fill(md_.occ2d_occ_cnt_.begin(), md_.occ2d_occ_cnt_.end(), 0);
-  std::fill(md_.occ2d_free_cnt_.begin(), md_.occ2d_free_cnt_.end(), 0);
-  if (need_infl)
-    std::fill(md_.occ2d_infl_cnt_.begin(), md_.occ2d_infl_cnt_.end(), 0);
+  const Eigen::Vector3i anchor = mp_.map_bound_min_idx_;
 
-  if (kz0 > kz1) {
-    RCLCPP_WARN_THROTTLE(
-        node_->get_logger(), *node_->get_clock(), 5000,
-        "[GridMap] 2D 投影高度带 [%.2f, %.2f] 与滑动地图 z 区间不相交，2D 层全为未知"
-        "（检查 proj_z_min/proj_z_max 与 sliding_map_size_z）",
-        mp_.proj_z_min_, mp_.proj_z_max_);
-    md_.has_2d_ = false;
-    return;
+  /* ---------- 2) 决定重建范围 ----------
+   * full：整窗重扫（首次构建 / 换图 / 高度带变了 / 窗口大跳 / 尺寸不匹配）
+   * 平移 + 增量：窗口只平移时，先把 2D
+   * 数据在窗口坐标系里原地平移以保持世界系对齐， 然后只重扫「本帧 3D
+   * 真正改变分类的列」+「新露出的条带」。
+   */
+  bool full = mp_.force_full_2d_ || !md_.has_2d_ || !md_.occ2d_band_valid_ ||
+              md_.occ2d_.size() != static_cast<size_t>(n2d) ||
+              md_.occ2d_kz0_ != kz0 || md_.occ2d_kz1_ != kz1;
+
+  /* 周期性全量刷新：增量路径存在极少数“漏标脏”的情形（自检可见），
+     定期整窗重扫一次把它彻底扫掉，把误差寿命限制在 refresh_full_2d_interval_
+     次构建以内。 */
+  if (!full && mp_.refresh_full_2d_interval_ > 0 &&
+      ++md_.occ2d_since_full_ >= mp_.refresh_full_2d_interval_)
+    full = true;
+  if (full)
+    md_.occ2d_since_full_ = 0;
+
+  int dx = 0, dy = 0;
+  if (!full) {
+    dx = anchor(0) - md_.occ2d_min_idx_(0);
+    dy = anchor(1) - md_.occ2d_min_idx_(1);
+    if (std::abs(dx) >= nx || std::abs(dy) >= ny)
+      full = true; // 窗口整体换过（位姿大跳 / 换图）
+    /* z 方向滑动（anchor(2) 变化）既不需要平移、也不需要整窗重扫：
+       2D 数组只按 (x,y) 索引，z 仅通过高度带 kz0/kz1 影响结果；而 z 滑动
+       清掉的 slab 只可能是 new_min 以下 / new_max 以上的平面，于是：
+         · 带被窗口边界裁剪时（kz0==new_min 或 kz1==new_max），
+           kz 相对上一帧必然变化 → 上面的 full 条件已经命中；
+         · 带严格落在窗口内时，被清的平面完全在带外 → 不影响任何列的带内内容。
+       因此这里不再有 dz!=0 ⇒ full 的保守分支（已用自检验证）。 */
   }
 
-  /* ---------- 2) 逐 (x,y) 扫高度带 ---------- */
-  /// toAddress 的布局是 lx*(ny*nz) + ly*nz + lz，这里把不随格子变化的量提到循环外
+  /* 脏列登记（增量路径用）。放在 if/else 之前：footprint 的区域修正在
+     “窗口有无平移”两种情况下都要用。 */
+  auto add_dirty = [&](int i2d) {
+    if (!md_.occ2d_dirty_[i2d]) {
+      md_.occ2d_dirty_[i2d] = 1;
+      md_.occ2d_dirty_list_.push_back(i2d);
+    }
+  };
+
+  if (full) {
+    std::fill(md_.occ2d_dirty_.begin(), md_.occ2d_dirty_.end(), 0);
+    md_.occ2d_dirty_list_.clear();
+  } else if (dx != 0 || dy != 0) {
+    /* 脏列下标要跟着数据一起换坐标系：旧下标先作废，再按新下标重建，
+       落到窗口外的（滑出去的列）直接丢弃。逐轴换算，与 shift2DArray 同一语义。
+     */
+    std::fill(md_.occ2d_dirty_.begin(), md_.occ2d_dirty_.end(), 0);
+    size_t w = 0;
+    for (int i2d : md_.occ2d_dirty_list_) {
+      const int ix = i2d % nx, iy = i2d / nx;
+      const int sx = ix - dx, sy = iy - dy;
+      if (sx < 0 || sx >= nx || sy < 0 || sy >= ny)
+        continue; // 该列已滑出窗口
+      const int k = sx + sy * nx;
+      md_.occ2d_dirty_list_[w++] = k;
+      md_.occ2d_dirty_[k] = 1;
+    }
+    md_.occ2d_dirty_list_.resize(w);
+
+    // 数据数组平移（新露出的条带先填“未知”，随后会被标脏重扫）
+    shift2DArray(md_.occ2d_, nx, ny, dx, dy, static_cast<int8_t>(-1));
+    shift2DArray(md_.occ2d_inflate_, nx, ny, dx, dy, static_cast<int8_t>(-1));
+
+    // 新露出的条带没有任何历史数据 → 全部标脏
+    if (dy > 0) {
+      for (int iy = ny - dy; iy < ny; ++iy)
+        for (int ix = 0; ix < nx; ++ix)
+          add_dirty(ix + iy * nx);
+    } else if (dy < 0) {
+      for (int iy = 0; iy < -dy; ++iy)
+        for (int ix = 0; ix < nx; ++ix)
+          add_dirty(ix + iy * nx);
+    }
+    if (dx > 0) {
+      for (int iy = 0; iy < ny; ++iy)
+        for (int ix = nx - dx; ix < nx; ++ix)
+          add_dirty(ix + iy * nx);
+    } else if (dx < 0) {
+      for (int iy = 0; iy < ny; ++iy)
+        for (int ix = 0; ix < -dx; ++ix)
+          add_dirty(ix + iy * nx);
+    }
+  }
+
+  if (!full) {
+    /* ---------- footprint 离开区域的重扫修正 ----------
+       机器人移动后，**上一帧**被 footprint mask 抹成“空闲”的格子如果本帧不再被抹，
+       它们的真实投影值就没人重扫 → 会永久留下假空闲（自检能抓到：期望 100 实际 0，
+       且提示“本帧未重扫”）。这里把上一帧 footprint 覆盖的列全部标脏，让它们重扫回
+       真实投影；本帧仍在 footprint 内的格子随后会被 applyFootprintClear() 再抹一遍，
+       所以多标一点没有副作用。代价只有矩形内几十格。
+       ⚠ 下标必须用**本帧** anchor 换算：数组此时已经平移到新窗口坐标系了。 */
+    const FootprintPose &fprev = md_.fp_prev_;
+    if (fprev.valid && mp_.footprint_length_ > 0.0 &&
+        mp_.footprint_width_ > 0.0) {
+      const double half = footprintCircumradius();
+      const auto to_ix = [&](double w, int a) {
+        return static_cast<int>(std::floor(w * mp_.resolution_inv_)) - a;
+      };
+      const int fx0 = std::max(0, to_ix(fprev.cx - half, anchor(0)));
+      const int fx1 = std::min(nx - 1, to_ix(fprev.cx + half, anchor(0)));
+      const int fy0 = std::max(0, to_ix(fprev.cy - half, anchor(1)));
+      const int fy1 = std::min(ny - 1, to_ix(fprev.cy + half, anchor(1)));
+      for (int iy = fy0; iy <= fy1; ++iy) {
+        const double wy = (anchor(1) + iy + 0.5) * mp_.resolution_;
+        for (int ix = fx0; ix <= fx1; ++ix) {
+          const double wx = (anchor(0) + ix + 0.5) * mp_.resolution_;
+          if (inFootprintRect(fprev, wx, wy))
+            add_dirty(ix + iy * nx);
+        }
+      }
+    }
+  }
+
+  /* ---------- 3) 重扫：全量所有列，或只扫脏列 ---------- */  /// toAddress 的布局是 lx*(ny*nz) + ly*nz +
+  /// lz，这里把不随格子变化的量提到循环外
   std::vector<int> kz_local;
   kz_local.reserve(static_cast<size_t>(kz1 - kz0 + 1));
   for (int kz = kz0; kz <= kz1; ++kz)
     kz_local.push_back(getLocalIndex(kz, 2));
   const int stride_x = ny * nz;
-  const int bx0 = mp_.map_bound_min_idx_(0);
-  const int by0 = mp_.map_bound_min_idx_(1);
 
+  auto rebuild_column = [&](int i2d) {
+    const int ix = i2d % nx;
+    const int iy = i2d / nx;
+    const int base = getLocalIndex(anchor(0) + ix, 0) * stride_x +
+                     getLocalIndex(anchor(1) + iy, 1) * nz;
+    bool has_occ = false, has_free = false, has_infl = false;
+    for (size_t k = 0; k < kz_local.size(); ++k) {
+      const int adr = base + kz_local[k];
+      const double log_odds = md_.occupancy_buffer_[adr];
+      if (log_odds > mp_.min_occupancy_log_) {
+        has_occ = true;
+      } else if (log_odds >= mp_.clamp_min_log_) {
+        has_free = true;
+      }
+      if (need_infl && md_.occupancy_buffer_inflate_[adr] != 0)
+        has_infl = true;
+      // 早退：结果的两种情况（有无占据 /
+      // 有无非占据）都确定了，后面的层不影响结果
+      if (has_occ && (has_free || (need_infl && has_infl)))
+        break;
+    }
+    md_.occ2d_[i2d] =
+        has_occ ? static_cast<int8_t>(100)
+                : (has_free ? static_cast<int8_t>(0) : static_cast<int8_t>(-1));
+    if (need_infl)
+      md_.occ2d_inflate_[i2d] = has_infl ? static_cast<int8_t>(100)
+                                         : (has_free ? static_cast<int8_t>(0)
+                                                     : static_cast<int8_t>(-1));
+    md_.occ2d_last_build_[i2d] = md_.occ2d_build_cnt_;
+  };
+
+  int rebuilt = 0;
+  ++md_.occ2d_build_cnt_;
+  if (full) {
+    for (int i2d = 0; i2d < n2d; ++i2d)
+      rebuild_column(i2d);
+    rebuilt = n2d;
+    md_.esdf2d_stale_ = true;
+  } else {
+    rebuilt = static_cast<int>(md_.occ2d_dirty_list_.size());
+    for (int i2d : md_.occ2d_dirty_list_) {
+      md_.occ2d_dirty_[i2d] = 0;
+      rebuild_column(i2d);
+    }
+    md_.occ2d_dirty_list_.clear();
+    if (rebuilt > 0)
+      md_.esdf2d_stale_ = true;
+  }
+
+  /// 固定本帧 2D 数据对应的窗口原点（发布/查询时都用它，避免与滑动地图错位）
+  md_.occ2d_min_idx_ = anchor;
+  md_.occ2d_kz0_ = kz0;
+  md_.occ2d_kz1_ = kz1;
+  md_.occ2d_band_valid_ = true;
+  md_.has_2d_ = true;
+
+  /* ---------- 4) footprint 清除 ----------
+     放在每帧构建的**最后**：增量路径下被重扫的列也会在这里重新抹一遍，于是
+     “机器人脚下永远不是障碍”是个几何保证，与自车点云从哪来无关。
+     必须在 verify2DLayer 之前，否则自检会看到未经抹除的期望值。 */
+  applyFootprintClear();
+
+  if (mp_.show_occ_time_) {
+    static int stat_cnt = 0;
+    if (++stat_cnt % 100 == 0)
+      RCLCPP_INFO(node_->get_logger(),
+                  "[GridMap] 2D 增量重建：本帧 %d / %d 列（%.1f%%）", rebuilt,
+                  n2d, 100.0 * rebuilt / static_cast<double>(std::max(1, n2d)));
+  }
+
+  if (mp_.verify_2d_)
+    verify2DLayer(dx, dy, full, rebuilt);
+}
+
+FootprintPose GridMap::computeFootprintPose() const {
+  FootprintPose fp;
+  if (!mp_.footprint_clear_enable_ || !md_.has_ray_pose_)
+    return fp; // valid = false
+
+  /* 机器人朝向：取传感器位姿的 yaw（纯俯仰安装时 yaw 仍等于机体朝向；
+     机体与雷达朝向不一致时用 footprint_yaw_offset_deg 修正）。 */
+  const Eigen::Quaterniond &q = md_.ray_q_;
+  double yaw = std::atan2(2.0 * (q.w() * q.z() + q.x() * q.y()),
+                          1.0 - 2.0 * (q.y() * q.y() + q.z() * q.z()));
+  yaw += mp_.footprint_yaw_offset_deg_ * M_PI / 180.0;
+  fp.c = std::cos(yaw);
+  fp.s = std::sin(yaw);
+  // 矩形中心 = 传感器位置 + 机体系偏移（offset_x 沿机体前向，offset_y
+  // 沿机体左向）
+  fp.cx = md_.ray_pos_.x() + fp.c * mp_.footprint_offset_x_ -
+          fp.s * mp_.footprint_offset_y_;
+  fp.cy = md_.ray_pos_.y() + fp.s * mp_.footprint_offset_x_ +
+          fp.c * mp_.footprint_offset_y_;
+  fp.valid = true;
+  return fp;
+}
+
+void GridMap::updateFootprintPoseCache() {
+  md_.fp_prev_ = md_.fp_cur_;
+  md_.fp_cur_ = computeFootprintPose();
+}
+
+double GridMap::footprintCircumradius() const {
+  const double m = 0.5 * mp_.resolution_;
+  return 0.5 * std::hypot(mp_.footprint_length_ + 2.0 * m,
+                          mp_.footprint_width_ + 2.0 * m);
+}
+
+void GridMap::applyFootprintClear() {
+  if (!mp_.enable_2d_ || !md_.has_2d_ || mp_.footprint_length_ <= 0.0 ||
+      mp_.footprint_width_ <= 0.0 || !md_.fp_cur_.valid)
+    return;
+
+  const int nx = mp_.map_voxel_num_(0);
+  const int ny = mp_.map_voxel_num_(1);
+  const Eigen::Vector3i &anchor = md_.occ2d_min_idx_;
+
+  /* 只需遍历 footprint 覆盖的格子。
+     ⚠ 包围盒必须用**外扩后矩形**的外接圆半径：判定用的是"格与矩形相交"
+     （矩形外扩半格），斜着转（yaw≠0）时外扩矩形的 x/y 投影会超出
+     0.5*hypot(L,W)，用后者会漏掉边缘几格没抹（自检能抓到，实测过）。 */
+  const double half_diag = footprintCircumradius();
+  const FootprintPose &fp = md_.fp_cur_;
+  const int ix0 =
+      std::max(0, static_cast<int>(std::floor((fp.cx - half_diag) *
+                                              mp_.resolution_inv_)) -
+                      anchor(0));
+  const int ix1 = std::min(
+      nx - 1, static_cast<int>(std::ceil((fp.cx + half_diag) *
+                                         mp_.resolution_inv_)) -
+                  anchor(0));
+  const int iy0 =
+      std::max(0, static_cast<int>(std::floor((fp.cy - half_diag) *
+                                              mp_.resolution_inv_)) -
+                      anchor(1));
+  const int iy1 = std::min(
+      ny - 1, static_cast<int>(std::ceil((fp.cy + half_diag) *
+                                         mp_.resolution_inv_)) -
+                  anchor(1));
+
+  const int8_t v = footprintValue();
+  const bool need_infl = mp_.pub_2d_occupancy_inflate_;
+  int changed = 0;
+  for (int iy = iy0; iy <= iy1; ++iy) {
+    const double wy = (anchor(1) + iy + 0.5) * mp_.resolution_;
+    for (int ix = ix0; ix <= ix1; ++ix) {
+      const double wx = (anchor(0) + ix + 0.5) * mp_.resolution_;
+      if (!inFootprint(wx, wy))
+        continue;
+      const int i2d = ix + iy * nx;
+      if (md_.occ2d_[i2d] != v) {
+        md_.occ2d_[i2d] = v;
+        ++changed;
+      }
+      if (need_infl && md_.occ2d_inflate_[i2d] != v) {
+        md_.occ2d_inflate_[i2d] = v;
+        ++changed;
+      }
+    }
+  }
+  if (changed > 0)
+    md_.esdf2d_stale_ = true; // footprint 抹掉的格也要反映到 ESDF
+}
+
+void GridMap::publishFootprintViz() {
+  if (!mp_.enable_2d_ || !mp_.pub_footprint_viz_ || !footprint_viz_pub_ ||
+      mp_.footprint_length_ <= 0.0 || mp_.footprint_width_ <= 0.0 ||
+      footprint_viz_pub_->get_subscription_count() == 0)
+    return;
+  const FootprintPose fp = computeFootprintPose();
+  if (!fp.valid)
+    return;
+
+  // 与 2D 栅格同一节流节奏（pub_2d_interval_），避免无谓刷屏
+  const auto now = std::chrono::steady_clock::now();
+  static std::chrono::steady_clock::time_point last_viz;
+  static bool last_viz_valid = false;
+  if (last_viz_valid && mp_.pub_2d_interval_ > 0.0 &&
+      std::chrono::duration<double>(now - last_viz).count() <
+          mp_.pub_2d_interval_)
+    return;
+  last_viz = now;
+  last_viz_valid = true;
+
+  /* 画在 2D 栅格同一高度（带中点）上，这样在 RViz 里能和 2D 图叠在一起看；
+     2D 层还没建起来时退化成雷达高度。 */
+  const float z =
+      md_.has_2d_ ? static_cast<float>(0.5 * (md_.proj_z_lo_ + md_.proj_z_hi_))
+                  : static_cast<float>(md_.ray_pos_.z());
+  const float hl = 0.5f * static_cast<float>(mp_.footprint_length_);
+  const float hw = 0.5f * static_cast<float>(mp_.footprint_width_);
+  const double yaw = std::atan2(fp.s, fp.c); // 由 cos/sin 还原 yaw
+  const double cy = std::cos(yaw), sy = std::sin(yaw);
+
+  visualization_msgs::msg::MarkerArray arr;
+  const rclcpp::Time stamp = node_->now();
+
+  // 四个角（机体系）→ map 系
+  const double lx[4] = {-hl, hl, hl, -hl};
+  const double ly[4] = {-hw, -hw, hw, hw};
+  auto to_map = [&](double x, double y, geometry_msgs::msg::Point &out) {
+    out.x = fp.cx + cy * x - sy * y;
+    out.y = fp.cy + sy * x + cy * y;
+    out.z = z + 0.02; // 稍抬高一点，避免与 2D 栅格平面 z-fighting
+  };
+
+  visualization_msgs::msg::Marker outline;
+  outline.header.stamp = stamp;
+  outline.header.frame_id = mp_.frame_id_;
+  outline.ns = "footprint";
+  outline.id = 0;
+  outline.type = visualization_msgs::msg::Marker::LINE_STRIP;
+  outline.action = visualization_msgs::msg::Marker::ADD;
+  outline.pose.orientation.w = 1.0;
+  outline.scale.x = 0.02; // 线宽
+  outline.color.r = 0.0f;
+  outline.color.g = 1.0f;
+  outline.color.b = 0.3f;
+  outline.color.a = 1.0f;
+  outline.points.resize(5);
+  for (int i = 0; i < 4; ++i)
+    to_map(lx[i], ly[i], outline.points[i]);
+  outline.points[4] = outline.points[0]; // 闭合
+  arr.markers.push_back(outline);
+
+  visualization_msgs::msg::Marker fill = outline;
+  fill.id = 1;
+  fill.type = visualization_msgs::msg::Marker::CUBE;
+  fill.points.clear();
+  fill.pose.position.x = fp.cx;
+  fill.pose.position.y = fp.cy;
+  fill.pose.position.z = z + 0.01;
+  fill.pose.orientation.z = std::sin(yaw * 0.5);
+  fill.pose.orientation.w = std::cos(yaw * 0.5);
+  fill.scale.x = mp_.footprint_length_;
+  fill.scale.y = mp_.footprint_width_;
+  fill.scale.z = 0.01;
+  fill.color.a = 0.25f;
+  arr.markers.push_back(fill);
+
+  footprint_viz_pub_->publish(arr);
+}
+
+void GridMap::build2DESDF() {
+  if (!mp_.enable_2d_ || !mp_.pub_2d_esdf_ || !md_.has_2d_ ||
+      md_.esdf2d_.empty() || !md_.esdf2d_stale_)
+    return;
+
+  const int nx = mp_.map_voxel_num_(0);
+  const int ny = mp_.map_voxel_num_(1);
+  const int n2d = nx * ny;
+
+  const float inv_res = static_cast<float>(mp_.resolution_inv_);
+  const float max_cells = static_cast<float>(mp_.esdf_max_dist_) * inv_res;
+  const float max_sq = max_cells * max_cells;
+
+  for (int i = 0; i < n2d; ++i) {
+    const int8_t c = md_.occ2d_[i];
+    const bool blocked =
+        (c == 100) || (mp_.esdf_unknown_as_occupied_ && c == -1);
+    md_.edt_f_[i] = blocked ? 0.f : kEdtInf;
+  }
+  for (int iy = 0; iy < ny; ++iy) { // 行方向
+    const int row = iy * nx;
+    for (int ix = 0; ix < nx; ++ix)
+      md_.edt_line_in_[ix] = md_.edt_f_[row + ix];
+    edt1D(md_.edt_line_in_, md_.edt_line_out_, nx, md_.edt_v_, md_.edt_z_);
+    for (int ix = 0; ix < nx; ++ix)
+      md_.edt_sq_[row + ix] = md_.edt_line_out_[ix];
+  }
+  for (int ix = 0; ix < nx; ++ix) { // 列方向
+    for (int iy = 0; iy < ny; ++iy)
+      md_.edt_line_in_[iy] = md_.edt_sq_[ix + iy * nx];
+    edt1D(md_.edt_line_in_, md_.edt_line_out_, ny, md_.edt_v_, md_.edt_z_);
+    for (int iy = 0; iy < ny; ++iy)
+      md_.esdf2d_[ix + iy * nx] =
+          std::sqrt(std::min(md_.edt_line_out_[iy], max_sq)) / inv_res;
+  }
+
+  md_.esdf2d_stale_ = false;
+}
+
+void GridMap::verify2DLayer(int dx, int dy, bool full, int rebuilt) {
+  if (!mp_.enable_2d_ || !md_.has_2d_ || !md_.occ2d_band_valid_)
+    return;
+
+  const int nx = mp_.map_voxel_num_(0);
+  const int ny = mp_.map_voxel_num_(1);
+  const int nz = mp_.map_voxel_num_(2);
+  const int stride_x = ny * nz;
+  const Eigen::Vector3i anchor = md_.occ2d_min_idx_; // 2D 数据自己的锚点
+  const bool need_infl = mp_.pub_2d_occupancy_inflate_;
+
+  std::vector<int> kz_local;
+  for (int kz = md_.occ2d_kz0_; kz <= md_.occ2d_kz1_; ++kz)
+    kz_local.push_back(getLocalIndex(kz, 2));
+
+  int bad_occ = 0, bad_infl = 0, first_i2d = -1, first_expected = 0,
+      first_got = 0;
+  // 自检里 occ / inflate 两层的首例失配分开记（否则报错信息会打出无意义的格号）
+  int first_inf_i2d = -1, first_inf_expected = 0, first_inf_got = 0;
+  int min_ix = 1 << 30, max_ix = -1, min_iy = 1 << 30, max_iy = -1;
+  int first_stamp = -1;
+  int bad_now = 0, bad_stale = 0; // “本帧刚重扫过但仍不对” / “本帧没被重扫”
   for (int iy = 0; iy < ny; ++iy) {
-    const int ly = getLocalIndex(by0 + iy, 1) * nz;
+    const int ly = getLocalIndex(anchor(1) + iy, 1) * nz;
     for (int ix = 0; ix < nx; ++ix) {
-      const int base = getLocalIndex(bx0 + ix, 0) * stride_x + ly;
-      int occ_cnt = 0, free_cnt = 0, infl_cnt = 0;
+      const int base = getLocalIndex(anchor(0) + ix, 0) * stride_x + ly;
+      bool has_occ = false, has_free = false, has_infl = false;
       for (size_t k = 0; k < kz_local.size(); ++k) {
         const int adr = base + kz_local[k];
         const double log_odds = md_.occupancy_buffer_[adr];
-        if (log_odds > mp_.min_occupancy_log_) {
-          ++occ_cnt;
-        } else if (log_odds >= mp_.clamp_min_log_) {
-          ++free_cnt;
-        }
+        if (log_odds > mp_.min_occupancy_log_)
+          has_occ = true;
+        else if (log_odds >= mp_.clamp_min_log_)
+          has_free = true;
         if (need_infl && md_.occupancy_buffer_inflate_[adr] != 0)
-          ++infl_cnt;
+          has_infl = true;
       }
-
       const int i2d = ix + iy * nx;
-      md_.occ2d_occ_cnt_[i2d] = occ_cnt;
-      md_.occ2d_free_cnt_[i2d] = free_cnt;
-      if (need_infl)
-        md_.occ2d_infl_cnt_[i2d] = infl_cnt;
-
-      md_.occ2d_[i2d] = occ_cnt > 0 ? static_cast<int8_t>(100)
-                                    : (free_cnt > 0 ? static_cast<int8_t>(0)
-                                                    : static_cast<int8_t>(-1));
-      if (need_infl)
-        md_.occ2d_inflate_[i2d] =
-            infl_cnt > 0 ? static_cast<int8_t>(100)
-                         : (free_cnt > 0 ? static_cast<int8_t>(0)
-                                         : static_cast<int8_t>(-1));
+      /* footprint 内的格子期望值就是“抹除后的值”（applyFootprintClear 已在
+         本帧构建末尾执行）—— 否则自检会把正确处理报成失败。 */
+      const bool in_fp = inFootprint((anchor(0) + ix + 0.5) * mp_.resolution_,
+                                     (anchor(1) + iy + 0.5) * mp_.resolution_);
+      const int8_t e_occ =
+          in_fp ? footprintValue() : (has_occ ? 100 : (has_free ? 0 : -1));
+      if (md_.occ2d_[i2d] != e_occ) {
+        if (bad_occ == 0) {
+          first_i2d = i2d;
+          first_expected = e_occ;
+          first_got = md_.occ2d_[i2d];
+          first_stamp = md_.occ2d_last_build_[i2d];
+        }
+        min_ix = std::min(min_ix, ix);
+        max_ix = std::max(max_ix, ix);
+        min_iy = std::min(min_iy, iy);
+        max_iy = std::max(max_iy, iy);
+        if (md_.occ2d_last_build_[i2d] == md_.occ2d_build_cnt_)
+          ++bad_now;
+        else
+          ++bad_stale;
+        ++bad_occ;
+      }
+      if (need_infl) {
+        const int8_t e_inf =
+            in_fp ? footprintValue() : (has_infl ? 100 : (has_free ? 0 : -1));
+        if (md_.occ2d_inflate_[i2d] != e_inf) {
+          if (first_inf_i2d < 0) {
+            first_inf_i2d = i2d;
+            first_inf_expected = e_inf;
+            first_inf_got = md_.occ2d_inflate_[i2d];
+          }
+          ++bad_infl;
+        }
+      }
     }
   }
 
-  /* ---------- 3) 2D ESDF（可选）---------- */
-  if (mp_.pub_2d_esdf_) {
-    const float inv_res = static_cast<float>(mp_.resolution_inv_);
-    const float max_cells = static_cast<float>(mp_.esdf_max_dist_) * inv_res;
-    const float max_sq = max_cells * max_cells;
-
-    for (int i = 0; i < n2d; ++i) {
-      const int8_t c = md_.occ2d_[i];
-      const bool blocked =
-          (c == 100) || (mp_.esdf_unknown_as_occupied_ && c == -1);
-      md_.edt_f_[i] = blocked ? 0.f : kEdtInf;
-    }
-    for (int iy = 0; iy < ny; ++iy) { // 行方向
-      const int row = iy * nx;
-      for (int ix = 0; ix < nx; ++ix)
-        md_.edt_line_in_[ix] = md_.edt_f_[row + ix];
-      edt1D(md_.edt_line_in_, md_.edt_line_out_, nx, md_.edt_v_, md_.edt_z_);
-      for (int ix = 0; ix < nx; ++ix)
-        md_.edt_sq_[row + ix] = md_.edt_line_out_[ix];
-    }
-    for (int ix = 0; ix < nx; ++ix) { // 列方向
-      for (int iy = 0; iy < ny; ++iy)
-        md_.edt_line_in_[iy] = md_.edt_sq_[ix + iy * nx];
-      edt1D(md_.edt_line_in_, md_.edt_line_out_, ny, md_.edt_v_, md_.edt_z_);
-      for (int iy = 0; iy < ny; ++iy)
-        md_.esdf2d_[ix + iy * nx] =
-            std::sqrt(std::min(md_.edt_line_out_[iy], max_sq)) / inv_res;
-    }
+  if (bad_occ || bad_infl) {
+    RCLCPP_ERROR(
+        node_->get_logger(),
+        "[GridMap] 2D 自检失败：occ=%d 格 inflate=%d 格 | 首例 (ix=%d,iy=%d) "
+        "期望 %d 实际 %d（最后一次重扫@第 %d 次构建，当前第 %d 次）| "
+        "差异范围 ix[%d,%d] iy[%d,%d] | 本帧 full=%d dx=%d dy=%d 已重扫=%d | "
+        "本帧扫过仍错=%d 本帧未重扫=%d | 带[%d,%d] 锚点(%d,%d) | inflate 首例 "
+        "(ix=%d,iy=%d) 期望 %d 实际 %d",
+        bad_occ, bad_infl, first_i2d % nx, first_i2d / nx, first_expected,
+        first_got, first_stamp, md_.occ2d_build_cnt_, min_ix, max_ix, min_iy,
+        max_iy, static_cast<int>(full), dx, dy, rebuilt, bad_now, bad_stale,
+        md_.occ2d_kz0_, md_.occ2d_kz1_, anchor(0), anchor(1),
+        first_inf_i2d % nx, first_inf_i2d / nx, first_inf_expected,
+        first_inf_got);
+  } else {
+    RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 10000,
+                         "[GridMap] 2D 自检通过：%d 格与暴力全扫完全一致",
+                         nx * ny);
   }
-
-  md_.has_2d_ = true;
 }
 
 void GridMap::publish2D() {
@@ -1271,10 +1934,12 @@ void GridMap::publish2D() {
     msg.info.resolution = res;
     msg.info.width = static_cast<uint32_t>(nx);
     msg.info.height = static_cast<uint32_t>(ny);
-    // OccupancyGrid 的 origin 是 (0,0) 格的**角点**，格心 = origin + (i+0.5)*res
+    // OccupancyGrid 的 origin 是 (0,0) 格的**角点**，格心 = origin +
+    // (i+0.5)*res
     msg.info.origin.position.x = md_.occ2d_min_idx_(0) * mp_.resolution_;
     msg.info.origin.position.y = md_.occ2d_min_idx_(1) * mp_.resolution_;
-    msg.info.origin.position.z = z_mid; // 只作为切片高度的记录（RViz Map 显示会用它）
+    msg.info.origin.position.z =
+        z_mid; // 只作为切片高度的记录（RViz Map 显示会用它）
     msg.info.origin.orientation.w = 1.0;
     msg.data = src; // 布局一致，直接拷贝
     return msg;
@@ -1285,6 +1950,24 @@ void GridMap::publish2D() {
 
   if (occ2d_inf_pub_ && occ2d_inf_pub_->get_subscription_count() > 0)
     occ2d_inf_pub_->publish(make_grid_msg(md_.occ2d_inflate_));
+
+  /* ESDF 只在真正需要时才算（esdf2d_query_en_ 或有人在订阅）；
+     本函数受 pub_2d_interval_ 节流，所以进程内查询场景下 ESDF 的刷新率 =
+     发布率。 */
+  if (mp_.pub_2d_esdf_ &&
+      (mp_.esdf2d_query_en_ ||
+       (esdf2d_pub_ && esdf2d_pub_->get_subscription_count() > 0))) {
+    const auto t_esdf = std::chrono::steady_clock::now();
+    build2DESDF();
+    if (mp_.show_occ_time_) {
+      static int esdf_cnt = 0;
+      if (++esdf_cnt % 50 == 0)
+        RCLCPP_INFO(node_->get_logger(), "[GridMap] 2D ESDF 构建 %.2f ms",
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t_esdf)
+                        .count());
+    }
+  }
 
   if (esdf2d_pub_ && esdf2d_pub_->get_subscription_count() > 0) {
     const int step = std::max(1, mp_.esdf_pub_step_);
@@ -1318,6 +2001,51 @@ void GridMap::publish2D() {
   }
 }
 
+void GridMap::verifyOccIdx() {
+  /* 自检：索引是增量维护的，一旦某个写入路径忘了同步 flag，发布出去的点云就会
+     少几块（很难看出来）。这里用暴力全扫重新数一遍，逐体素核对 flag。 */
+  const auto now = std::chrono::steady_clock::now();
+  static std::chrono::steady_clock::time_point last;
+  static bool last_valid = false;
+  if (last_valid &&
+      std::chrono::duration<double>(now - last).count() < 1.0) // 最多 1Hz
+    return;
+  last = now;
+  last_valid = true;
+
+  size_t occ_bf = 0, infl_bf = 0, occ_miss = 0, infl_miss = 0;
+  Eigen::Vector3i min_cut = mp_.map_bound_min_idx_;
+  Eigen::Vector3i max_cut = mp_.map_bound_max_idx_;
+  for (int x = min_cut(0); x <= max_cut(0); ++x)
+    for (int y = min_cut(1); y <= max_cut(1); ++y)
+      for (int z = min_cut(2); z <= max_cut(2); ++z) {
+        const int addr = toAddress(x, y, z);
+        if (md_.occupancy_buffer_[addr] >= mp_.min_occupancy_log_) {
+          ++occ_bf;
+          if (!md_.occ_idx_flag_[addr])
+            ++occ_miss; // 漏记
+        }
+        if (md_.occupancy_buffer_inflate_[addr] != 0) {
+          ++infl_bf;
+          if (!md_.infl_idx_flag_[addr])
+            ++infl_miss;
+        }
+      }
+
+  if (occ_miss || infl_miss)
+    RCLCPP_ERROR(node_->get_logger(),
+                 "[GridMap] 占据索引自检失败：占据漏记 %zu/%zu 格，膨胀漏记 "
+                 "%zu/%zu 格（索引列表 %zu/%zu 条）",
+                 occ_miss, occ_bf, infl_miss, infl_bf, md_.occ_idx_list_.size(),
+                 md_.infl_idx_list_.size());
+  else
+    RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 10000,
+                         "[GridMap] 占据索引自检通过：占据 %zu 格、膨胀 %zu 格"
+                         "（索引列表 %zu/%zu 条，含坟墓）",
+                         occ_bf, infl_bf, md_.occ_idx_list_.size(),
+                         md_.infl_idx_list_.size());
+}
+
 void GridMap::publishMap() {
 
   if (map_pub_->get_subscription_count() == 0)
@@ -1325,25 +2053,41 @@ void GridMap::publishMap() {
 
   pcl::PointXYZ pt;
   pcl::PointCloud<pcl::PointXYZ> cloud;
+  /* 不再扫全图体素（那是 O(体素数)，50 万次里绝大多数是 continue），
+     只遍历"占据体素索引"（通常几千个），并顺手把坟墓（不再占据的旧条目）
+     原地压掉。索引的维护见 applyOccupancyUpdate / resetCellByAddress /
+     滑动清图 / resetAllMapData。 */
+  std::vector<int> &lst = md_.occ_idx_list_;
+  std::vector<char> &flag = md_.occ_idx_flag_;
+  const std::vector<double> &occ = md_.occupancy_buffer_;
+  const int z_vis_max =
+      md_.has_ray_pose_
+          ? static_cast<int>(std::floor((md_.ray_pos_(2) + mp_.vis_height_) *
+                                        mp_.resolution_inv_))
+          : std::numeric_limits<int>::max();
 
-  Eigen::Vector3i min_cut = mp_.map_bound_min_idx_;
-  Eigen::Vector3i max_cut = mp_.map_bound_max_idx_;
+  size_t w = 0;
+  for (size_t i = 0; i < lst.size(); ++i) {
+    const int addr = lst[i];
+    if (!flag[addr] || occ[addr] < mp_.min_occupancy_log_) {
+      flag[addr] = 0; // 坟墓：丢弃（下次再占据时会重新入列）
+      continue;
+    }
+    lst[w++] = addr;
 
-  for (int x = min_cut(0); x <= max_cut(0); ++x)
-    for (int y = min_cut(1); y <= max_cut(1); ++y)
-      for (int z = min_cut(2); z <= max_cut(2); ++z) {
-        if (md_.occupancy_buffer_[toAddress(x, y, z)] < mp_.min_occupancy_log_)
-          continue;
-
-        Eigen::Vector3d pos;
-        indexToPos(Eigen::Vector3i(x, y, z), pos);
-        if (md_.has_ray_pose_ && pos(2) > md_.ray_pos_(2) + mp_.vis_height_)
-          continue;
-        pt.x = pos(0);
-        pt.y = pos(1);
-        pt.z = pos(2);
-        cloud.push_back(pt);
-      }
+    Eigen::Vector3i id_g;
+    hashIdToGlobalIndex(addr, id_g);
+    if (id_g(2) >
+        z_vis_max) // 与旧实现一致：跳过传感器上方 vis_height 以上的体素
+      continue;
+    Eigen::Vector3d pos;
+    indexToPos(id_g, pos);
+    pt.x = pos(0);
+    pt.y = pos(1);
+    pt.z = pos(2);
+    cloud.push_back(pt);
+  }
+  lst.resize(w);
 
   cloud.width = cloud.points.size();
   cloud.height = 1;
@@ -1364,26 +2108,38 @@ void GridMap::publishMapInflate(bool all_info) {
   pcl::PointXYZ pt;
   pcl::PointCloud<pcl::PointXYZ> cloud;
 
-  Eigen::Vector3i min_cut = mp_.map_bound_min_idx_;
-  Eigen::Vector3i max_cut = mp_.map_bound_max_idx_;
-
+  /* 同 publishMap：遍历"膨胀体素索引"而不是全图（膨胀集比占据集换得更勤，
+     但索引只在 0↔1 翻转时维护，见 updateInflationLayer）。 */
+  std::vector<int> &lst = md_.infl_idx_list_;
+  std::vector<char> &flag = md_.infl_idx_flag_;
   const std::vector<char> &inflate_buffer = md_.occupancy_buffer_inflate_;
-  for (int x = min_cut(0); x <= max_cut(0); ++x)
-    for (int y = min_cut(1); y <= max_cut(1); ++y)
-      for (int z = min_cut(2); z <= max_cut(2); ++z) {
-        if (inflate_buffer[toAddress(x, y, z)] == 0)
-          continue;
+  const int z_vis_max =
+      md_.has_ray_pose_
+          ? static_cast<int>(std::floor((md_.ray_pos_(2) + mp_.vis_height_) *
+                                        mp_.resolution_inv_))
+          : std::numeric_limits<int>::max();
 
-        Eigen::Vector3d pos;
-        indexToPos(Eigen::Vector3i(x, y, z), pos);
-        if (md_.has_ray_pose_ && pos(2) > md_.ray_pos_(2) + mp_.vis_height_)
-          continue;
+  size_t w = 0;
+  for (size_t i = 0; i < lst.size(); ++i) {
+    const int addr = lst[i];
+    if (!flag[addr] || inflate_buffer[addr] == 0) {
+      flag[addr] = 0; // 坟墓
+      continue;
+    }
+    lst[w++] = addr;
 
-        pt.x = pos(0);
-        pt.y = pos(1);
-        pt.z = pos(2);
-        cloud.push_back(pt);
-      }
+    Eigen::Vector3i id_g;
+    hashIdToGlobalIndex(addr, id_g);
+    if (id_g(2) > z_vis_max)
+      continue;
+    Eigen::Vector3d pos;
+    indexToPos(id_g, pos);
+    pt.x = pos(0);
+    pt.y = pos(1);
+    pt.z = pos(2);
+    cloud.push_back(pt);
+  }
+  lst.resize(w);
 
   cloud.width = cloud.points.size();
   cloud.height = 1;

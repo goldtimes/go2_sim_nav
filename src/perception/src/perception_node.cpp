@@ -4,8 +4,9 @@
 // 输入只依赖定位（lightning）输出，不再依赖任何规划器：
 //   cloud       <- /lightning/perception/cloud   (PointCloud2, frame_id = map)
 //   sensor_pose <- /lightning/perception/pose    (Odometry, map -> lidar_link)
-// 这两个是 grid_map.cpp 内部硬编码的相对话题名，由 launch remap 注入，
-// 因此本节点和 grid_map.cpp 都不需要改动。
+//   map_state   <- /lightning/map_state          (Int32, 换图/失败时清空栅格)
+// 话题名走参数（grid_map.topic_cloud / topic_pose / topic_map_state ...），
+// 默认值就是原来的相对名，所以既有配置行为不变；launch remap 的优先级更高。
 //
 // 输出：
 //   grid_map/occupancy            占据栅格（膨胀前）
@@ -75,6 +76,16 @@ void CheckInterfaceContract(const rclcpp::Node::SharedPtr &node) {
   }
 }
 
+/// 与 grid_map.cpp 里的 load_parameter 同款：声明（带默认值）+ 读取。
+/// 本节点的 map_state 订阅不在 GridMap 里，所以参数自己读。
+template <typename T>
+void LoadParam(const rclcpp::Node::SharedPtr &node, const std::string &name,
+               T &value, const T &default_value) {
+  if (!node->has_parameter(name))
+    node->declare_parameter<T>(name, default_value);
+  node->get_parameter(name, value);
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -97,16 +108,26 @@ int main(int argc, char **argv) {
       "voxels %.0f | map origin (%.2f, %.2f, %.2f)",
       res, size.x(), size.y(), size.z(), voxel_num, origin.x(), origin.y(),
       origin.z());
+  /* 配置的输入话题名（launch 里的 -r remap 优先级高于参数，会覆盖它们；
+     所以这里打的是“配置值”，实际生效名可用 ros2 topic info 核对）。 */
   RCLCPP_INFO(node->get_logger(),
-              "expecting: cloud <- /lightning/perception/cloud (map), "
-              "sensor_pose <- /lightning/perception/pose (map -> lidar_link)");
+              "configured input topics: cloud='%s' sensor_pose='%s' "
+              "(期望取到 map 系点云 / map->lidar_link 位姿)",
+              node->get_parameter("grid_map.topic_cloud").as_string().c_str(),
+              node->get_parameter("grid_map.topic_pose").as_string().c_str());
 
   /// 订阅定位侧的系统阶段（latched，所以即使本节点比定位节点晩启动也能立即拿到当前值）。
   /// 换图后 map 系定义变了，旧地图下累积的体素全部失效，必须清空；
   /// 否则会出现“幽灵障碍”，新建的上层地图上叠着上一张地图的墙。
+  /* 定位阶段话题：与 grid_map 的输入话题一样走参数，默认值 = 原来的写死名。
+     换定位源时改 grid_map.topic_map_state 即可，不必改代码。 */
+  std::string map_state_topic;
+  LoadParam(node, "grid_map.topic_map_state", map_state_topic,
+            std::string("lightning/map_state"));
+
   auto last_map_state = std::make_shared<int32_t>(-1);
   auto map_state_sub = node->create_subscription<std_msgs::msg::Int32>(
-      "lightning/map_state", rclcpp::QoS(1).reliable().transient_local(),
+      map_state_topic, rclcpp::QoS(1).reliable().transient_local(),
       [&grid_map, &node,
        last_map_state](const std_msgs::msg::Int32::SharedPtr msg) {
         const int32_t state = msg->data;

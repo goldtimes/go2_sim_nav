@@ -18,13 +18,16 @@ map_server:
     map_yaml: ""
 
     # ---- 输出 ----
-    # 静态图用 latched(transient_local) 发布；另外每 republish_interval 秒重发一次，
-    # 让 Durability=Volatile 的订阅者（RViz Map 显示项的默认值）也能拿到。
+    # 静态图用 latched(transient_local) 发布：载图/换图时发一次。
+    # RViz 的 Map 显示项默认 Durability=Volatile，收不到历史样本 → 由
+    # republish_on_new_subscriber 看门狗在“有新订阅者”时补发一次（稳态零流量）。
+    # 老做法是每秒重发一张图（实测 186349 格 ≈ 182 KB ≈ 1.5 Mbit/s + 每秒唤醒所有下游），已改成默认关闭。
     frame_id: "map"
     topic_occupancy: "global_map/occupancy"     # nav_msgs/OccupancyGrid
     topic_metadata: "global_map/metadata"       # nav_msgs/MapMetaData
     publish_metadata: true
-    republish_interval: 1.0                     # 0 = 不重发（只靠 latched）
+    republish_on_new_subscriber: true          # 新订阅者出现时补发一次（推荐）
+    republish_interval: 0.0                    # >0 = 周期性重发（仅调试/兼容用）
 
     # ---- 地图语义 ----
     # 实测：现有 map.pgm 只含黑(0)+灰(205)，**没有白色(254) 空闲像素**：
@@ -40,6 +43,39 @@ map_server:
 
     # ---- 运行时换图服务 ----
     srv_load_map: "global_map/load_map"         # nav2_msgs/LoadMap
+
+    # ==================================================================
+    # 路网（**可选**资产）
+    # ==================================================================
+    # 与 map.yaml 同目录的 routes.yaml（换图四件套同源）。
+    # ⚠ 站点没有这个文件时只打一句 INFO，**不会报错**（很多站点还没画路网）。
+    # 本节点不做规划，但会用地图 + 车体轮廓逐条校验“这条通道车能不能过”，
+    # 过不去的通道在 RViz 里标红（避免画得漂亮但车过不去）。
+    publish_routes: true                        # false = 不加载也不发可视化
+    routes_file: ""                             # 空 = <地图目录>/routes.yaml
+    topic_routes: "global_map/routes"           # visualization_msgs/MarkerArray（latched）
+
+    # 车体轮廓与代价语义（与 pnc_2d 同名，仅用于路网可行性校验；必须与规划器一致）
+    footprint.enable: true
+    footprint.length: 0.70
+    footprint.width: 0.40
+    footprint.offset_x: 0.0
+    footprint.offset_y: 0.0
+    footprint.safe_margin: 0.05
+    footprint.check_edges: true
+    footprint.fast_path: true
+    common.hard_threshold: 80
+    common.unknown_as_occupied: true
+
+    # ------------------------------------------------------------------
+    # 区域层（zones，写在同一个 routes.yaml 里）
+    #   forbidden   = **全栈禁行**：本节点按车体外接圆半径膨胀后烧进发布的全局图，
+    #                 于是全局规划 / 局部规划 / RViz / 将来 nav2 自动都遵守
+    #                 （若让每个算法各自解析，一定会漏）；
+    #   speed_limit = 限速区：不烧入栅格，供速度规划（P5）查询；本节点只可视化。
+    # ------------------------------------------------------------------
+    zones.burn_into_map: true     # false = 只可视化不生效（调试用）
+    zones.inflate: -1.0           # 禁行区膨胀量 [m]；<0 = 自动 = 车体外接圆半径
 
     # ==================================================================
     # 3D 地图（M3 接口；本期只接线，不实现内容）

@@ -46,8 +46,154 @@
 | `topic_occupancy` / `topic_metadata` | `global_map/occupancy` / `global_map/metadata` | 自定义话题名 |
 | `srv_load_map` | `global_map/load_map` | 换图服务名 |
 | `publish_metadata` | `true` | 是否发 metadata |
-| `republish_interval` | `1.0` s | **周期性重发**（见下），0 = 关闭 |
+| `republish_on_new_subscriber` | `true` | **新订阅者出现时补发一次**（推荐，见下） |
+| `republish_interval` | `0.0` s | 周期性重发，`0` = 关闭（仅调试/兼容用） |
 | `unknown_as_free` | **`true`（本项目策略）** | 把"未知"当"空闲"发布（见"地图语义"） |
+| `publish_routes` | `true` | 是否加载路网并发布可视化 |
+| `routes_file` | `""` | 路网文件；空 = `<地图目录>/routes.yaml` |
+| `topic_routes` | `global_map/routes` | 路网 + 区域可视化（`MarkerArray`，latched） |
+| `zones.burn_into_map` | `true` | 把**禁行区**烧进发布的全局图（全栈生效） |
+| `zones.inflate` | `-1.0` | 禁行区膨胀量 [m]；<0 = 自动用车体外接圆半径 |
+| `footprint.*` / `common.hard_threshold` / `common.unknown_as_occupied` | 同 pnc_2d | **仅用于路网可行性校验**，必须与规划器一致 |
+
+#### 路网（`routes.yaml`）：**可选资产**
+
+本节点把路网当作与地图同级的**站点资产**管起来：加载、按站点切换、逐条校验、可视化。
+
+- 文件位置：与 `map.yaml` 同目录（换图四件套同源）；
+- **没有这个文件很正常**：只打一句 `该站点没有路网文件（路网是可选的，跳过）`，
+  **不影响地图发布、不报错**；
+- 文件坏了 / 格式不对：`WARN` 说明原因，仍然不影响地图发布；
+- 加载成功后会：
+  1. 用**刚发布的地图** + 车体轮廓（`footprint.*`）逐条通道做碰撞校验，
+     过不去的通道在 RViz 里**标红**并 `WARN` 列出 `A→B, B→C` 这样的通道名；
+  2. 发布 `global_map/routes`（latched）：节点（按语义着色 + 名字标签）、
+     通道（可行青蓝 / 不可行红色）、单向箭头。
+- 换站点（`load_map` 服务）时会**一并重载路网**，并把上一个站点多出来的标记发 `DELETE` 清掉。
+
+通道默认**双向**；需要单向时给该条边加 `one_way: true`。
+字段含义见 `src/pnc_2d/doc/pnc2d_restructure_plan.md` §6 P2。
+
+#### 区域层（`zones:`）：禁行区 / 限速区
+
+写在同一个 `routes.yaml` 里：
+
+```yaml
+zones:
+  - {name: charging_hall, type: forbidden, polygon: [[10,-6],[12,-6],[12,-4],[10,-4]]}
+  - {name: door_north, type: speed_limit, value: 0.30, polygon: [[2,1],[4,1],[4,3],[2,3]]}
+```
+
+- **禁行区（forbidden）= 全栈约束**：本节点按车体**外接圆半径**膨胀后烧进
+  `global_map/occupancy`，因此全局规划 / 路网路由 / 局部规划 / RViz **自动都遵守**。
+  只给全局规划器是不够的：局部规划不知道就会出现“全局绕开了、局部冲进去”。
+  日志会报告烧入了多少格（与图中占据数一致）：
+  `其中 3274 格来自禁行区（1 个区域，已按 0.472 m 膨胀）`。
+- **限速区（speed_limit）**：不烧入栅格（软约束），只解析 + 可视化 + 供速度规划
+  （P5）查询；本节点在 RViz 里用橙色多边形 + `0.3 m/s` 标签标出。
+- `zones.burn_into_map=false` 时只可视化不生效（调试用）。
+- 禁行区把某条通道切断时，那条通道会被判为“车体过不去”并 `WARN`（画错早发现）。
+
+#### 画线器 `scripts/route_editor.py` 操作手册 ★
+
+用 2D 地图当底图，鼠标点着画通道与区域，存成 `map_server` / `pnc_2d` 直接能吃的
+`routes.yaml`。**离线工具，不依赖 ROS**。
+
+**依赖与启动**
+
+```bash
+cd ~/r41_ws
+.venv/bin/python3 src/map_server/scripts/route_editor.py                 # 默认站点 go2_sim_factory
+.venv/bin/python3 src/map_server/scripts/route_editor.py --map-dir /home/gmd/rcs/maps/office4f
+.venv/bin/python3 src/map_server/scripts/route_editor.py --help
+```
+
+依赖：`.venv` 里的 `matplotlib` / `numpy` / `pyyaml`（已装）；需要图形界面（本地桌面或 X11 转发）。
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--map-dir` | `/home/gmd/rcs/maps/go2_sim_factory` | 站点地图目录（含 `map.yaml` + `map.pgm`） |
+| `--routes` | `<map-dir>/routes.yaml` | 输出文件；**已存在则先载入**，可继续编辑 |
+| `--lane-length` / `--lane-width` / `--margin` | `0.70` / `0.40` / `0.05` | 车体尺寸，用于通行性检查。**必须与 `map_server` 的 `footprint.*`（及规划器）一致**，否则会出现“编辑器说通得过、map_server 说过不去” |
+| `--snap` | `0.30` | 点到已有节点的吸附半径 [m]，用于把通道接到一起 |
+
+界面：底图是站点地图（黑=障碍），标题栏显示 `[当前模式] 通道数/节点数/区域数 | ⚠ N 条车体过不去 | 状态`；
+窗口左下角状态栏跟着鼠标显示世界坐标，便于对齐。
+
+**通道模式（lane，默认）**
+
+| 操作 | 作用 |
+|---|---|
+| **左键** | 在当前通道末尾加一个点；落点距已有节点 ≤ `--snap` 时**自动吸附**到该节点（用来接线、共用路口） |
+| **右键** | 结束当前通道（至少 2 个点；端点自动创建/复用节点） |
+| `n` | 开始新通道（切回 lane 模式） |
+| `u` | 撤销：先撤当前通道的最后一个点，没有点则撤销最后一条通道 |
+| `d` | 删除最后一条通道 |
+| `f` | 对最后一条通道做样条平滑（点多点少都能出顺滑通道） |
+| `a` | 切换最后一条通道 单/双向（**默认双向**） |
+| `-` / `=` | 最后一条通道限速 −/+ 0.1 m/s |
+| `[` / `]` | 最后一条通道走廊半宽 −/+ 0.1 m（调到 **0 = 严格贴线、遇障即停**） |
+| `k` | 切换最后一条通道**末端节点**的类型：`waypoint→station→charge→park`（只影响配色/标签） |
+
+**区域模式（zone：禁行 / 限速）**
+
+| 操作 | 作用 |
+|---|---|
+| `z` | 进入区域模式（左键加顶点、右键闭合多边形，至少 3 个顶点） |
+| **左键** | 追加一个顶点 |
+| **右键** | 闭合当前多边形（新区域默认 `forbidden`） |
+| `t` | 切换最后一个区域的类型：`forbidden ↔ speed_limit` |
+| `-` / `=` | 调整最后一个**限速区**的限速值 −/+ 0.1 m/s |
+| `d` | 删除最后一个区域 |
+| `u` | 撤销：先撤当前多边形最后一个顶点，再撤最后一个区域 |
+| `n` | 回到通道模式 |
+
+颜色：禁行区**红色**多边形 + 名字；限速区**橙色**多边形 + `名字 0.30m/s`。
+
+**通用**
+
+| 操作 | 作用 |
+|---|---|
+| `s` | 保存到输出文件（会先把当前未结束的对象收尾） |
+| `h` | 在终端打印按键表 |
+| `q` | 退出（**未按 `s` 的修改不会保存**） |
+
+**保存时自动做的三项校验**（每次 `s` 都会打印，并在图上标出问题）
+
+1. **通行性**：用车体矩形（含 margin）沿每条通道逐位姿扫一遍，**并把禁行区按车体外接圆半径膨胀一并计入**
+   （与本节点同口径）→ 过不去的通道**标红**并在终端列出；
+2. **连通性**：路网被切成几块会列出每块的节点名 —— 断开的路网会让规划器“只能在同一块里找通路”，
+   这是最隐蔽的错误；
+3. **重复通道**：同起止点出现多次会提示（多半是重复画了一遍）。
+
+**典型工作流**
+
+```text
+1. 起 map_server（把站点地图发出来，供 RViz 叠合看）
+2. 跑画线器 → 沿走廊依次左键连点 → 右键结束；路口就点到已有节点附近（自动吸附复用）
+3. （可选）z 切区域模式 → 画禁行区/限速区 → t 切类型、- / = 调限速值
+4. s 保存 → 看三项校验输出；红标通道就调整或收窄禁行区
+5. 重启 map_server（或调 /global_map/load_map 换站点）→ 日志应出现
+   "路网已加载 …" / "区域层：N 个区域" / "其中 M 格来自禁行区"
+6. ros2 launch pnc_2d global_planner.launch.py planner_type:=route_network
+   → RViz 里点目标 → 路径严格沿通道，RViz 高亮当前走过的通道
+```
+
+**常见问题**
+
+| 现象 | 原因 / 处理 |
+|---|---|
+| 窗口打不开 / 报 display 相关错误 | 需要图形界面（本地桌面或 X11 转发）；纯 SSH 环境请手写 yaml |
+| 标题里的中文显示成方块 | 系统缺中文字体（不影响功能）；节点名/区域名建议用 ASCII |
+| 某条通道是红色的 | 车体过不去：贴着墙、通道太窄，或被禁行区（含 0.472 m 膨胀）挡住 |
+| 保存提示“路网被分成 N 块” | 两块之间没接上：把端点画到已有节点 `--snap` 半径内 |
+| 规划器报“起点离路网 X m” | 起点/终点离通道太远（默认上限 `max_entry_distance: 10 m`），或地图与路网不同源 |
+| 想让某段变成单向 | 编辑器里选中该通道按 `a`，或直接在 yaml 里加 `one_way: true`（本仓库路网默认全双向） |
+| 画完规划器仍然走老路线 | `planner.type` 还是 `astar`；或规划节点还是旧进程（重启节点） |
+
+> 可视化分工：**全网**由本节点发布在 `global_map/routes`；**当前通路高亮**由 pnc_2d
+> 的规划节点发布在 `/pnc_2d/plan_markers`（只有它知道这次走了哪几条通道）。
+> RViz 里各加一个 MarkerArray 显示项即可，不会重复画。
 
 ### 3D 地图参数（M3 接口，本期只接线）
 
@@ -60,18 +206,37 @@
 | `cloud_voxel_leaf` | `0.0` | 预留：发布前体素降采样（m） |
 | `require_3d` | `false` | true = 3D 加载失败时整个 `load_map` 报错；否则只 WARN（不连累 2D） |
 
-#### 为什么还要周期性重发（不只是 latched）
+#### 重发策略：默认“发一次 + 按需补发”（不再每秒重发）
 
-标准做法是 latched（`transient_local`）：晚启动的订阅者能立刻拿到历史样本。但 **RViz 的
-Map 显示项默认 `Durability=Volatile`**，而 Volatile 订阅端**不会**收到历史样本 → 先起节点
-后开 RViz 会看到空白。所以本节点在 latched 之外再按 `republish_interval` 重发一次
-（一张图每秒重发，开销可忽略），这样任何 QoS 的订阅者都能拿到。
+latched（`transient_local`）是标准做法：晚启动的订阅者能立即拿到历史样本。但 **RViz 的
+Map 显示项默认 `Durability=Volatile`**，而 Volatile 订阅端**不会**收到历史样本
+（DDS 规则）→ 先起节点后开 RViz 会看到空白。
 
-实测（`republish_interval=1.0` vs `0`）：
+三种解法：
+
+| 做法 | RViz 零配置 | 稳态流量 |
+|---|---|---|
+| 只发一次（`republish_on_new_subscriber: false` + `republish_interval: 0`） | ✗ 需把 RViz Map 的 Durability 改成 `Transient Local` | 0 |
+| **默认：看门狗按需补发** | ✓ | **0** |
+| 周期重发（`republish_interval: 1.0`，旧行为） | ✓ | 一张图/秒（本项目 186349 格 ≈ 182 KB ≈ 1.5 Mbit/s），且**每秒唤醒所有下游节点** |
+
+默认策略是第二种：**载图/换图时发一次**（latched），此后每 0.5 s 只做一次“订阅者数量是否变多”
+的整数比较；一旦变多、且其中有 Volatile 订阅者，就补发一次（全是 `transient_local` 的订阅者
+已经自动收到历史样本，不补发）。
+
+实现约束：Humble 的 `rclcpp::PublisherEventCallbacks` **没有 `matched` 回调**（Iron 之后才有），
+所以只能用轻量轮询，不能用“订阅者匹配事件”。已知局限：若“一个订阅者离开、另一个同时进来”
+导致计数不变，可能漏补发 —— 此时可打开 `republish_interval` 兑底。
+
+实测（本项目 `go2_sim_factory`，607×307，186349 格，同一张图）：
 
 ```
-[volatile] 607x307 ... 占据=12041      # 重发开启 → 收得到
-[volatile] 没收到                       # 重发关闭 → 收不到（latched 的固有限制）
+新默认（republish_interval=0 + 按需补发）：
+  Volatile 订阅者接入后 6 s 内收到 1 条（首条 0.46 s 到达，即看门狗补发）
+  再接入第二个 Volatile 订阅者：同样 1 条（仍能补发）
+  Transient_local 订阅者：0.10 s 内 1 条（走历史样本，不触发补发）
+旧行为（republish_interval=1.0）作为对照：
+  同一个 Volatile 订阅者 6 s 内收到 7 条（≈ 1.27 MB / 6 s 的无谓流量）
 ```
 
 ## 3D 地图接口（M3：**已接线，未实现内容**）

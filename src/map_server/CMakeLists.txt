@@ -14,7 +14,11 @@ find_package(rclcpp REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(nav2_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
 find_package(yaml-cpp REQUIRED)
+# 路网：复用 pnc_2d 的 RouteGraph（ROS-free 数据结构 + yaml 读写）
+# 依赖方向：map_server（资产）→ pnc_2d（库）；只用到数据层，不用规划器
+find_package(pnc_2d REQUIRED)
 
 # ---- 地图加载库（yaml + pgm → OccupancyGrid 语义；不依赖 rclcpp，可单独复用）----
 add_library(map_io src/map_io.cpp)
@@ -31,7 +35,9 @@ target_link_libraries(map_server_node
   rclcpp::rclcpp
   ${nav_msgs_TARGETS}
   ${nav2_msgs_TARGETS}
-  ${sensor_msgs_TARGETS})
+  ${sensor_msgs_TARGETS}
+  ${visualization_msgs_TARGETS}
+  ${pnc_2d_TARGETS})
 
 install(TARGETS map_server_node map_io
   ARCHIVE DESTINATION lib
@@ -41,7 +47,9 @@ install(TARGETS map_server_node map_io
 install(DIRECTORY config launch
   DESTINATION share/${PROJECT_NAME})
 
-install(PROGRAMS scripts/compare_maps.py
+install(PROGRAMS
+  scripts/compare_maps.py
+  scripts/route_editor.py
   DESTINATION lib/${PROJECT_NAME})
 
 ament_package()

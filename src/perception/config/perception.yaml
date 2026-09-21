@@ -28,6 +28,8 @@ perception_node:
     # local_update_range 必须 <= size/2：超出这个范围的点只做无命中射线（清空），
     # 不写入占据，用于把"传感器前方空区"和"远处未知"区分开。
     # 这是控制"每帧融合多少点"的正规旋钮（与地图大小无关）。
+    # ⚠ 它与下面的 max_ray_length 是一对：这里是"写占据"的范围，那里是"清空"的
+    #   半径。两者脱节就会出现一圈"能写障碍却不清空"的带子 → 2D 图一大片未知。
     grid_map.local_update_range_x: 4.0
     grid_map.local_update_range_y: 4.0
     grid_map.local_update_range_z: 2.0
@@ -98,10 +100,18 @@ perception_node:
     grid_map.p_min: 0.12
     grid_map.p_max: 0.98
     grid_map.p_occ: 0.80
-    # 射线上限：直接决定每条射线要步进多少个体素（步数 ∝ 长度/res）。
-    # 5.0 → 2.0 实测每帧 -33~39%。语义变化：更远处不再被清成 free，unknown 会变多
-    # （对雷达有效距离内的避障而言合理）。
-    grid_map.max_ray_length: 2.0
+    # 射线上限（= 每帧能把多远**清成空闲**的半径）：
+    #   raycastProcess() 里 length > max_ray_length 的点会被截断到该半径并标为
+    #   free —— 所以它就是 2D 图里"未知面积"的直接阀门。
+    # 它与 local_update_range 是一对儿，必须自洽：
+    #   · 5.0 → 2.0 实测每帧 -33~39%（为了提帧率改的）；
+    #   · 但 2.0 配 8x8m 窗口时日测 2D 图 未知 63% / 空闲 36%
+    #     （2.0m 处空闲率 88% → 2.5m 处骤降 52% → 4.5m 处 6%）：
+    #     2~4m 一圈能写障碍却不清空，规划器看到的是"未知里夹着障碍"。
+    # → 现在打开 ray_length_from_local_range，两者自动一致；
+    #   max_ray_length 仅作为开关关闭时的显式值（也是日志里的回退提示）。
+    grid_map.ray_length_from_local_range: true
+    grid_map.max_ray_length: 4.0
 
     # ==================================================================
     # 障碍膨胀（用于后续规划避障；纯感知验证阶段可保持原值）
@@ -154,6 +164,12 @@ perception_node:
     # 0 = 不额外节流，直接跟 vis_interval（10 Hz）同一个节奏，避免两个 0.1s 撞出
     # "跳拍"（实测会变成 6.6 Hz、间隔 150ms）。想要更高/更低就改 vis_interval。
     grid_map.pub_2d_interval: 0.0
+
+    # 2D 层统计日志间隔（秒）：每隔这么久打印一行 2D 图的
+    # 空闲/未知/占据 占比 + 清空半径 + 窗口尺寸。0 = 关闭。
+    # 用途：窗口尺寸 / local_update_range / max_ray_length 这几个几何参数配歪时
+    # 的表现就是"未知占了大半张图"，有这行日志就不必另写脚本去数格子。
+    grid_map.pub_2d_stats_interval: 5.0
 
     # ---- 3D -> 2D 投影高度带（只有带内的体素参与投影）----
     # ⚠ 下沿必须**高于地面**，否则地面被投影成障碍、整张 2D 图会全黑。

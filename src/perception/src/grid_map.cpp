@@ -150,6 +150,16 @@ void GridMap::initMap(rclcpp::Node *node) {
   load_parameter(node_, "grid_map.p_max", mp_.p_max_, -1.0);
   load_parameter(node_, "grid_map.p_occ", mp_.p_occ_, -1.0);
   load_parameter(node_, "grid_map.max_ray_length", mp_.max_ray_length_, -0.1);
+  /* max_ray_length 的真实语义（见 raycastProcess）：
+       length > max_ray_length 的点会被截断到该半径，并把截断点标记为 free。
+     所以它就是"每帧能把多远清成空闲"的半径，也是 2D 图里未知面积的直接阀门。
+     打开 ray_length_from_local_range 后它与 local_update_range 强制一致，
+     改窗口尺寸/局部范围时不会再漏改这一项。 */
+  load_parameter(node_, "grid_map.ray_length_from_local_range",
+                 mp_.ray_length_from_local_range_, false);
+  if (mp_.ray_length_from_local_range_)
+    mp_.max_ray_length_ =
+        std::max(mp_.local_update_range_(0), mp_.local_update_range_(1));
 
   load_parameter(node_, "grid_map.vis_height", mp_.vis_height_, 0.3);
   load_parameter(node_, "grid_map.show_occ_time", mp_.show_occ_time_, false);
@@ -170,6 +180,8 @@ void GridMap::initMap(rclcpp::Node *node) {
                  mp_.pub_2d_occupancy_inflate_, true);
   load_parameter(node_, "grid_map.pub_2d_esdf", mp_.pub_2d_esdf_, true);
   load_parameter(node_, "grid_map.pub_2d_interval", mp_.pub_2d_interval_, 0.1);
+  load_parameter(node_, "grid_map.pub_2d_stats_interval",
+                 mp_.pub_2d_stats_interval_, 0.0);
   load_parameter(node_, "grid_map.proj_relative_to_sensor",
                  mp_.proj_relative_to_sensor_, false);
   load_parameter(node_, "grid_map.proj_z_min", mp_.proj_z_min_, -0.5);
@@ -249,6 +261,40 @@ void GridMap::initMap(rclcpp::Node *node) {
           mp_.footprint_clear_as_unknown_ ? "未知(-1)" : "空闲(0)");
     }
   }
+
+  /* ---------- 几何自洽性：窗口 / 写占据范围 / 清空半径 ----------
+     这三个数决定 2D 图里"空闲"最多能占多少，是最容易配歪的一组：
+       · local_update_range = 能写占据的范围（看到多远就记多远）
+       · max_ray_length     = 能清成空闲的半径（raycastProcess 的截断）
+     清空半径小于写占据范围时，中间会留一圈"能写障碍、却永远不清空"的带子，
+     2D 图上就是一大片未知（规划器看到的是"未知里夹着远处障碍"）。 */
+  {
+    const double clear_r = mp_.max_ray_length_;
+    const double lr_min =
+        std::min(mp_.local_update_range_(0), mp_.local_update_range_(1));
+    const double win_area = std::max(x_size * y_size, 1e-9);
+    /* 单帧最多清 π r²："从当前位置靠射线能清出的面积上限"。
+       机器人开过去还能继续扩大，所以这只是个量级参考。 */
+    const double clear_frac =
+        std::min(std::acos(-1.0) * clear_r * clear_r / win_area, 1.0);
+    RCLCPP_INFO(
+        node_->get_logger(),
+        "[GridMap] 几何: 窗口 %.1fx%.1f m (%.1f m^2) | 写占据 ±%.1f/±%.1f m | "
+        "清空半径 %.2f m%s | 单帧最多清 %.0f%% 窗口面积",
+        x_size, y_size, win_area, mp_.local_update_range_(0),
+        mp_.local_update_range_(1), clear_r,
+        mp_.ray_length_from_local_range_ ? " (=local_update_range)" : "",
+        clear_frac * 100.0);
+    if (clear_r < lr_min - 1e-9)
+      RCLCPP_WARN(
+          node_->get_logger(),
+          "[GridMap] 清空半径 %.2f m < 写占据范围 %.2f m：%.2f~%.2f m 那一圈"
+          "能写障碍却不清空 → 2D 图会有一大片未知。只为省 CPU 可忽略；"
+          "否则把 grid_map.ray_length_from_local_range 置 true（或把 "
+          "max_ray_length 提到 %.2f）",
+          clear_r, lr_min, clear_r, lr_min, lr_min);
+  }
+
   load_parameter(node_, "grid_map.cloud_is_world", mp_.cloud_is_world_, true);
   load_parameter(node_, "grid_map.need_extrinsic", mp_.need_extrinsic_, true);
 
@@ -1599,8 +1645,47 @@ void GridMap::build2DLayer() {
                   n2d, 100.0 * rebuilt / static_cast<double>(std::max(1, n2d)));
   }
 
+  /// 几何参数体检（内部按 pub_2d_stats_interval_ 自行节流，<= 0 直接返回）
+  maybeLog2DStats();
+
   if (mp_.verify_2d_)
     verify2DLayer(dx, dy, full, rebuilt);
+}
+
+void GridMap::maybeLog2DStats() {
+  if (mp_.pub_2d_stats_interval_ <= 0.0 || !md_.has_2d_ || md_.occ2d_.empty())
+    return;
+
+  const double now_s = std::chrono::duration<double>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+  if (md_.t_2d_stats_s_ > 0.0 &&
+      now_s - md_.t_2d_stats_s_ < mp_.pub_2d_stats_interval_)
+    return;
+  md_.t_2d_stats_s_ = now_s;
+
+  size_t n_occ = 0, n_free = 0, n_unk = 0;
+  for (const int8_t v : md_.occ2d_) {
+    if (v == 100)
+      ++n_occ;
+    else if (v == 0)
+      ++n_free;
+    else
+      ++n_unk;
+  }
+  const double n = static_cast<double>(md_.occ2d_.size());
+  if (n <= 0.0)
+    return;
+  const double pct = 100.0 / n;
+  const double cell_area = mp_.resolution_ * mp_.resolution_;
+  RCLCPP_INFO(node_->get_logger(),
+              "[GridMap] 2D 图: 空闲 %zu (%.1f%%, %.1f m^2) | 未知 %zu "
+              "(%.1f%%, %.1f m^2) | 占据 %zu (%.1f%%, %.1f m^2) | 清空半径 "
+              "%.2f m | 窗口 %.1fx%.1f m",
+              n_free, n_free * pct, n_free * cell_area, n_unk, n_unk * pct,
+              n_unk * cell_area, n_occ, n_occ * pct, n_occ * cell_area,
+              mp_.max_ray_length_, mp_.map_voxel_num_(0) * mp_.resolution_,
+              mp_.map_voxel_num_(1) * mp_.resolution_);
 }
 
 FootprintPose GridMap::computeFootprintPose() const {

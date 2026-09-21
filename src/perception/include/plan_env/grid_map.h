@@ -83,6 +83,20 @@ struct MappingParameters {
   double prob_hit_log_, prob_miss_log_, clamp_min_log_, clamp_max_log_,
       min_occupancy_log_;                  // logit of occupancy probability
   double min_ray_length_, max_ray_length_; // range of doing raycasting
+  /**
+   * 是否让 max_ray_length 自动跟随 local_update_range（取 x/y 中较大者）。
+   *
+   * 为什么需要这个开关：raycastProcess() 里 `length > max_ray_length` 的点会被
+   * **截断到 max_ray_length 并标记为 free** —— 所以 max_ray_length 实际就是
+   * "每帧能把多远清成空闲"的半径。它一旦与 local_update_range（能写占据的范围）
+   * 脱节，就会出现一圈"能写障碍、却永远不清空"的环带：实测 max_ray_length=2.0
+   * 配 8x8m 窗口时，2D 图的空闲率在 2.0m 处还有 88%、到 2.5m 骤降到 52%，
+   * 整张图 未知 63% / 空闲 36%。
+   *
+   * 打开后两者永远一致（换窗口尺寸/换局部范围时不会再漏改）；显式值
+   * max_ray_length 仍保留，作为开关关闭时的取值。
+   */
+  bool ray_length_from_local_range_;
 
   /* visualization and computation time display */
   double vis_height_, ground_height_;
@@ -135,6 +149,15 @@ struct MappingParameters {
    * 压到 N 次构建，代价约为全量重扫的 1/N。默认 100（约 10 s @10 Hz）。
    */
   int refresh_full_2d_interval_;
+  /**
+   * 2D 层统计日志间隔（s）。>0 时每隔这么久打印一行 2D 图的
+   * 空闲 / 未知 / 占据 占比（占窗口面积的百分比）+ 清空半径。
+   *
+   * 用途：窗口尺寸 / local_update_range / max_ray_length 这几个几何参数配歪时，
+   * 表现形式就是"未知占了大半张图"；有这行日志就不必另写订阅脚本去数格子，
+   * 改完参数直接在终端看效果。0 = 关闭（默认）。
+   */
+  double pub_2d_stats_interval_;
   string topic_2d_occupancy_, topic_2d_occupancy_inflate_, topic_2d_esdf_;
 
   /* ---------- 输入话题名（相对名，会被解析成 <命名空间>/名字）----------
@@ -287,6 +310,9 @@ struct MappingData {
   // 融合"分开看。
   double t_cloud_ms_{0.0};
 
+  // 2D 统计日志节流：上次打印的 steady_clock 时刻（秒），0 = 尚未打印过。
+  double t_2d_stats_s_{0.0};
+
   /* ---------- 占据/膨胀体素索引（可视化发布用）----------
    * 为什么需要：occupancy_buffer_ 是稠密数组，publishMap() 原来只能遍历全部体素
    * （res0.10/10x10x5m = 50 万个，res0.05 时 400 万个）才找出占据体素，
@@ -380,6 +406,13 @@ public:
    * ESDF 不在这里算（见 build2DESDF），避免无人订阅时白算。
    */
   void build2DLayer();
+
+  /**
+   * 按 pub_2d_stats_interval_ 的节奏打印 2D 图的 空闲/未知/占据 占比。
+   * 由 build2DLayer() 末尾调用；只做一次 O(窗口格数) 的计数（80x80 = 6400 格，
+   * 开销可忽略），用于直接观察几何参数改动后的效果。
+   */
+  void maybeLog2DStats();
 
   /**
    * 2D ESDF（到最近障碍的距离场，Felzenszwalb 1D EDT）。

@@ -1,0 +1,64 @@
+#######################################################################
+# 全局规划节点参数（pnc_2d）
+#
+# 机制说明：
+#   · 节点允许未声明参数（allow_undeclared_parameters），所以 astar.* / footprint.* /
+#     common.* 都能直接在这里配，而节点本身不必认识每个算法；
+#   · 值的含义见 src/pnc_2d/doc/pnc2d_dev_plan.md §6；
+#   · 触发方式是事件驱动：收到 /goal_pose 才规划一次。
+#######################################################################
+global_planner:
+  ros__parameters:
+    use_sim_time: false
+
+    # ---------------- 算法选择 ----------------
+    # 可用值：astar（后续加 jps / hybrid_astar / rrt_star 时在这里切换）
+    planner.type: "astar"
+    planner.frame_id: "map"
+
+    # ---------------- 接口话题 ----------------
+    topics.map: "/global_map/occupancy"          # map_server 发布（latched）
+    topics.odom: "/lightning/perception/pose"    # 定位位姿（Odometry, map -> lidar_link）
+    topics.goal: "/goal_pose"                    # RViz "2D Goal Pose"
+    topics.path: "/pnc_2d/global_path"           # 输出几何路径
+    topics.markers: "/pnc_2d/plan_markers"       # 起终点箭头 + 起点处车体轮廓
+
+    # ==================================================================
+    # 代价语义（所有算法共用）
+    # ==================================================================
+    # ⚠ 未知区域策略必须与全局图一致：
+    #   map_server 已把未知当空闲发布（unknown_as_free: true），所以这里默认保守
+    #   （把 -1 当障碍）不会误伤；若将来全局图保留 -1，需要把两边一起改。
+    common.hard_threshold: 80          # ≥ 该值视为硬障碍（100 = 占据）
+    common.unknown_as_occupied: true   # 未知格是否当障碍（保守）
+    common.soft_cost_weight: 5.0       # 软代价权重：(raw/阈值)² × 该值；0 = 关闭
+
+    # ==================================================================
+    # 矩形车体轮廓（footprint）—— 与 perception 的命名保持一致
+    # ==================================================================
+    # 只查致命格、不看膨胀梯度：安全性由 footprint 保证，舒适性由软代价保证。
+    footprint.enable: true
+    footprint.length: 0.70             # 机体系 x：前后（m）← Go2
+    footprint.width: 0.40              # 机体系 y：左右（m）
+    footprint.offset_x: 0.0            # 参考点不在矩形中心时用
+    footprint.offset_y: 0.0
+    footprint.safe_margin: 0.05        # 四边各外扩（m）
+    footprint.check_edges: true        # 边扫掠（四角轨迹 + 中心线），防"擦角"
+    footprint.fast_path: true          # 内切/外接双阈值快路径（距离场，1 次查表）
+
+    # ==================================================================
+    # A* 参数
+    # ==================================================================
+    astar.connectivity: 8              # 4 或 8 邻域（8 邻域含斜穿保护）
+    astar.heuristic_weight: 1.0        # >1 加速但可能次优（<1 会破坏最优性）
+    astar.use_search_window: true      # 只在起终点包围盒附近搜索（大图省一个量级）
+    astar.search_window_margin: 10.0   # 首次窗口余量（m）
+    astar.search_window_retry_margins: [30.0, 100.0, 1.0e9]   # 失败后逐级扩大
+    astar.max_iterations: 300000       # 扩展节点上限
+    astar.max_search_time_ms: 2000.0   # 单次搜索时间上限（ms）
+
+    # ---------------- 路径后处理 ----------------
+    astar.path_prune_mode: "line_of_sight"   # line_of_sight / collinear / none
+    astar.path_prune_max_span: 8.0           # 单次捷径检查的最大跨度（m）
+    astar.path_resample_spacing: 0.0         # >0 时按弧长重采样（m）
+    astar.keep_start_yaw: true               # 首点保留当前朝向（供控制器原地对正）

@@ -1,0 +1,54 @@
+#######################################################################
+# 路网模式参数（pnc_2d / route_network）
+#
+# 用法：把这份文件里的 route_network.* 合进 config/global_planner.yaml，
+#       或直接：ros2 launch pnc_2d global_planner.launch.py planner_type:=route_network
+#
+# 路网文件约定（与 map.yaml 同目录，换站点同源）：
+#   ~/rcs/maps/<站点>/routes.yaml
+#   用 map_server 的 scripts/route_editor.py 在地图上点选生成（见 map_server/README.md）
+#######################################################################
+global_planner:
+  ros__parameters:
+    planner.type: "route_network"
+
+    # ---------------- 路网 ----------------
+    route_network.routes_file: "/home/gmd/rcs/maps/go2_sim_factory/routes.yaml"
+
+    # 目标不在通道上时怎么办：
+    #   hybrid（默认）= 沿路网走主干道，第一段/最后一段用现有 A* 在自由空间补上
+    #   strict        = 只走到离目标最近的通道投影点（"必须全程在线上"的巡检场景）
+    route_network.goal_mode: "hybrid"
+
+    # 起终点离路网的最大允许距离 [m]；超过就拒绝并报错（多半是地图/路网不同源）
+    route_network.max_entry_distance: 10.0
+
+    # 车体过不去的通道是否禁止参与路由：
+    #   true（默认）= 禁止，并给出"哪条通道过不去"的诊断
+    #   false       = 允许强行走（只在临时调试时用）
+    route_network.reject_infeasible: true
+
+    # 注意：路网模式**禁止视线剪枝**（通道是人为画的，切角会破坏原设计的绕行），
+    # 代码里会强制 prune_mode = "collinear"，这里写出来只为提示。
+    route_network.path_prune_mode: "collinear"
+
+    # ---------------- 代价语义（与 A* 模式共用）----------------
+    common.hard_threshold: 80          # ≥ 该值视为硬障碍（100 = 占据）
+    common.unknown_as_occupied: true   # 未知格是否当障碍（保守）
+    common.soft_cost_weight: 5.0       # 软代价权重（路网模式下主要用于 hybrid 的离网段）
+
+    # ---------------- 车体轮廓（与 A* 模式共用）----------------
+    footprint.enable: true
+    footprint.length: 0.70             # Go2：机体系 x（前后）
+    footprint.width: 0.40              # 机体系 y（左右）
+    footprint.safe_margin: 0.05        # 四边各外扩
+    footprint.check_edges: true
+    footprint.fast_path: true
+
+    # ---------------- hybrid 的"最后一段"用这套 A* 参数 ----------------
+    astar.connectivity: 8
+    astar.use_search_window: true
+    astar.search_window_margin: 10.0
+    astar.search_window_retry_margins: [30.0, 100.0, 1.0e9]
+    astar.max_iterations: 300000
+    astar.max_search_time_ms: 2000.0

@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+    <name>pnc_2d</name>
+    <version>0.1.0</version>
+    <description> 二维规划与控制：可插拔的全局规划（GlobalPlanner 抽象 + A* + 路网路由 + 矩形车体轮廓 碰撞）、状态机与局部规划（见
+        doc/pnc2d_restructure_plan.md），以及 MPC/NMPC 参考实现 （scripts/）。 </description>
+    <maintainer email="gmd@todo.todo">gmd</maintainer>
+    <license>Apache-2.0</license>
+
+    <buildtool_depend>ament_cmake</buildtool_depend>
+
+    <depend>rclcpp</depend>
+    <depend>nav_msgs</depend>
+    <depend>geometry_msgs</depend>
+    <depend>visualization_msgs</depend>
+    <depend>yaml-cpp</depend>
+
+    <test_depend>ament_cmake_gtest</test_depend>
+
+    <export>
+        <build_type>ament_cmake</build_type>
+    </export>
+</package>

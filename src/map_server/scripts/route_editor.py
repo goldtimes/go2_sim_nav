@@ -1,40 +1,20 @@
 #!/usr/bin/env python3
-"""路网画线编辑器（离线，不依赖 ROS）
+"""Route network editor (offline, no ROS).
 
-在 2D 栅格地图上当底图，用鼠标点着画"通道"与"区域"，存成 map_server / pnc_2d
-能直接吃的 `routes.yaml`（格式见 ../README.md）。
+Draw lanes and zones on top of a 2D occupancy map and save them as `routes.yaml`
+(consumed by map_server / pnc_2d; format documented in ../README.md).
 
-为什么跟着 map_server：`routes.yaml` 是**站点资产**（与 map.yaml 同目录），加载、
-校验、发布都在 map_server；画线器是这份资产的编辑工具，理应跟在一起。
+Why it lives with map_server: `routes.yaml` is a *station asset* (same directory
+as map.yaml); loading, validating and publishing it is map_server's job, so the
+authoring tool lives here too.
 
-为什么不用 RViz 录制：地图本身是运维资产，画线是"离线批改"，用 matplotlib
-更省事 —— 底图、坐标、碰撞校验、撤销都在一个窗口里，改完存盘即可。
-
-用法（在 r41_ws 根目录）：
-    .venv/bin/python3 src/map_server/scripts/route_editor.py                 # 默认站点
+Usage (from the r41_ws root):
+    .venv/bin/python3 src/map_server/scripts/route_editor.py                 # default station
     .venv/bin/python3 src/map_server/scripts/route_editor.py --map-dir /home/gmd/rcs/maps/office4f
     .venv/bin/python3 src/map_server/scripts/route_editor.py --help
 
-交互（窗口里按 h 也会打印一次）：
-    —— 通道（lane）——
-    左键        在当前通道末尾加一个点（靠近已有节点会自动吸附，用来接线）
-    右键        结束当前通道
-    n          开始新通道        u  撤销上一步（先撤点，再撤整条通道）
-    d          删最后一条通道     f  对最后一条通道做平滑
-    a          切换最后一条通道的单/双向
-    - / =      最后一条通道限速 -/+ 0.1 m/s
-    [ / ]      最后一条通道走廊半宽 -/+ 0.1 m（0 = 严格贴线、遇障即停）
-    k          切换最后一条通道"末端节点"的类型（waypoint→station→charge→park）
-    —— 区域（zone：禁行 / 限速）——
-    z          进入区域模式；左键加顶点、右键闭合多边形（至少 3 个顶点）
-    t          切换最后一个区域的类型（forbidden ↔ speed_limit）
-    - / =      区域模式下：调最后一个限速区的限速值 -/+ 0.1 m/s
-    d / u      区域模式下：删/撤销最后一个区域
-    —— 非通道 ——
-    s          保存到 <map-dir>/routes.yaml      q  退出
-
-保存前会用**车体矩形**（默认 0.70×0.40 + 0.05 margin）沿每条通道扫一遍，
-过不去的通道在图上标红并提示 —— 避免"画得漂亮但车过不去"。
+NOTE: all window / terminal text is English on purpose -- matplotlib cannot render
+CJK without a CJK font installed (Chinese labels showed up as boxes).
 """
 
 from __future__ import annotations
@@ -47,7 +27,7 @@ from typing import Dict, List, Optional, Tuple
 
 import matplotlib
 
-try:  # 非交互环境（比如 SSH）也能 import 成功，方便单测/校验
+try:  # 非交互环境（SSH/CI）也能 import 成功，方便脚本化自测
     matplotlib.use("TkAgg")
 except Exception:  # pragma: no cover
     pass
@@ -64,6 +44,72 @@ TYPE_COLOR = {
     "park": "#9467bd",
 }
 
+HELP = """\
+Interaction (also printed by pressing `h` in the window):
+
+  --- lane mode (default) ---
+  Every left click becomes a NODE (a named point). Consecutive clicks are
+  connected in order, so both "click along and draw" and "place points first,
+  connect them afterwards" work the same way.
+  left click   append the next point of the current lane. An existing node within
+               --snap metres is REUSED (this is how you connect / branch from an
+               existing point); otherwise a new node is created right there.
+  right click  finish the current lane (needs >= 2 points)
+  u            undo: drop last point of the current lane, else drop the last lane.
+               A point that this lane created itself is removed with it (unless
+               another lane uses it), so no orphan points are left behind
+  d            delete last lane
+  f            smooth last lane (spline; node positions are kept as vertices)
+  a            toggle one-way of last lane (default: two-way)
+  - / =        speed limit of last lane          -/+ 0.1 m/s
+  [ / ]        corridor half width of last lane  -/+ 0.1 m (0 = strict lane
+               keeping: stop when blocked)
+  k            cycle type of the lane's END node (waypoint/station/charge/park)
+
+  --- delete mode (`x`, or press Delete/Backspace) ---
+  left click   delete whatever is under the cursor. Pick order: point > lane >
+               zone, and the target is highlighted in red while hovering.
+               * point that no lane uses  -> the point is removed
+               * point used by lanes     -> the point is removed AND every lane
+                 that used it is removed as well
+               * lane                    -> the lane is removed, its points stay
+               * zone                    -> the zone is removed
+  shift+click  same, but afterwards also drop the waypoint(s) that this deletion
+               just orphaned. Points you placed on purpose (station / charge /
+               park) are never removed automatically.
+  x            leave delete mode (back to lane mode)
+
+  --- point mode ---
+  left click   place a standalone point (useful for stations / landmarks)
+  k            cycle type of the last placed point
+  u / d        remove the last placed point (refused while a lane uses it --
+               use delete mode `x` if you want to remove it together with that lane)
+
+  --- zone mode (forbidden / speed_limit) ---
+  z            enter zone mode
+  left click   add a polygon vertex
+  right click  close the polygon (>= 3 vertices; new zone is `forbidden`)
+  t            toggle type of the last zone (forbidden <-> speed_limit)
+  - / =        speed limit of the last speed zone  -/+ 0.1 m/s
+  u / d        undo / delete last zone
+
+  --- common ---
+  n / p / z    lane mode / point mode / zone mode
+  x            delete mode (click a point / lane / zone to remove it)
+  s            save to <map-dir>/routes.yaml      h  help      q  quit
+
+matplotlib's own single-key shortcuts (k = log axis, s = save figure, h = home,
+f = fullscreen, p = pan, backspace = back) are disabled so they cannot clash.
+
+On save three checks run with the vehicle rectangle (0.70 x 0.40 + 0.05 margin
+by default) and problems are printed plus highlighted in the window:
+  1. passability of every lane (including inflated forbidden zones, the same rule
+     map_server uses when burning zones into the global map);
+  2. connectivity -- a split network is the most hidden mistake, each component
+     is listed;
+  3. duplicate lanes (same from/to pair).
+"""
+
 
 # --------------------------------------------------------------------------- 地图
 class GridMap:
@@ -72,7 +118,7 @@ class GridMap:
     def __init__(self, map_dir: str) -> None:
         yaml_path = os.path.join(map_dir, "map.yaml")
         if not os.path.isfile(yaml_path):
-            raise FileNotFoundError(f"找不到 {yaml_path}")
+            raise FileNotFoundError(f"map.yaml not found: {yaml_path}")
         with open(yaml_path, "r", encoding="utf-8") as f:
             meta = yaml.safe_load(f)
         pgm = meta.get("image", "map.pgm")
@@ -98,7 +144,7 @@ class GridMap:
         with open(path, "rb") as f:
             magic = f.readline().strip()
             if magic != b"P5":
-                raise ValueError(f"{path} 不是二进制 PGM（P5）")
+                raise ValueError(f"{path} is not a binary PGM (P5)")
             line = f.readline()
             while line.startswith(b"#"):
                 line = f.readline()
@@ -130,48 +176,6 @@ def rect_free(grid: GridMap, cx: float, cy: float, yaw: float,
     return True
 
 
-def lane_free(grid: GridMap, pts: List[Tuple[float, float]], half_len: float,
-              half_wid: float, zones: Optional[List[Dict]] = None) -> bool:
-    """沿通道逐位姿检查（朝向取该段方向，与 C++ 侧 lineIsConnectionFree 同口径）。
-
-    zones 非空时，**禁行区也算障碍**（按车体外接圆半径膨胀，与 map_server 的
-    烧入口径一致）—— 否则编辑器说“通得过”、map_server 说“过不去”，很迷惑。
-    """
-    inf = math.hypot(half_len, half_wid)
-    for (ax, ay), (bx, by) in zip(pts[:-1], pts[1:]):
-        seg = math.hypot(bx - ax, by - ay)
-        if seg < 1e-9:
-            continue
-        yaw = math.atan2(by - ay, bx - ax)
-        n = max(1, int(math.ceil(seg / max(grid.res / 2.0, 0.02))))
-        for k in range(n + 1):
-            t = k / n
-            cx, cy = ax + (bx - ax) * t, ay + (by - ay) * t
-            if not rect_free(grid, cx, cy, yaw, half_len, half_wid):
-                return False
-            if zones and in_any_forbidden(cx, cy, zones, inf):
-                return False
-    return True
-
-
-def in_any_forbidden(x: float, y: float, zones: List[Dict], inflate: float) -> bool:
-    """点（或离边界的距离 <= inflate）是否落在任一禁行区内"""
-    for z in zones:
-        if z["type"] != "forbidden":
-            continue
-        poly = z["points"]
-        if not poly:
-            continue
-        xs = [p[0] for p in poly]
-        ys = [p[1] for p in poly]
-        if x < min(xs) - inflate or x > max(xs) + inflate \
-           or y < min(ys) - inflate or y > max(ys) + inflate:
-            continue
-        if _point_in_polygon(x, y, poly) or _dist_to_polygon(x, y, poly) <= inflate:
-            return True
-    return False
-
-
 def _point_in_polygon(x: float, y: float, poly: List[Tuple[float, float]]) -> bool:
     inside = False
     n = len(poly)
@@ -198,6 +202,83 @@ def _dist_to_polygon(x: float, y: float, poly: List[Tuple[float, float]]) -> flo
             d = math.hypot(x - (ax + dx * t), y - (ay + dy * t))
         best = min(best, d)
     return best
+
+
+def disable_default_keymaps() -> List[str]:
+    """屏蔽 matplotlib 自带的单键快捷键。
+
+    FigureManagerBase 会自动注册 key_press_handler，而它的默认 keymap 与本画线器
+    抢键：k = x 轴对数坐标、s = 存图、h = home、f = 全屏、p = pan、backspace = 后退。
+    例如按 k 切节点类型时，x 轴会被切成对数坐标，画面直接废。
+    方向键（'left'/'right' 等多字符键）保留，但 backspace 要去掉（本工具用 Delete/
+    Backspace 进入删除模式）。
+    """
+    cleared: List[str] = []
+    for key, val in list(matplotlib.rcParams.items()):
+        if key.startswith("keymap.") and isinstance(val, (list, tuple)):
+            keep = [c for c in val
+                    if not (isinstance(c, str) and (len(c) == 1 or c == "backspace"))]
+            if len(keep) != len(val):
+                matplotlib.rcParams[key] = keep
+                cleared.append(key)
+    return cleared
+
+
+def _dist_to_polyline(x: float, y: float, pts: List[Tuple[float, float]]) -> float:
+    """点到一段未闭合折线（通道）的最短距离"""
+    best = float("inf")
+    for (ax, ay), (bx, by) in zip(pts[:-1], pts[1:]):
+        dx, dy = bx - ax, by - ay
+        seg2 = dx * dx + dy * dy
+        if seg2 <= 1e-18:
+            d = math.hypot(x - ax, y - ay)
+        else:
+            t = max(0.0, min(1.0, ((x - ax) * dx + (y - ay) * dy) / seg2))
+            d = math.hypot(x - (ax + dx * t), y - (ay + dy * t))
+        best = min(best, d)
+    return best
+
+
+def in_any_forbidden(x: float, y: float, zones: List[Dict], inflate: float) -> bool:
+    """点（或离边界距离 <= inflate）是否落在任一禁行区内"""
+    for z in zones:
+        if z["type"] != "forbidden":
+            continue
+        poly = z["points"]
+        if not poly:
+            continue
+        xs = [p[0] for p in poly]
+        ys = [p[1] for p in poly]
+        if x < min(xs) - inflate or x > max(xs) + inflate \
+           or y < min(ys) - inflate or y > max(ys) + inflate:
+            continue
+        if _point_in_polygon(x, y, poly) or _dist_to_polygon(x, y, poly) <= inflate:
+            return True
+    return False
+
+
+def lane_free(grid: GridMap, pts: List[Tuple[float, float]], half_len: float,
+              half_wid: float, zones: Optional[List[Dict]] = None) -> bool:
+    """沿通道逐位姿检查（朝向取该段方向，与 C++ 侧 lineIsCollisionFree 同口径）。
+
+    zones 非空时**禁行区也算障碍**（按车体外接圆半径膨胀，与 map_server 烧入口径一致）
+    —— 否则编辑器说"通得过"、map_server 说"过不去"，很迷惑。
+    """
+    inf = math.hypot(half_len, half_wid)
+    for (ax, ay), (bx, by) in zip(pts[:-1], pts[1:]):
+        seg = math.hypot(bx - ax, by - ay)
+        if seg < 1e-9:
+            continue
+        yaw = math.atan2(by - ay, bx - ax)
+        n = max(1, int(math.ceil(seg / max(grid.res / 2.0, 0.02))))
+        for k in range(n + 1):
+            t = k / n
+            cx, cy = ax + (bx - ax) * t, ay + (by - ay) * t
+            if not rect_free(grid, cx, cy, yaw, half_len, half_wid):
+                return False
+            if zones and in_any_forbidden(cx, cy, zones, inf):
+                return False
+    return True
 
 
 def smooth(points: List[Tuple[float, float]], n: int = 6
@@ -234,14 +315,17 @@ class RouteEditor:
         self.snap = snap
 
         self.nodes: Dict[str, Dict] = {}      # name -> {x, y, type}
-        self.lanes: List[Dict] = []           # {points, start, end, one_way, speed, corridor}
-        self.zones: List[Dict] = []           # {name, type, value, points}  ★区域层
+        self.lanes: List[Dict] = []           # {points, start, end, via, one_way, speed, corridor}
+        self.zones: List[Dict] = []           # {name, type, value, points}
         self.current: List[Tuple[float, float]] = []
+        self.current_nodes: List[str] = []    # 当前通道途经的节点名（顺序）
+        self.current_created: List[bool] = []  # 与 current_nodes 平行：该点是否本次新建
         self.zone_current: List[Tuple[float, float]] = []
-        self.mode = "lane"                    # lane | zone
-        self.cur_start: Optional[str] = None
-        self.cur_end: Optional[str] = None
-        self.status = "左键加点 / 右键结束通道 / z 画区域 / h 帮助"
+        self.mode = "lane"                    # lane | point | zone | delete
+        self.last_point: Optional[str] = None  # 最近放置的点（point 模式用）
+        self.hover: Tuple[Optional[str], Optional[object]] = (None, None)
+        self.hover_key: Optional[Tuple] = None  # 悬停对象变化时才重绘
+        self.status = "left click: add point / right click: finish lane / h: help"
         self._new_counter = 0
         self._zone_counter = 0
 
@@ -257,17 +341,28 @@ class RouteEditor:
                 "x": float(n["x"]), "y": float(n["y"]),
                 "type": str(n.get("type", "waypoint")),
             }
+
+        def node_at(x: float, y: float) -> Optional[str]:
+            best, best_d = None, 1e-6
+            for nm, nd in self.nodes.items():
+                d = math.hypot(nd["x"] - x, nd["y"] - y)
+                if d <= best_d:
+                    best, best_d = nm, d
+            return best
+
         for e in doc.get("edges", []):
             pts = [(float(p[0]), float(p[1])) for p in e.get("polyline", [])]
             if len(pts) < 2:
                 continue
+            via = [nm for nm in (node_at(*p) for p in pts) if nm is not None]
             self.lanes.append({
                 "points": pts,
                 "start": str(e["from"]),
                 "end": str(e["to"]),
+                "via": via,
                 "one_way": bool(e.get("one_way", False)),
                 "speed": float(e.get("speed_limit", 1.0)),
-                "corridor": float(e.get("corridor_width", 0.5)),
+                "corridor": float(e.get("corridor_width", 0.6)),
             })
         for z in doc.get("zones", []):
             pts = [(float(p[0]), float(p[1])) for p in z.get("polygon", [])]
@@ -277,53 +372,61 @@ class RouteEditor:
                                "type": str(z.get("type", "forbidden")),
                                "value": float(z.get("value", 0.3)),
                                "points": pts})
-        print(f"[载入] {path}: {len(self.nodes)} 节点 / {len(self.lanes)} 通道 / "
-              f"{len(self.zones)} 区域")
+        print(f"[load] {path}: {len(self.nodes)} nodes / {len(self.lanes)} lanes / "
+              f"{len(self.zones)} zones")
 
     # ------------------------------------------------------------- 交互
     def run(self) -> None:
+        print(f"[keys] disabled matplotlib default shortcuts: "
+              f"{', '.join(disable_default_keymaps())}")
         self.fig, self.ax = plt.subplots(figsize=(14, 9))
         self.ax.imshow(self.grid.img, cmap="gray", origin="upper",
-                       extent=[self.grid.x0, self.grid.x1, self.grid.y0, self.grid.y1],
+                       extent=(self.grid.x0, self.grid.x1, self.grid.y0, self.grid.y1),
                        alpha=0.55, zorder=1)
         self.ax.set_xlim(self.grid.x0, self.grid.x1)
         self.ax.set_ylim(self.grid.y0, self.grid.y1)
         self.ax.set_aspect("equal")
         self.ax.grid(True, lw=0.3, alpha=0.4)
-        self.ax.set_title("pnc_2d 路网编辑器 —— 左键加点 / 右键结束 / h 帮助 / s 保存")
+        self.ax.set_title("pnc_2d route editor")
+        self.ax.set_xlabel("x [m]")
+        self.ax.set_ylabel("y [m]")
         self._print_help()
         self.fig.canvas.mpl_connect("button_press_event", self._on_click)
         self.fig.canvas.mpl_connect("key_press_event", self._on_key)
+        self.fig.canvas.mpl_connect("motion_notify_event", self._on_move)
         self.redraw()
         plt.show()
 
     def _print_help(self) -> None:
-        print(__doc__.split("交互（窗口里按 h 也会打印一次）：")[1].split("保存前")[0])
+        print(HELP)
 
     def _on_click(self, event) -> None:
         if event.inaxes is not self.ax or event.xdata is None:
             return
         x, y = float(event.xdata), float(event.ydata)
-        if event.button == 1:            # 左键：加点
-            if self.mode == "zone":
+
+        if event.button == 1:                     # left click
+            if self.mode == "delete":
+                self._delete_at(x, y, cleanup=bool(event.key == "shift"))
+            elif self.mode == "zone":
                 self.zone_current.append((x, y))
-                self.status = f"当前区域 {len(self.zone_current)} 个顶点（右键闭合）"
-            else:
-                name = self._snap_node(x, y)
-                if name is not None:
-                    x = self.nodes[name]["x"]
-                    y = self.nodes[name]["y"]
-                if not self.current and name is not None:
-                    self.cur_start = name
-                self.current.append((x, y))
-                if name is not None:
-                    if len(self.current) == 1:
-                        self.cur_start = name
-                    else:
-                        self.cur_end = name
-                self.status = f"当前通道 {len(self.current)} 点" + (
-                    f"，末点吸附到节点 {name}" if name else "")
-        elif event.button == 3:          # 右键：结束当前对象
+                self.status = f"zone: {len(self.zone_current)} vertices (right click closes)"
+            elif self.mode == "point":
+                name, created = self._ensure_node(x, y)
+                self.last_point = name
+                self.status = (f"point {name} placed" if created
+                               else f"point {name} already exists (reused)")
+            else:                                 # lane
+                name, created = self._ensure_node(x, y)
+                if name in self.current_nodes:
+                    self.status = f"point {name} is already in this lane"
+                else:
+                    self.current_nodes.append(name)
+                    self.current_created.append(created)
+                    self.current.append((self.nodes[name]["x"], self.nodes[name]["y"]))
+                    self.status = ("lane: " + " -> ".join(self.current_nodes)
+                                   + ("  (new node)" if created else "  (existing node)"))
+        elif event.button == 3:                   # right click
             if self.mode == "zone":
                 self._finish_zone()
             else:
@@ -336,69 +439,98 @@ class RouteEditor:
             self._finish_lane()
             self._finish_zone()
             self.mode = "lane"
-            self.status = "开始画通道（lane 模式）"
+            self.status = "lane mode: click points; existing nodes are reused"
+        elif k == "p":
+            self._finish_lane()
+            self._finish_zone()
+            self.mode = "point"
+            self.status = "point mode: click to place standalone points (k cycles type)"
         elif k == "z":
             self._finish_lane()
             self._finish_zone()
             self.mode = "zone"
-            self.status = "开始画区域（zone 模式）：左键加顶点、右键闭合、t 切类型"
+            self.status = "zone mode: left click adds vertices, right click closes"
+        elif k in ("x", "delete", "backspace"):
+            self._finish_lane()
+            self._finish_zone()
+            if self.mode == "delete":
+                self.mode = "lane"
+                self.status = "lane mode: click points; existing nodes are reused"
+            else:
+                self.mode = "delete"
+                self.status = ("delete mode: click a point / lane / zone; "
+                               "shift+click also cleans orphaned points")
+            self.hover, self.hover_key = (None, None), None
         elif k == "u":
             if self.mode == "zone" and self.zone_current:
                 self.zone_current.pop()
-                self.status = "撤销一个顶点"
-            elif self.current:
+                self.status = "removed last zone vertex"
+            elif self.zone_current:
+                self.zone_current.pop()
+                self.status = "removed last zone vertex"
+            elif self.mode == "point" and self.last_point:
+                self._remove_last_point()
+            elif self.current_nodes:
+                name = self.current_nodes.pop()
                 self.current.pop()
-                self.status = "撤销一个点"
-            elif self.mode == "zone" and self.zones:
-                self.zones.pop()
-                self.status = "撤销最后一个区域"
+                created = self.current_created.pop() if self.current_created else False
+                if created and not self._lanes_using(name):
+                    self.nodes.pop(name, None)   # 本次新建且没人引用 → 一并收回
+                self.status = ("lane: " + " -> ".join(self.current_nodes)
+                               if self.current_nodes else "lane cleared")
             elif self.lanes:
                 self.lanes.pop()
-                self.status = "撤销最后一条通道"
+                self.status = "removed last lane"
+            elif self.zones:
+                self.zones.pop()
+                self.status = "removed last zone"
         elif k == "d":
             if self.mode == "zone":
                 if self.zones:
                     self.zones.pop()
-                    self.status = "删除最后一个区域"
+                    self.status = "removed last zone"
+            elif self.mode == "point":
+                self._remove_last_point()
             elif self.lanes:
                 self.lanes.pop()
-                self.status = "删除最后一条通道"
+                self.status = "removed last lane"
         elif k == "t":
             if self.zones:
                 z = self.zones[-1]
                 z["type"] = "speed_limit" if z["type"] == "forbidden" else "forbidden"
-                self.status = f"区域 {z['name']} 类型 → {z['type']}"
+                self.status = f"zone {z['name']} type -> {z['type']}"
         elif k == "f":
             if self.lanes:
                 self.lanes[-1]["points"] = smooth(self.lanes[-1]["points"])
-                self.status = "平滑最后一条通道"
+                self.status = "smoothed last lane"
         elif k == "a":
             if self.lanes:
                 self.lanes[-1]["one_way"] = not self.lanes[-1]["one_way"]
-                self.status = f"单向={self.lanes[-1]['one_way']}"
+                self.status = f"one_way = {self.lanes[-1]['one_way']}"
         elif k in ("-", "="):
             dlt = -0.1 if k == "-" else 0.1
             if self.mode == "zone" and self.zones:
                 z = self.zones[-1]
                 z["value"] = max(0.1, round(z["value"] + dlt, 2))
-                self.status = f"区域 {z['name']} 限速={z['value']:.2f} m/s"
+                self.status = f"zone {z['name']} speed limit = {z['value']:.2f} m/s"
             elif self.lanes:
                 self.lanes[-1]["speed"] = max(0.1, round(self.lanes[-1]["speed"] + dlt, 2))
-                self.status = f"限速={self.lanes[-1]['speed']:.2f} m/s"
+                self.status = f"lane speed limit = {self.lanes[-1]['speed']:.2f} m/s"
         elif k in ("[", "]"):
             if self.lanes:
                 dlt = -0.1 if k == "[" else 0.1
                 self.lanes[-1]["corridor"] = max(0.0, round(self.lanes[-1]["corridor"] + dlt, 2))
-                self.status = (f"走廊半宽={self.lanes[-1]['corridor']:.2f} m"
-                               + ("（严格贴线，遇障即停）" if self.lanes[-1]["corridor"] == 0 else ""))
+                self.status = (f"corridor half width = {self.lanes[-1]['corridor']:.2f} m"
+                               + ("  (strict lane keeping)" if self.lanes[-1]["corridor"] == 0 else ""))
         elif k == "k":
-            if self.lanes:
-                nm = self.lanes[-1]["end"]
-                node = self.nodes.get(nm or "")
-                if node:
-                    i = (NODE_TYPES.index(node["type"]) + 1) % len(NODE_TYPES)
-                    node["type"] = NODE_TYPES[i]
-                    self.status = f"节点 {nm} 类型 → {node['type']}"
+            name = self.last_point if self.mode == "point" else (
+                self.lanes[-1]["end"] if self.lanes else None)
+            node = self.nodes.get(name or "")
+            if node:
+                i = (NODE_TYPES.index(node["type"]) + 1) % len(NODE_TYPES) \
+                    if node["type"] in NODE_TYPES else 0
+                node["type"] = NODE_TYPES[i]
+                self.status = f"node {name} type -> {node['type']}"
         elif k == "s":
             self._finish_lane()
             self._finish_zone()
@@ -409,6 +541,117 @@ class RouteEditor:
             plt.close(self.fig)
         self.redraw()
 
+    def _on_move(self, event) -> None:
+        """删除模式：鼠标悬停对象变红（只在目标变化时重绘，避免刷帧卡顿）"""
+        if self.mode != "delete" or event.inaxes is not self.ax or event.xdata is None:
+            if self.hover_key is not None:
+                self.hover, self.hover_key = (None, None), None
+                self.redraw()
+            return
+        kind, obj = self._pick(float(event.xdata), float(event.ydata))
+        key = (kind, id(obj)) if obj is not None else (kind, None)
+        if key != self.hover_key:
+            self.hover_key, self.hover = key, (kind, obj)
+            self.redraw()
+
+    # ------------------------------------------------------------- 删除
+    def _pick_radius(self) -> float:
+        """拾取半径：鼠标不需要点得很准，但别大到能误删邻点"""
+        return max(self.snap, 0.40)
+
+    def _pick(self, x: float, y: float) -> Tuple[Optional[str], Optional[object]]:
+        """命中测试，优先级：点 > 通道 > 区域；没命命中返回 (None, None)"""
+        r = self._pick_radius()
+        best, best_d = None, r
+        for name, n in self.nodes.items():
+            d = math.hypot(n["x"] - x, n["y"] - y)
+            if d <= best_d:
+                best, best_d = name, d
+        if best is not None:
+            return "node", best
+
+        lane_hit, best_d = None, r
+        for lane in self.lanes:
+            d = _dist_to_polyline(x, y, lane["points"])
+            if d <= best_d:
+                lane_hit, best_d = lane, d
+        if lane_hit is not None:
+            return "lane", lane_hit
+
+        for z in self.zones:
+            if _point_in_polygon(x, y, z["points"]):
+                return "zone", z
+        return None, None
+
+    def _drop_from_current(self, name: str) -> None:
+        """把一个点从未结束的通道里抽掉（三个平行列表要同步）"""
+        while name in self.current_nodes:
+            i = self.current_nodes.index(name)
+            self.current_nodes.pop(i)
+            if i < len(self.current):
+                self.current.pop(i)
+            if i < len(self.current_created):
+                self.current_created.pop(i)
+
+    def _cleanup_orphans(self, candidates: List[str]) -> List[str]:
+        """只清理由本次删除直接造成的孤立点，两个保险：
+        1) 候选必须是刚被删对象引用过的点（不会动用户特意放的站点）；
+        2) 类型必须是 waypoint（station/charge/park 即使孤立也保留）。"""
+        orphans = [n for n in dict.fromkeys(candidates)
+                   if n in self.nodes
+                   and n not in self.current_nodes
+                   and self.nodes[n]["type"] == "waypoint"
+                   and not self._lanes_using(n)]
+        for n in orphans:
+            self.nodes.pop(n, None)
+            if self.last_point == n:
+                self.last_point = None
+        if orphans:
+            print(f"[delete] cleaned {len(orphans)} orphan point(s): "
+                  f"{', '.join(orphans)}")
+        return orphans
+
+    def _delete_at(self, x: float, y: float, cleanup: bool = False) -> None:
+        kind, obj = self._pick(x, y)
+        if kind is None:
+            self.status = "delete: nothing under the cursor"
+            return
+        touched: List[str] = []        # 受影响、可能变孤立的点
+        if kind == "node":
+            name: str = obj                                        # type: ignore[assignment]
+            users = self._lanes_using(name)
+            if users:
+                gone = ", ".join(f"{l['start']}->{l['end']}" for l in users)
+                for l in users:
+                    touched += l.get("via") or [l["start"], l["end"]]
+                self.lanes = [l for l in self.lanes if l not in users]
+                self.nodes.pop(name, None)
+                print(f"[delete] point {name} removed, together with "
+                      f"{len(users)} lane(s) that used it: {gone}")
+                self.status = (f"deleted point {name} "
+                               f"(+{len(users)} lane(s): {gone})")
+            else:
+                self.nodes.pop(name, None)
+                print(f"[delete] point {name} removed")
+                self.status = f"deleted point {name}"
+            if self.last_point == name:
+                self.last_point = None
+            self._drop_from_current(name)
+        elif kind == "lane":
+            self.lanes.remove(obj)                                 # type: ignore[arg-type]
+            touched = obj.get("via") or [obj["start"], obj["end"]]  # type: ignore[union-attr]
+            print(f"[delete] lane {obj['start']}->{obj['end']} removed")  # type: ignore[index]
+            self.status = f"deleted lane {obj['start']}->{obj['end']}"    # type: ignore[index]
+        else:
+            self.zones.remove(obj)                                 # type: ignore[arg-type]
+            print(f"[delete] zone {obj['name']} removed")                 # type: ignore[index]
+            self.status = f"deleted zone {obj['name']}"                   # type: ignore[index]
+        if cleanup:
+            n = self._cleanup_orphans(touched)
+            if n:
+                self.status += f", cleaned {len(n)} orphan(s)"
+        self.hover, self.hover_key = (None, None), None
+
     # ------------------------------------------------------------- 节点/通道
     def _new_node_name(self) -> str:
         while True:
@@ -418,6 +661,7 @@ class RouteEditor:
                 return name
 
     def _snap_node(self, x: float, y: float) -> Optional[str]:
+        """最近的已有节点（吸附半径内），没有则 None"""
         best, best_d = None, self.snap
         for name, n in self.nodes.items():
             d = math.hypot(n["x"] - x, n["y"] - y)
@@ -425,37 +669,54 @@ class RouteEditor:
                 best, best_d = name, d
         return best
 
+    def _ensure_node(self, x: float, y: float) -> Tuple[str, bool]:
+        """复用吸附到的已有节点，否则在 (x,y) 新建一个 → (名字, 是否新建)"""
+        name = self._snap_node(x, y)
+        if name is not None:
+            return name, False
+        name = self._new_node_name()
+        self.nodes[name] = {"x": x, "y": y, "type": "waypoint"}
+        return name, True
+
+    def _remove_last_point(self) -> None:
+        name = self.last_point
+        if name is None:
+            self.status = "no point to remove"
+            return
+        used = any(name in [l["start"], l["end"]] or name in l.get("via", [])
+                   for l in self.lanes)
+        if used:
+            self.status = f"point {name} is used by a lane -- delete that lane first"
+            return
+        self.nodes.pop(name, None)
+        self.last_point = None
+        self.status = f"point {name} removed"
+
+    def _reset_lane(self) -> None:
+        self.current, self.current_nodes, self.current_created = [], [], []
+
     def _finish_lane(self) -> None:
-        if len(self.current) < 2:
-            if self.current:
-                self.status = "通道至少 2 个点，已丢弃"
-            self.current, self.cur_start, self.cur_end = [], None, None
+        if len(self.current_nodes) < 2:
+            if self.current_nodes:
+                self.status = "lane needs >= 2 points, discarded"
+            self._reset_lane()
             return
-        # 端点节点：① 点击时已吸附的名字优先；② 否则看该位置附近有没有已有节点
-        # （**必须按坐标去重**：两条通道共用一个交点时不能生成两个同位置节点，
-        #   否则路网会在那里断开 —— 自测踩过）
-        first, last = self.current[0], self.current[-1]
-        start = self.cur_start or self._snap_node(*first) or self._new_node_name()
-        self.nodes.setdefault(start, {"x": first[0], "y": first[1], "type": "waypoint"})
-        end = self.cur_end or self._snap_node(*last) or self._new_node_name()
-        self.nodes.setdefault(end, {"x": last[0], "y": last[1], "type": "waypoint"})
+        names = list(self.current_nodes)
+        start, end = names[0], names[-1]
         if start == end:
-            self.status = "起止节点相同（自环），已丢弃"
-            self.current, self.cur_start, self.cur_end = [], None, None
+            self.status = "lane start == end (self loop), discarded"
+            self._reset_lane()
             return
-        # 端点对齐到节点坐标（与 C++ 侧的"自动吸附"一致）
-        pts = list(self.current)
-        pts[0] = (self.nodes[start]["x"], self.nodes[start]["y"])
-        pts[-1] = (self.nodes[end]["x"], self.nodes[end]["y"])
-        self.lanes.append({"points": pts, "start": start, "end": end,
+        pts = [(self.nodes[n]["x"], self.nodes[n]["y"]) for n in names]
+        self.lanes.append({"points": pts, "start": start, "end": end, "via": names,
                            "one_way": False, "speed": 1.0, "corridor": 0.6})
-        self.status = f"完成通道 {start}→{end}（{len(pts)} 点）"
-        self.current, self.cur_start, self.cur_end = [], None, None
+        self.status = f"lane {start} -> {end} finished ({len(names)} points)"
+        self._reset_lane()
 
     def _finish_zone(self) -> None:
         if len(self.zone_current) < 3:
             if self.zone_current:
-                self.status = "区域至少 3 个顶点，已丢弃"
+                self.status = "zone needs >= 3 vertices, discarded"
             self.zone_current = []
             return
         while True:
@@ -465,7 +726,7 @@ class RouteEditor:
                 break
         self.zones.append({"name": name, "type": "forbidden", "value": 0.3,
                            "points": list(self.zone_current)})
-        self.status = f"完成区域 {name}（{len(self.zone_current)} 顶点，默认禁行，t 可切类型）"
+        self.status = f"zone {name} closed ({len(self.zone_current)} vertices, `t` toggles type)"
         self.zone_current = []
 
     # ------------------------------------------------------------- 绘制
@@ -480,9 +741,8 @@ class RouteEditor:
                 bad += 1
             xs = [p[0] for p in lane["points"]]
             ys = [p[1] for p in lane["points"]]
-            self.ax.plot(xs, ys, "-", lw=2.2, zorder=3,
-                         color=("#d62728" if not ok else ("#ff9900" if lane["one_way"] else "#00b0f0")))
-            # 方向箭头
+            color = "#d62728" if not ok else ("#ff9900" if lane["one_way"] else "#00b0f0")
+            self.ax.plot(xs, ys, "-", lw=2.2, zorder=3, color=color)
             mx, my = xs[len(xs) // 2], ys[len(ys) // 2]
             dx, dy = xs[-1] - xs[0], ys[-1] - ys[0]
             L = math.hypot(dx, dy) or 1.0
@@ -512,16 +772,45 @@ class RouteEditor:
             xs = [p[0] for p in self.zone_current]
             ys = [p[1] for p in self.zone_current]
             self.ax.plot(xs, ys, "o-", lw=2.0, color="#aa00aa", zorder=3)
+        hint = ""
+        if self.mode == "delete":
+            kind, obj = self.hover
+            if kind == "node" and obj in self.nodes:
+                n = self.nodes[obj]                                # type: ignore[index]
+                self.ax.plot([n["x"]], [n["y"]], "o", ms=17, mfc="none",
+                             mec="#d62728", mew=2.2, zorder=8)
+                hint = f"  |  DELETE point {obj}"
+            elif kind == "lane":
+                xs = [p[0] for p in obj["points"]]                # type: ignore[index]
+                ys = [p[1] for p in obj["points"]]                # type: ignore[index]
+                self.ax.plot(xs, ys, "-", lw=5.0, color="#d62728", alpha=0.55, zorder=8)
+                hint = f"  |  DELETE lane {obj['start']}->{obj['end']}"  # type: ignore[index]
+            elif kind == "zone":
+                xs = [p[0] for p in obj["points"]]                # type: ignore[index]
+                ys = [p[1] for p in obj["points"]]                # type: ignore[index]
+                self.ax.plot(xs + [xs[0]], ys + [ys[0]], "-", lw=4.0, color="#d62728",
+                             alpha=0.6, zorder=8)
+                hint = f"  |  DELETE zone {obj['name']}"               # type: ignore[index]
+            else:
+                hint = "  |  nothing under the cursor"
         self.ax.set_title(
-            f"pnc_2d 路网编辑器 [{self.mode}] | {len(self.lanes)} 通道 / {len(self.nodes)} 节点"
-            + (f" / {len(self.zones)} 区域" if self.zones else "")
-            + (f" | ⚠ {bad} 条车体过不去（红）" if bad else "")
-            + f" | {self.status}")
+            f"[{self.mode}] {len(self.lanes)} lanes / {len(self.nodes)} points"
+            + (f" / {len(self.zones)} zones" if self.zones else "")
+            + (f"  |  WARNING: {bad} lane(s) blocked (red)" if bad else "")
+            + hint
+            + f"  |  {self.status}")
         self.fig.canvas.draw_idle()
 
+    # ------------------------------------------------------------- 保存
+    def _lanes_using(self, name: str) -> List[Dict]:
+        return [l for l in self.lanes
+                if name in [l["start"], l["end"]] or name in l.get("via", [])]
+
     def _components(self) -> List[List[str]]:
-        """按通道的连通性分组（无向）：路网断开是最隐蔽的错误，保存前必须报出来"""
-        parent: Dict[str, str] = {n: n for n in self.nodes}
+        """按通道连通性分组（无向）。只统计**参与通道的节点**：孤立单点（比如刚放的站点）
+        不算“网络不连通”（那是另一回事，save() 里单独提示）。"""
+        used = [n for n in self.nodes if self._lanes_using(n)]
+        parent: Dict[str, str] = {n: n for n in used}
 
         def find(a: str) -> str:
             while parent[a] != a:
@@ -534,17 +823,16 @@ class RouteEditor:
             if ra != rb:
                 parent[ra] = rb
         groups: Dict[str, List[str]] = {}
-        for n in self.nodes:
+        for n in used:
             groups.setdefault(find(n), []).append(n)
         return list(groups.values())
 
-    # ------------------------------------------------------------- 保存
     def save(self) -> None:
         bad = []
         for lane in self.lanes:
             if not lane_free(self.grid, lane["points"], self.half_len, self.half_wid,
                              self.zones):
-                bad.append(f"{lane['start']}→{lane['end']}")
+                bad.append(f"{lane['start']}->{lane['end']}")
 
         lines: List[str] = []
         lines.append("# pnc_2d 路网与区域（由 map_server/scripts/route_editor.py 生成）")
@@ -558,7 +846,6 @@ class RouteEditor:
         lines.append("edges:")
         for lane in self.lanes:
             pts = ", ".join(f"[{x:.3f}, {y:.3f}]" for x, y in lane["points"])
-            # 双向是默认语义 → 不写 one_way，保持文件干净易读
             one_way = "one_way: true, " if lane["one_way"] else ""
             lines.append(f"  - {{from: {lane['start']}, to: {lane['end']}, "
                          f"{one_way}"
@@ -579,55 +866,66 @@ class RouteEditor:
 
         total = sum(sum(math.dist(a, b) for a, b in zip(l["points"][:-1], l["points"][1:]))
                     for l in self.lanes)
-        print(f"[保存] {self.routes_file}: {len(self.nodes)} 节点 / {len(self.lanes)} 通道 "
-              f"/ {len(self.zones)} 区域 / 总长 {total:.1f} m")
+        print(f"[save] {self.routes_file}: {len(self.nodes)} nodes / {len(self.lanes)} "
+              f"lanes / {len(self.zones)} zones / total {total:.1f} m")
         if self.zones:
             forb = sum(1 for z in self.zones if z["type"] == "forbidden")
             spd = len(self.zones) - forb
-            print(f"[区域] 禁行 {forb} 个（map_server 会按车体外接圆半径膨胀后烧进全局图）；"
-                  f"限速 {spd} 个（不烧入，供速度规划查询）")
-        # 重复通道（同起止点）：多半是重复画了一遍，会让图里出现平行边
+            print(f"[zones] forbidden {forb} (map_server inflates by the vehicle "
+                  f"circumscribed radius and burns them into the global map); "
+                  f"speed_limit {spd} (queried by the speed planner)")
+
         seen: Dict[Tuple[str, str], int] = {}
         for lane in self.lanes:
             key = (lane["start"], lane["end"])
             seen[key] = seen.get(key, 0) + 1
-        dup = [f"{a}→{b}×{c}" for (a, b), c in seen.items() if c > 1]
+        dup = [f"{a}->{b} x{c}" for (a, b), c in seen.items() if c > 1]
         if dup:
-            print(f"[警告] 存在重复通道：{', '.join(dup)}（是否多画了一遍？）")
+            print(f"[warn] duplicate lanes: {', '.join(dup)} (drawn twice?)")
+
         if bad:
-            print(f"[警告] 以下通道车体过不去（已在图上标红）：{', '.join(bad)}")
-            print("       原因可能是墙上、也可能是被禁行区挡住了；请挪开通道或收紧区域。")
+            print(f"[warn] these lanes are blocked (red in the window): {', '.join(bad)}")
+            print("       either an obstacle is in the way, or a forbidden zone covers it;")
+            print("       move the lane or tighten the zone.")
         comps = self._components()
+        used = {n for n in self.nodes if self._lanes_using(n)}
+        standalone = [n for n in self.nodes if n not in used]
+        if standalone:
+            print(f"[info] {len(standalone)} standalone point(s) not connected to any "
+                  f"lane: {', '.join(standalone)}")
         if len(comps) > 1:
-            print(f"[警告] 路网被分成 {len(comps)} 块（不连通），规划器只能在同一块里找通路：")
+            print(f"[warn] the network has {len(comps)} disconnected components; the "
+                  f"planner can only find routes inside one component:")
             for i, comp in enumerate(comps, 1):
-                print(f"       第 {i} 块：{', '.join(comp)}")
-            print("       两块之间需要一条通道连起来（端点靠近已有节点会自动吸附）。")
-        self.status = (f"已保存（{len(self.lanes)} 通道）"
-                       + (f"，⚠{len(bad)} 条不通" if bad else "")
-                       + (f"，⚠{len(comps)} 块不连通" if len(comps) > 1 else ""))
+                print(f"       #{i}: {', '.join(comp)}")
+            print("       connect them by clicking an existing point of the other part")
+            print("       (points within --snap metres are reused automatically).")
+        self.status = (f"saved ({len(self.lanes)} lanes)"
+                       + (f", WARNING {len(bad)} blocked" if bad else "")
+                       + (f", WARNING {len(comps)} components" if len(comps) > 1 else ""))
 
 
 # --------------------------------------------------------------------------- main
 def main() -> int:
-    ap = argparse.ArgumentParser(description="pnc_2d 路网画线编辑器")
+    ap = argparse.ArgumentParser(description="pnc_2d route network editor")
     ap.add_argument("--map-dir", default="/home/gmd/rcs/maps/go2_sim_factory",
-                    help="站点地图目录（含 map.yaml + map.pgm）")
-    ap.add_argument("--routes", default="", help="路网文件路径（默认 <map-dir>/routes.yaml）")
-    ap.add_argument("--lane-length", type=float, default=0.70, help="车体长 [m]")
-    ap.add_argument("--lane-width", type=float, default=0.40, help="车体宽 [m]")
-    ap.add_argument("--margin", type=float, default=0.05, help="车体四周安全余量 [m]")
+                    help="station map directory (map.yaml + map.pgm)")
+    ap.add_argument("--routes", default="",
+                    help="output file (default <map-dir>/routes.yaml)")
+    ap.add_argument("--lane-length", type=float, default=0.70, help="vehicle length [m]")
+    ap.add_argument("--lane-width", type=float, default=0.40, help="vehicle width [m]")
+    ap.add_argument("--margin", type=float, default=0.05, help="safety margin [m]")
     ap.add_argument("--snap", type=float, default=0.30,
-                    help="点到已有节点的吸附半径 [m]（用来把通道接起来）")
+                    help="reuse an existing point within this radius [m]")
     args = ap.parse_args()
 
     routes = args.routes or os.path.join(args.map_dir, "routes.yaml")
     editor = RouteEditor(args.map_dir, routes, args.lane_length, args.lane_width,
                          args.margin, args.snap)
-    print(f"[地图] {args.map_dir} | {editor.grid.w}x{editor.grid.h} @ {editor.grid.res} m "
-          f"| 范围 x[{editor.grid.x0:.2f},{editor.grid.x1:.2f}] "
+    print(f"[map] {args.map_dir} | {editor.grid.w}x{editor.grid.h} @ {editor.grid.res} m "
+          f"| x[{editor.grid.x0:.2f},{editor.grid.x1:.2f}] "
           f"y[{editor.grid.y0:.2f},{editor.grid.y1:.2f}]")
-    print(f"[输出] {routes}")
+    print(f"[out] {routes}")
     editor.run()
     return 0
 

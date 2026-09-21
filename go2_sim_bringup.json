@@ -18,14 +18,14 @@
         },
         {
           "shell_command": [
-            "sleep 8",
-            "# ros2 launch lightning go2_sim_slam.launch.py"
+            "sleep 20",
+            "ros2 launch lightning go2_sim_loc.launch.py map_path:=/home/gmd/rcs/maps/go2_sim_factory"
           ]
         },
         {
           "shell_command": [
             "sleep 8",
-            "# rviz2 -d ~/r41_ws/src/slam/lightning-lm/config/showbodypc.rviz"
+            "ros2 launch plan_env perception.launch.py "
           ]
         },
         {
@@ -40,19 +40,21 @@
       "window_name": "dev window 2",
       "layout": "tiled",
       "shell_command_before": [
-        "source ~/r41_ws/install/setup.bash"
+        "source ~/r41_ws/install/setup.bash",
+        "export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp",
+        "export CYCLONEDDS_URI=~/r41_ws/src/bringup/cyclonedds.xml"
       ],
       "panes": [
         {
           "shell_command": [
             "# 定位模式：先在window1停掉slam再启动，避免slam/loc同时抢占点云",
-            "# ros2 launch lightning r41_online_loc.launch.py"
+            "ros2 launch map_server map_server.launch.py "
           ]
         },
         {
           "shell_command": [
             "# 定位模式rviz",
-            "# rviz2 -d ~/r41_ws/src/slam/lightning-lm/config/showglobalmap.rviz"
+            "ros2 launch pnc_2d global_planner.launch.py"
           ]
         },
         {

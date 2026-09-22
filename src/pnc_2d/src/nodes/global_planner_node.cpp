@@ -28,12 +28,15 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <std_srvs/srv/trigger.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 
 #include "pnc_2d/core/cost_map_2d.hpp"
 #include "pnc_2d/core/factory.hpp"
 #include "pnc_2d/core/global_planner.hpp"
 #include "pnc_2d/core/route_graph.hpp"
+#include "pnc_2d/msg/planner_status.hpp"
+#include "pnc_2d/srv/switch_planner.hpp"
 #include "ros_param_reader.hpp"
 
 namespace pnc_2d {
@@ -70,22 +73,25 @@ public:
     topic_goal_ = paramString("topics.goal", "/goal_pose");
     topic_path_ = paramString("topics.path", "/pnc_2d/global_path");
     topic_markers_ = paramString("topics.markers", "/pnc_2d/plan_markers");
+    topic_status_ = paramString("topics.status", "/pnc_2d/global_status");
+    // 到达目标自动清空：**默认关**。"任务是否结束"是状态机的判断（P4），
+    // 规划器不该替它做决定；需要这个便利行为时把它打开即可。
+    clear_on_reach_ = paramBool("clear.auto_on_goal_reached", false);
+    reach_tol_ = paramDouble("clear.goal_tolerance", 0.30);
 
-    planner_ = createPlanner(planner_type_);
-    if (!planner_) {
-      std::string names;
-      for (const auto &n : availablePlanners())
-        names += (names.empty() ? "" : ", ") + n;
-      RCLCPP_ERROR(get_logger(),
-                   "[planner] 未知 planner.type='%s'（可用：%s）→ 回退 astar",
-                   planner_type_.c_str(), names.c_str());
-      planner_type_ = "astar";
-      planner_ = createPlanner(planner_type_);
-    }
-
-    RosParamReader reader(*this);
-    if (!planner_->configure(reader)) {
-      RCLCPP_ERROR(get_logger(), "[planner] 参数装载失败");
+    // 创建 + 配置（启动、热切换、热重载共用同一段逻辑）
+    {
+      std::string err;
+      if (!buildPlanner(planner_type_, err)) {
+        std::string names;
+        for (const auto &n : availablePlanners())
+          names += (names.empty() ? "" : ", ") + n;
+        RCLCPP_ERROR(get_logger(),
+                     "[planner] %s（可用：%s）→ 回退 astar", err.c_str(),
+                     names.c_str());
+        planner_type_ = "astar";
+        buildPlanner(planner_type_, err);
+      }
     }
 
     // 把"这一次到底吃了哪些
@@ -134,24 +140,122 @@ public:
         topic_path_, rclcpp::QoS(1).transient_local());
     pub_markers_ = create_publisher<visualization_msgs::msg::MarkerArray>(
         topic_markers_, rclcpp::QoS(1).transient_local());
+    // 状态同样是 latched：晚启动的状态机/监控也能拿到"最近一次规划到底成不成"
+    pub_status_ = create_publisher<pnc_2d::msg::PlannerStatus>(
+        topic_status_, rclcpp::QoS(1).transient_local());
+
+    // 显式清除入口：路径/标记是 latched 的，"当前没有有效计划"必须有人能主动说
+    // 一声（状态机切模式、RViz 手工清、任务取消都用它）。
+    srv_clear_ = create_service<std_srvs::srv::Trigger>(
+        "~/clear_path",
+        [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+               std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+          clearPlan("服务调用");
+          res->success = true;
+          res->message = "路径与规划标记已清空";
+        });
+
+    // 运行时热切换算法（不重启）。P4 的状态机切模式时就用它。
+    srv_switch_ = create_service<pnc_2d::srv::SwitchPlanner>(
+        "~/switch_planner",
+        [this](const std::shared_ptr<pnc_2d::srv::SwitchPlanner::Request> req,
+               std::shared_ptr<pnc_2d::srv::SwitchPlanner::Response> res) {
+          std::string err;
+          if (switchPlanner(req->type, err)) {
+            res->success = true;
+            res->message = "已切换到 " + planner_type_;
+          } else {
+            res->success = false;
+            res->message = err;
+            RCLCPP_ERROR(get_logger(), "[planner] 热切换 → '%s' 失败：%s",
+                         req->type.c_str(), err.c_str());
+          }
+        });
+
+    // 热重载参数：用当前参数值重新 configure（换 footprint / 剪枝策略不用重启）
+    srv_reload_ = create_service<std_srvs::srv::Trigger>(
+        "~/reload_params",
+        [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+               std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+          std::string err;
+          if (reloadParams(err)) {
+            res->success = true;
+            res->message = "已按当前参数重新装载 " + planner_type_;
+          } else {
+            res->success = false;
+            res->message = err;
+          }
+        });
 
     const FootprintParams &fp = planner_->footprintParams();
     RCLCPP_INFO(
         get_logger(),
-        "[planner] type=%s frame=%s | 地图 %s | 位姿 %s | 目标 %s | 路径 %s",
+        "[planner] type=%s frame=%s | 地图 %s | 位姿 %s | 目标 %s | 路径 %s | 状态 %s",
         planner_type_.c_str(), frame_id_.c_str(), topic_map_.c_str(),
-        topic_odom_.c_str(), topic_goal_.c_str(), topic_path_.c_str());
+        topic_odom_.c_str(), topic_goal_.c_str(), topic_path_.c_str(),
+        topic_status_.c_str());
+    RCLCPP_INFO(get_logger(),
+                "[planner] 清空策略：失败时自动清空 | 到达目标(≤ %.2f m)自动清空：%s%s "
+                "| 也可调服务 ~/clear_path",
+                reach_tol_, clear_on_reach_ ? "开" : "关",
+                clear_on_reach_
+                    ? ""
+                    : "（clear.auto_on_goal_reached:=true 可打开；默认由状态机决定"
+                      "何时清）");
     RCLCPP_INFO(
         get_logger(),
         "[planner] QoS：地图 transient_local（匹配 map_server latched）| "
         "位姿 best_effort+keep_last(5)（匹配 lightning 定位）| 目标 reliable");
-    RCLCPP_INFO(get_logger(),
-                "[planner] footprint %s: %.2fx%.2f m（机体系）+ margin %.2f | "
-                "内切半径 %.3f "
-                "外接半径 %.3f | 边扫掠 %s | 快路径 %s",
-                fp.enable ? "开" : "关", fp.length, fp.width, fp.safe_margin,
-                fp.inscribedRadius(), fp.circumscribedRadius(),
-                fp.check_edges ? "on" : "off", fp.fast_path ? "on" : "off");
+    logFootprintInfo();
+
+    // 启动清场：把上一个进程（或上一次运行）留在 latched 话题 / RViz 里的
+    // 路径与通路高亮清掉，避免"换了算法重启，旧路网路径还挂在那里"。
+    //
+    // ⚠ 必须**重复发几次**：RViz 的 MarkerArray 订阅是 VOLATILE 的，只收
+    // "writer 与 reader 匹配完成之后"发布的消息；启动瞬间发一次会早于 DDS
+    // discovery，被直接丢掉（实测就是这个问题：旧高亮留在 RViz 里）。
+    // 一旦有过规划结果就不再重发，避免反过来把刚发的新路径清掉。
+    timer_startup_cleanup_ = create_wall_timer(
+        std::chrono::milliseconds(500), [this]() {
+          if (first_result_seen_)
+            return;
+          publishStartupCleanup();
+          if (++startup_cleanup_ticks_ >= 6) // 3 s 足够覆盖发现时间
+            timer_startup_cleanup_->cancel();
+        });
+    publishStartupCleanup();
+
+    // planner.type 支持**热切换**：按参数改会真的重建规划器（见 switchPlanner）。
+    // 失败时拒绝这次参数修改（successful=false）—— 保证"参数值 = 实际生效值"，
+    // 否则会出现"以为切成 A* 了，结果还在走路网"这种最难查的误解。
+    cb_set_params_ = add_on_set_parameters_callback(
+        [this](const std::vector<rclcpp::Parameter> &ps) {
+          rcl_interfaces::msg::SetParametersResult r;
+          r.successful = true;
+          for (const auto &p : ps) {
+            if (p.get_name() != "planner.type")
+              continue;
+            const std::string want =
+                p.get_type() == rclcpp::ParameterType::PARAMETER_STRING
+                    ? p.as_string()
+                    : std::string();
+            if (want == planner_type_)
+              continue;
+            std::string err;
+            if (switchPlanner(want, err)) {
+              RCLCPP_INFO(get_logger(), "[planner] 已按参数热切换到 '%s'",
+                          planner_type_.c_str());
+            } else {
+              r.successful = false;
+              r.reason = "热切换失败：" + err + "（仍在使用 " + planner_type_ +
+                         "）";
+              RCLCPP_ERROR(get_logger(),
+                           "[planner] planner.type → '%s' 失败：%s",
+                           want.c_str(), err.c_str());
+            }
+          }
+          return r;
+        });
   }
 
 private:
@@ -185,6 +289,7 @@ private:
       return;
     }
     planner_->setCostMap(map);
+    map_ = map; // 热切换/热重载时要把同一张图交给新规划器
     has_map_ = true;
     has_map_meta_ = true;
     map_load_time_ = msg->info.map_load_time;
@@ -200,14 +305,115 @@ private:
                 map->originY(), map->originYaw());
 
     // 路网类算法：把路网信息报出来，并把全网画到 RViz
-    if (const RouteGraph *g = planner_->routeGraph();
-        g != nullptr && g->valid()) {
-      RCLCPP_INFO(get_logger(), "[planner] 路网 %s", g->summary().c_str());
-      for (const std::string &w : g->warnings()) {
-        RCLCPP_WARN(get_logger(), "[planner] 路网：%s", w.c_str());
-      }
-      publishMarkers(nullptr, nullptr);
+    logRoutesInfo();
+    publishMarkers(nullptr, nullptr);
+  }
+
+  /// 车体信息：热重载 footprint.* 后要能看到改没改成功
+  void logFootprintInfo() {
+    const FootprintParams &fp = planner_->footprintParams();
+    RCLCPP_INFO(get_logger(),
+                "[planner] footprint %s: %.2fx%.2f m（机体系）+ margin %.2f | "
+                "内切半径 %.3f 外接半径 %.3f | 边扫掠 %s | 快路径 %s",
+                fp.enable ? "开" : "关", fp.length, fp.width, fp.safe_margin,
+                fp.inscribedRadius(), fp.circumscribedRadius(),
+                fp.check_edges ? "on" : "off", fp.fast_path ? "on" : "off");
+  }
+
+  /// 路网信息（有路网才报）：节点数/通道数/总长 + 每条过不去的通道点名。
+  /// 地图到达、热切换、热重载后都会调一次。
+  void logRoutesInfo() {
+    const RouteGraph *g = planner_->routeGraph();
+    if (g == nullptr || !g->valid())
+      return;
+    RCLCPP_INFO(get_logger(), "[planner] 路网 %s", g->summary().c_str());
+    for (const std::string &w : g->warnings())
+      RCLCPP_WARN(get_logger(), "[planner] 路网：%s", w.c_str());
+    std::string bad;
+    int n_bad = 0;
+    for (const RouteEdge &e : g->edges()) {
+      if (e.feasible)
+        continue;
+      ++n_bad;
+      bad += (bad.empty() ? "" : ", ") +
+             g->nodes()[static_cast<std::size_t>(e.from)].name + "->" +
+             g->nodes()[static_cast<std::size_t>(e.to)].name;
     }
+    if (n_bad > 0)
+      RCLCPP_WARN(get_logger(),
+                  "[planner] 车体过不去的通道 %d 条（不参与路由）：%s", n_bad,
+                  bad.c_str());
+  }
+
+  /// 创建 + 配置一个算法实例（不动现有 planner_）。启动/热切换/热重载共用。
+  bool buildPlanner(const std::string &type, std::string &err,
+                    std::unique_ptr<GlobalPlanner> &out) {
+    std::unique_ptr<GlobalPlanner> next = createPlanner(type);
+    if (!next) {
+      std::string names;
+      for (const auto &n : availablePlanners())
+        names += (names.empty() ? "" : ", ") + n;
+      err = "未知 planner.type='" + type + "'（可用：" + names + "）";
+      return false;
+    }
+    RosParamReader reader(*this);
+    if (!next->configure(reader)) {
+      err = "参数装载失败（" + type + "）";
+      return false;
+    }
+    out = std::move(next);
+    return true;
+  }
+
+  bool buildPlanner(const std::string &type, std::string &err) {
+    std::unique_ptr<GlobalPlanner> next;
+    if (!buildPlanner(type, err, next))
+      return false;
+    planner_ = std::move(next);
+    planner_type_ = type;
+    return true;
+  }
+
+  /// 运行时热切换算法：构建 → 交地图（路网模式会立刻重跑可行性校验）→
+  /// 换指针 → 清空旧路径/标记 → 重报路网信息。失败时保留旧算法。
+  ///
+  /// 线程前提：节点用默认的**单线程** executor，goal/参数/服务回调互相串行，
+  /// 不存在"规划到一半把 planner_ 换掉"的重入。若将来改用
+  /// MultiThreadedExecutor，这里（以及 planner_ 的访问）必须加锁。
+  bool switchPlanner(const std::string &type, std::string &err) {
+    if (type == planner_type_) {
+      err = "已在使用 " + type;
+      return true;
+    }
+    std::unique_ptr<GlobalPlanner> next;
+    if (!buildPlanner(type, err, next))
+      return false;
+    if (map_)
+      next->setCostMap(map_); // 路网模式在这里做可行性校验
+    planner_ = std::move(next);
+    planner_type_ = type;
+    clearPlan("切换算法");
+    logFootprintInfo();
+    logRoutesInfo();
+    RCLCPP_INFO(get_logger(), "[planner] 已热切换到 %s", planner_type_.c_str());
+    return true;
+  }
+
+  /// 热重载参数：用当前参数值重新构建**同类**算法（footprint / 剪枝策略等
+  /// 改了不用重启）。失败时保留旧实例。
+  bool reloadParams(std::string &err) {
+    std::unique_ptr<GlobalPlanner> next;
+    if (!buildPlanner(planner_type_, err, next))
+      return false;
+    if (map_)
+      next->setCostMap(map_);
+    planner_ = std::move(next);
+    clearPlan("热重载参数");
+    logFootprintInfo();
+    logRoutesInfo();
+    RCLCPP_INFO(get_logger(), "[planner] 已按当前参数重新装载 %s",
+                planner_type_.c_str());
+    return true;
   }
 
   void onOdom(const nav_msgs::msg::Odometry::SharedPtr msg) {
@@ -217,6 +423,16 @@ private:
     start_.has_yaw = true;
     odom_frame_ = msg->header.frame_id;
     has_odom_ = true;
+
+    // 到达目标就收掉路径：路径是事件驱动产物，任务完成了就不该再挂在
+    // latched 话题上（RViz 会一直显示）。
+    // 只在"规划时本来就离目标更远"时生效，避免目标就在车边时刚发就清。
+    if (clear_on_reach_ && has_active_plan_ && plan_start_dist_ > reach_tol_) {
+      const double d = std::hypot(start_.x - active_goal_.x,
+                                  start_.y - active_goal_.y);
+      if (d <= reach_tol_)
+        clearPlan("已到达目标");
+    }
   }
 
   void onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
@@ -275,12 +491,20 @@ private:
 
   void publishResult(const PlanResult &result, const PlanRequest &req) {
     const auto &st = result.stats;
+    first_result_seen_ = true; // 有结果了，启动清场停止重发
+    if (timer_startup_cleanup_)
+      timer_startup_cleanup_->cancel();
+    publishStatus(result, req);
     if (!result.ok()) {
       RCLCPP_ERROR(get_logger(),
                    "[planner] 规划失败：%s（%s）| 窗口尝试 %d 次 | 扩展节点 "
                    "%ld | 耗时 %.1f ms",
                    toString(result.status), result.message.c_str(),
                    st.windows_tried, st.expanded_nodes, st.plan_time_ms);
+      // 显式清空 latched 路径：否则上层/RViz 会继续显示上一条**已过期**的成功
+      // 路径，把"规划失败"误当成"路径还有效"（真的踩过）。
+      publishEmptyPath();
+      has_active_plan_ = false;
       publishMarkers(&result, &req); // 只画起终点，不画路径
       return;
     }
@@ -303,11 +527,102 @@ private:
     RCLCPP_INFO(get_logger(),
                 "[planner] 规划成功：%zu 点 / %.2f m | 耗时 %.1f ms | 扩展节点 "
                 "%ld（发现 %ld，峰值开放集 %ld）"
-                "| 窗口尝试 %d 次 | 完整 footprint 检查 %ld 次",
+                "| 窗口尝试 %d 次 | 完整 footprint 检查 %ld 次%s%s",
                 result.path.size(), st.path_length, st.plan_time_ms,
                 st.expanded_nodes, st.discovered_nodes, st.max_open_set,
-                st.windows_tried, st.footprint_full_checks);
+                st.windows_tried, st.footprint_full_checks,
+                result.message.empty() ? "" : " | ",
+                result.message.c_str());
+    has_active_plan_ = true;
+    active_goal_ = req.goal;
+    plan_start_dist_ = std::hypot(req.goal.x - req.start.x,
+                                  req.goal.y - req.start.y);
     publishMarkers(&result, &req);
+  }
+
+  /// 发一条空 Path：latched 话题上"当前没有有效路径"就靠这个表达
+  void publishEmptyPath() {
+    nav_msgs::msg::Path empty;
+    empty.header.stamp = now();
+    empty.header.frame_id = frame_id_;
+    pub_path_->publish(empty);
+  }
+
+  /// 清空"当前计划"：空路径 + 删掉起终点箭头/车体轮廓/通路高亮。
+  /// 路网本体（节点/通道）是静态资产，保留。
+  void clearPlan(const char *why) {
+    const bool had = has_active_plan_;
+    publishEmptyPath();
+    planner_->reset(); // 把上次的通路高亮也一起收掉
+    publishClearMarkers();
+    has_active_plan_ = false;
+    if (had)
+      RCLCPP_INFO(get_logger(), "[planner] 已清空当前路径（%s）", why);
+  }
+
+  void publishClearMarkers() {
+    visualization_msgs::msg::MarkerArray arr;
+    const auto stamp = now();
+    appendRouteNetwork(arr, stamp); // 路网照旧显示
+    auto del = [&](const char *ns, int id, int32_t type) {
+      visualization_msgs::msg::Marker m;
+      m.header.stamp = stamp;
+      m.header.frame_id = frame_id_;
+      m.ns = ns;
+      m.id = id;
+      m.type = type;
+      m.action = visualization_msgs::msg::Marker::DELETE;
+      arr.markers.push_back(m);
+    };
+    del("start", 0, visualization_msgs::msg::Marker::ARROW);
+    del("goal", 1, visualization_msgs::msg::Marker::ARROW);
+    del("footprint", 2, visualization_msgs::msg::Marker::LINE_STRIP);
+    // 当前算法如果没有路网（例如热切换到 A*），本节点之前画的路网也要收掉
+    const RouteGraph *g = planner_->routeGraph();
+    if (g == nullptr || !g->valid()) {
+      for (int i = 0; i < kStaleMarkerIds; ++i) {
+        del("route_nodes", i, visualization_msgs::msg::Marker::SPHERE);
+        del("route_node_labels", i,
+            visualization_msgs::msg::Marker::TEXT_VIEW_FACING);
+        del("route_edges", i, visualization_msgs::msg::Marker::LINE_STRIP);
+        del("route_oneway", i, visualization_msgs::msg::Marker::ARROW);
+      }
+    }
+    // route_active 的 id 从 0 连续编号，但**上一个进程**发过几条本进程并不知道
+    // （active_marker_count_ 重启后从 0 开始），所以这里按一个足够大的范围全部删掉。
+    for (int i = 0; i < kStaleMarkerIds; ++i)
+      del("route_active", i, visualization_msgs::msg::Marker::LINE_STRIP);
+    active_marker_count_ = 0;
+    pub_markers_->publish(arr);
+  }
+
+  /// 启动时清一次场。路径/标记都是 latched 且 RViz 不会在发布者消失后自己清，
+  /// 所以"杀掉旧节点、用另一种算法重启"时，RViz 里会继续显示上一个进程留下的
+  /// 路径与通路高亮。启动时主动发一条空路径 + DELETE 就能清干净。
+  void publishStartupCleanup() {
+    publishEmptyPath();
+    planner_->reset();
+    publishClearMarkers();
+  }
+  /// 状态上报（成功/失败都发，latched）：供状态机与上层错误上报使用
+  void publishStatus(const PlanResult &result, const PlanRequest &req) {
+    pnc_2d::msg::PlannerStatus s;
+    s.header.stamp = now();
+    s.header.frame_id = frame_id_;
+    s.status = static_cast<uint8_t>(result.status);
+    s.status_name = toString(result.status);
+    s.message = result.message;
+    s.success = result.ok();
+    s.start_x = req.start.x;
+    s.start_y = req.start.y;
+    s.goal_x = req.goal.x;
+    s.goal_y = req.goal.y;
+    s.path_points = static_cast<uint32_t>(result.path.size());
+    s.path_length_m = result.stats.path_length;
+    s.plan_time_ms = result.stats.plan_time_ms;
+    s.expanded_nodes = static_cast<int32_t>(result.stats.expanded_nodes);
+    s.windows_tried = static_cast<int32_t>(result.stats.windows_tried);
+    pub_status_->publish(s);
   }
 
   void publishMarkers(const PlanResult *result, const PlanRequest *req) {
@@ -537,6 +852,32 @@ private:
     return def;
   }
 
+  bool paramBool(const std::string &key, bool def) {
+    if (!has_parameter(key))
+      return declare_parameter<bool>(key, def);
+    const rclcpp::Parameter p = get_parameter(key);
+    if (p.get_type() == rclcpp::ParameterType::PARAMETER_BOOL)
+      return p.as_bool();
+    RCLCPP_WARN(get_logger(),
+                "[planner] 参数 %s 类型应为 bool，实际 %s → 用默认值 %s",
+                key.c_str(), p.get_type_name().c_str(), def ? "true" : "false");
+    return def;
+  }
+
+  double paramDouble(const std::string &key, double def) {
+    if (!has_parameter(key))
+      return declare_parameter<double>(key, def);
+    const rclcpp::Parameter p = get_parameter(key);
+    if (p.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE)
+      return p.as_double();
+    if (p.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER)
+      return static_cast<double>(p.as_int());
+    RCLCPP_WARN(get_logger(),
+                "[planner] 参数 %s 类型应为 double，实际 %s → 用默认值 %.3f",
+                key.c_str(), p.get_type_name().c_str(), def);
+    return def;
+  }
+
   std::string planner_type_;
   std::string frame_id_;
   std::string topic_map_;
@@ -544,6 +885,7 @@ private:
   std::string topic_goal_;
   std::string topic_path_;
   std::string topic_markers_;
+  std::string topic_status_;
 
   std::unique_ptr<GlobalPlanner> planner_;
   rclcpp::QoS odom_qos_{rclcpp::SensorDataQoS()};
@@ -553,6 +895,27 @@ private:
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_path_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
       pub_markers_;
+  rclcpp::Publisher<pnc_2d::msg::PlannerStatus>::SharedPtr pub_status_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srv_clear_;
+  rclcpp::Service<pnc_2d::srv::SwitchPlanner>::SharedPtr srv_switch_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srv_reload_;
+  /// 当前地图（latched 收到后留着：热切换/热重载要交给新规划器）
+  std::shared_ptr<CostMap2D> map_;
+
+  // "当前是否有一个有效的路径"。路径是事件驱动产物 + latched 话题，
+  // 所以必须显式跟踪它的有效期，不然 RViz 会一直显示。
+  bool has_active_plan_{false};
+  Pose2D active_goal_;
+  double plan_start_dist_{0.0}; // 规划时车离目标有多远（用于判断"真的是到达"）
+  bool clear_on_reach_{true};
+  double reach_tol_{0.30};
+  /// 清场时删除的 route_active id 上界（够大即可，多发几个 DELETE 无代价）
+  static constexpr int kStaleMarkerIds = 64;
+  rclcpp::TimerBase::SharedPtr timer_startup_cleanup_;
+  int startup_cleanup_ticks_{0};
+  bool first_result_seen_{false};
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr
+      cb_set_params_;
 
   Pose2D start_;
   std::string odom_frame_;

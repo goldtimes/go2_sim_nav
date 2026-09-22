@@ -1,0 +1,16 @@
+# 运行时热切换全局规划算法（不重启节点）
+#
+# 例（写成一行，别用行尾反斜杠：rosidl 模板会被它搞崩）：
+#   ros2 service call /global_planner/switch_planner pnc_2d/srv/SwitchPlanner "{type: 'route_network'}"
+#
+# 语义：
+#   · 新算法按**当前**参数值 configure（yaml / ros2 param set 过的值都算）
+#   · 若已收到地图，会立刻把地图交给新算法（路网模式因此会马上做可行性校验）
+#   · 切换成功后会**清空当前路径与规划标记**（旧算法算出的路径对新算法无意义）
+#   · 构建/配置失败时**保留旧算法**并返回 success=false + 原因
+#   · 想热应用其它参数（footprint.* / path_prune_* 等）用 /global_planner/reload_params
+
+string type      # 目标算法类型：astar / route_network（见 core/factory.cpp）
+---
+bool success
+string message   # 成功时为"已切换到 X"，失败时为原因

@@ -24,7 +24,7 @@ from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description():
     pkg_share = FindPackageShare('pnc_2d')
-    default_config = PathJoinSubstitution([pkg_share, 'config', 'global_planner.yaml'])
+    default_config = PathJoinSubstitution([pkg_share, 'config', 'route_network.yaml'])
 
     config_arg = DeclareLaunchArgument(
         'config', default_value=default_config,

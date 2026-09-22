@@ -11,9 +11,21 @@ endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
+
+# ---------------------------------------------------------------- 消息/服务
+# 只有一个状态消息（失败上报）和一个切换服务（运行时热切换算法）。
+# 库仍然是 ROS-free：这些接口只被 nodes/ 里的薄壳使用。
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/PlannerStatus.msg"
+  "srv/SwitchPlanner.srv"
+  DEPENDENCIES std_msgs
+)
 # 路网 yaml 解析（P2）。库仍然 ROS-free：只多了个系统依赖。
 # ⚠ 系统 yaml-cpp 0.7 导出的 target 名不确定（yaml-cpp / yaml-cpp::yaml-cpp），
 #   map_server 已踩过：用 ${YAML_CPP_LIBRARIES} 最稳，且不要与
@@ -53,8 +65,12 @@ add_executable(global_planner_node src/nodes/global_planner_node.cpp)
 target_include_directories(global_planner_node PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/nodes)
 target_link_libraries(global_planner_node pnc_2d_planner)
 ament_target_dependencies(global_planner_node
-  rclcpp nav_msgs geometry_msgs visualization_msgs
+  rclcpp std_msgs std_srvs nav_msgs geometry_msgs visualization_msgs
 )
+# 生成的消息头（pnc_2d/msg/planner_status.hpp）在 CMake 构建目录下，
+# 必须把本包自己的 typesupport 目标链上，否则找不到头文件。
+rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")
+target_link_libraries(global_planner_node "${cpp_typesupport_target}")
 
 install(TARGETS pnc_2d_planner
   EXPORT export_pnc_2d_planner
@@ -73,7 +89,8 @@ install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
 # 对外导出：map_server 要复用 RouteGraph（路网资产由 map_server 管、规划器消费）
 ament_export_targets(export_pnc_2d_planner HAS_LIBRARY_TARGET)
 ament_export_include_directories(include)
-ament_export_dependencies(rclcpp nav_msgs geometry_msgs visualization_msgs yaml-cpp)
+ament_export_dependencies(rclcpp std_msgs std_srvs nav_msgs geometry_msgs visualization_msgs yaml-cpp)
+ament_export_dependencies(rosidl_default_runtime)
 
 # ---------------------------------------------------------------- 测试
 if(BUILD_TESTING)

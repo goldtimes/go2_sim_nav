@@ -22,6 +22,14 @@ global_planner:
     topics.goal: "/goal_pose"                    # RViz "2D Goal Pose"
     topics.path: "/pnc_2d/global_path"           # 输出几何路径
     topics.markers: "/pnc_2d/plan_markers"       # 起终点箭头 + 起点处车体轮廓
+    topics.status: "/pnc_2d/global_status"       # 规划状态（latched，失败上报用）
+
+    # ---------------- 路径有效期 ----------------
+    # 失败时总是自动清空（发空 Path），避免上层拿到过期路径；
+    # 到达目标是否清空默认 **false**："任务是否结束"由状态机（P4）判断，
+    # 规划器不替它决定。需要这个便利行为就打开。
+    clear.auto_on_goal_reached: false
+    clear.goal_tolerance: 0.30                    # 判定"到达"的距离 [m]
 
     # ==================================================================
     # 代价语义（所有算法共用）

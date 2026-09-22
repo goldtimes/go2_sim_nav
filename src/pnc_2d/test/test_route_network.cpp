@@ -323,8 +323,63 @@ TEST(RouteNetworkPlanner, StrictStopsAtProjectionHybridReachesGoal) {
               pathLen(rh.path));
 }
 
-TEST(RouteNetworkPlanner, InfeasibleLaneIsRejected) {
-  // 在 e1（x=9，y 从 1 到 9）中间横一道墙 → 车体过不去
+TEST(RouteNetworkPlanner, BlockedLaneIsSkippedOthersStillRoute) {
+  // 用户最关心的语义：路网拆成多段后，**被挡的那段单独剔除，其余仍可路由**。
+  // 环 A-B-C-D 上把 B->C 挡死：从 A->B 边上的点去 C->D 边上的点，必须绕 D->A。
+  auto map = MapBuilder(300, 300).rect(8.5, 4.5, 9.5, 5.5).build();
+  const std::string yaml = ringYaml(false);
+
+  MemoryParamReader p;
+  p.setString("route_network.routes_file", writeTempRoutes(yaml, "skip"));
+  p.setBool("route_network.reject_infeasible", true);
+  p.setString("route_network.goal_mode", "strict"); // 只看路网段，便于算长度
+  RouteNetworkPlanner planner;
+  ASSERT_TRUE(planner.configure(p));
+  planner.setCostMap(map);
+
+  const PlanResult r =
+      planner.plan(PlanRequest{mkPose(3.0, 1.0), mkPose(6.0, 9.0)});
+  ASSERT_TRUE(r.ok()) << toString(r.status) << " / " << r.message;
+  // 绕行里程：起点(3,1)→A 2 m + A→D 8 m + D→(6,9) 5 m = 15 m
+  EXPECT_NEAR(pathLen(r.path), 15.0, 0.15);
+  // 走过的通道里绝不能有被挡的 B->C（节点序号不写死，按名字判）
+  const auto used = planner.activeRouteEdges();
+  const RouteGraph *g = planner.routeGraph();
+  ASSERT_NE(g, nullptr);
+  for (const int ei : used) {
+    const RouteEdge &e = g->edges()[static_cast<std::size_t>(ei)];
+    const std::string nm =
+        g->nodes()[static_cast<std::size_t>(e.from)].name + "->" +
+        g->nodes()[static_cast<std::size_t>(e.to)].name;
+    EXPECT_NE(nm, "B->C") << "不应使用被挡的通道";
+  }
+  EXPECT_EQ(used.size(), 3u) << "应走 A->B / D->A / C->D 三条";
+  std::printf("      [绕开被挡段] %.2f m | 用了 %zu 条通道 | 消息：%s\n",
+              pathLen(r.path), used.size(), r.message.c_str());
+  EXPECT_NE(r.message.find("B->C"), std::string::npos)
+      << "成功时也应说明绕开了哪条：" << r.message;
+}
+
+TEST(RouteNetworkPlanner, NoPathMessageNamesTheBlockedLane) {
+  // 唯一通路必须经过被挡通道时：报错要**点名**，不能只说"有几条"
+  auto map = MapBuilder(300, 300).rect(8.5, 4.5, 9.5, 5.5).build();
+  MemoryParamReader p;
+  p.setString("route_network.routes_file", writeTempRoutes(ringYaml(false), "name"));
+  p.setBool("route_network.reject_infeasible", true);
+  RouteNetworkPlanner planner;
+  ASSERT_TRUE(planner.configure(p));
+  planner.setCostMap(map);
+
+  const PlanResult r =
+      planner.plan(PlanRequest{mkPose(3.0, 1.0), mkPose(9.0, 8.0)});
+  EXPECT_FALSE(r.ok());
+  EXPECT_EQ(r.status, PlannerStatus::kNoPath);
+  EXPECT_NE(r.message.find("B->C"), std::string::npos)
+      << "报错里应点名不可行通道：" << r.message;
+  std::printf("      [点名] %s\n", r.message.c_str());
+}
+
+TEST(RouteNetworkPlanner, InfeasibleLaneIsRejected) {  // 在 e1（x=9，y 从 1 到 9）中间横一道墙 → 车体过不去
   auto map = MapBuilder(300, 300).rect(8.5, 4.5, 9.5, 5.5).build();
   const std::string yaml = ringYaml(false);
 

@@ -60,6 +60,10 @@ Interaction (also printed by pressing `h` in the window):
                another lane uses it), so no orphan points are left behind
   d            delete last lane
   f            smooth last lane (spline; node positions are kept as vertices)
+  v            SPLIT last lane at every point -> one short lane per segment.
+               Recommended: map_server judges feasibility per whole edge, so a
+               single blocked segment then only kills that one lane (the rest
+               still route), and the intermediate points become real junctions
   a            toggle one-way of last lane (default: two-way)
   - / =        speed limit of last lane          -/+ 0.1 m/s
   [ / ]        corridor half width of last lane  -/+ 0.1 m (0 = strict lane
@@ -258,13 +262,15 @@ def in_any_forbidden(x: float, y: float, zones: List[Dict], inflate: float) -> b
 
 
 def lane_free(grid: GridMap, pts: List[Tuple[float, float]], half_len: float,
-              half_wid: float, zones: Optional[List[Dict]] = None) -> bool:
+              half_wid: float, zones: Optional[List[Dict]] = None,
+              zone_inflate: float = -1.0) -> bool:
     """沿通道逐位姿检查（朝向取该段方向，与 C++ 侧 lineIsCollisionFree 同口径）。
 
-    zones 非空时**禁行区也算障碍**（按车体外接圆半径膨胀，与 map_server 烧入口径一致）
+    zones 非空时**禁行区也算障碍**，并按 `zone_inflate` 膨胀（<0 = 车体外接圆半径）。
+    这个值必须与 map_server 的 `zones.inflate` 一致
     —— 否则编辑器说"通得过"、map_server 说"过不去"，很迷惑。
     """
-    inf = math.hypot(half_len, half_wid)
+    inf = zone_inflate if zone_inflate >= 0.0 else math.hypot(half_len, half_wid)
     for (ax, ay), (bx, by) in zip(pts[:-1], pts[1:]):
         seg = math.hypot(bx - ax, by - ay)
         if seg < 1e-9:
@@ -307,12 +313,17 @@ def smooth(points: List[Tuple[float, float]], n: int = 6
 # --------------------------------------------------------------------------- 编辑器
 class RouteEditor:
     def __init__(self, map_dir: str, routes_file: str, lane_len: float,
-                 lane_wid: float, margin: float, snap: float) -> None:
+                 lane_wid: float, margin: float, snap: float,
+                 zone_inflate: float = -1.0) -> None:
         self.grid = GridMap(map_dir)
         self.routes_file = routes_file
         self.half_len = lane_len / 2.0 + margin
         self.half_wid = lane_wid / 2.0 + margin
         self.snap = snap
+        # 禁行区膨胀量：必须与 map_server 的 zones.inflate 一致，否则会出现
+        # “编辑器说通得过 / map_server 说过不去”。<0 = 自动用车体外接圆半径。
+        self.zone_inflate = (zone_inflate if zone_inflate >= 0.0
+                             else math.hypot(self.half_len, self.half_wid))
 
         self.nodes: Dict[str, Dict] = {}      # name -> {x, y, type}
         self.lanes: List[Dict] = []           # {points, start, end, via, one_way, speed, corridor}
@@ -503,6 +514,8 @@ class RouteEditor:
             if self.lanes:
                 self.lanes[-1]["points"] = smooth(self.lanes[-1]["points"])
                 self.status = "smoothed last lane"
+        elif k == "v":
+            self._split_last_lane()
         elif k == "a":
             if self.lanes:
                 self.lanes[-1]["one_way"] = not self.lanes[-1]["one_way"]
@@ -695,6 +708,45 @@ class RouteEditor:
     def _reset_lane(self) -> None:
         self.current, self.current_nodes, self.current_created = [], [], []
 
+    def _split_last_lane(self) -> None:
+        """把最后一条通道在**每个点**处切开 → 每相邻两点一条通道。
+
+        推荐做法就是多段：单段被挡只影响那一段（map_server 是按整条边判可行性的），
+        而且中间点从此就是可路由的路口/岔路。
+        """
+        if not self.lanes:
+            self.status = "no lane to split"
+            return
+        src = self.lanes[-1]
+        names = src.get("via") or [src["start"], src["end"]]
+        if len(names) < 3:
+            self.status = f"lane {src['start']}->{src['end']} has 2 points, nothing to split"
+            return
+        # 安全性：折线里若有"不在节点表里"的形状点，切开会丢掉它们 → 拒绝
+        node_pts = {(round(self.nodes[n]["x"], 3), round(self.nodes[n]["y"], 3))
+                    for n in names}
+        alien = [p for p in src["points"]
+                 if (round(p[0], 3), round(p[1], 3)) not in node_pts]
+        if alien:
+            self.status = (f"lane has {len(alien)} shape point(s) that are not nodes "
+                           f"-- split would drop them")
+            return
+        self.lanes.pop()
+        made = []
+        for a, b in zip(names, names[1:]):
+            self.lanes.append({
+                "points": [(self.nodes[a]["x"], self.nodes[a]["y"]),
+                           (self.nodes[b]["x"], self.nodes[b]["y"])],
+                "start": a, "end": b, "via": [a, b],
+                "one_way": src["one_way"], "speed": src["speed"],
+                "corridor": src["corridor"],
+            })
+            made.append(f"{a}->{b}")
+        self.status = (f"split {src['start']}->{src['end']} into {len(made)} lanes")
+        print(f"[split] {src['start']}->{src['end']} ({len(names)} points) "
+              f"-> {len(made)} lanes: {', '.join(made)}")
+        print("        重新保存后，map_server 会逐条判可行性：单段被挡只剔除那一段")
+
     def _finish_lane(self) -> None:
         if len(self.current_nodes) < 2:
             if self.current_nodes:
@@ -736,7 +788,7 @@ class RouteEditor:
         bad = 0
         for lane in self.lanes:
             ok = lane_free(self.grid, lane["points"], self.half_len, self.half_wid,
-                           self.zones)
+                           self.zones, self.zone_inflate)
             if not ok:
                 bad += 1
             xs = [p[0] for p in lane["points"]]
@@ -830,8 +882,8 @@ class RouteEditor:
     def save(self) -> None:
         bad = []
         for lane in self.lanes:
-            if not lane_free(self.grid, lane["points"], self.half_len, self.half_wid,
-                             self.zones):
+            if not lane_free(self.grid, lane["points"], self.half_len,
+                             self.half_wid, self.zones, self.zone_inflate):
                 bad.append(f"{lane['start']}->{lane['end']}")
 
         lines: List[str] = []
@@ -917,15 +969,22 @@ def main() -> int:
     ap.add_argument("--margin", type=float, default=0.05, help="safety margin [m]")
     ap.add_argument("--snap", type=float, default=0.30,
                     help="reuse an existing point within this radius [m]")
+    ap.add_argument("--zone-inflate", type=float, default=-1.0,
+                    help="forbidden-zone inflation [m]; <0 = auto (vehicle "
+                         "circumscribed radius). Keep it equal to map_server's "
+                         "zones.inflate, otherwise the editor and map_server "
+                         "disagree")
     args = ap.parse_args()
 
     routes = args.routes or os.path.join(args.map_dir, "routes.yaml")
     editor = RouteEditor(args.map_dir, routes, args.lane_length, args.lane_width,
-                         args.margin, args.snap)
+                         args.margin, args.snap, args.zone_inflate)
     print(f"[map] {args.map_dir} | {editor.grid.w}x{editor.grid.h} @ {editor.grid.res} m "
           f"| x[{editor.grid.x0:.2f},{editor.grid.x1:.2f}] "
           f"y[{editor.grid.y0:.2f},{editor.grid.y1:.2f}]")
     print(f"[out] {routes}")
+    print(f"[zones] forbidden zones are inflated by {editor.zone_inflate:.3f} m "
+          f"in the passability check (map_server zones.inflate must match)")
     editor.run()
     return 0
 

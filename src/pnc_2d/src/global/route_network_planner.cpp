@@ -294,6 +294,29 @@ PlanResult RouteNetworkPlanner::planOnGraph(const PlanRequest &req) {
     return std::isfinite(dist[static_cast<std::size_t>(G)]);
   };
 
+  // 诊断用：把"边序号"翻译成"A->B"，不可行通道点名 —— 只报数量对排查没用
+  auto edgeName = [&](int ei) -> std::string {
+    const RouteEdge &e = edges[static_cast<std::size_t>(ei)];
+    return graph_.nodes()[static_cast<std::size_t>(e.from)].name + "->" +
+           graph_.nodes()[static_cast<std::size_t>(e.to)].name;
+  };
+  // 回溯一条 Dijkstra 结果所经过的边序列（只用于诊断）
+  auto collectEdges = [&](const std::vector<int> &pn,
+                          const std::vector<int> &pa) -> std::vector<int> {
+    std::vector<int> seq;
+    int cur = G;
+    while (cur != S) {
+      const int p = pn[static_cast<std::size_t>(cur)];
+      const int k = pa[static_cast<std::size_t>(cur)];
+      if (p < 0 || k < 0)
+        break;
+      seq.push_back(adj[static_cast<std::size_t>(p)][static_cast<std::size_t>(k)].edge);
+      cur = p;
+    }
+    std::reverse(seq.begin(), seq.end());
+    return seq;
+  };
+
   std::vector<int> prev_node, prev_arc;
   bool found = runDijkstra(false, prev_node, prev_arc);
   int attempts = 1;
@@ -304,13 +327,20 @@ PlanResult RouteNetworkPlanner::planOnGraph(const PlanRequest &req) {
     std::vector<int> pn2, pa2;
     if (runDijkstra(true, pn2, pa2)) {
       res.status = PlannerStatus::kNoPath;
-      char buf[256];
-      std::snprintf(buf, sizeof(buf),
-                    "路网内连不通：唯一通路经过 %zu 条车体过不去的通道"
-                    "（可把 route_network.reject_infeasible 设为 false 强行走，"
-                    "或修正通道/地图）",
-                    infeasible_count_);
-      res.message = buf;
+      // 点名：优先列出"唯一通路必须经过的那几条不可行通道"，比只报数量有用得多
+      std::string names;
+      for (const int ei : collectEdges(pn2, pa2)) {
+        if (edges[static_cast<std::size_t>(ei)].feasible)
+          continue;
+        names += (names.empty() ? "" : ", ") + edgeName(ei);
+      }
+      if (names.empty())
+        names = "（无法定位到具体通道）";
+      res.message =
+          "路网内连不通：唯一通路必须经过车体过不去的通道 " + names +
+          "（共 " + std::to_string(infeasible_count_) +
+          " 条不可行；可把 route_network.reject_infeasible 设为 false 强行走，"
+          "或修通道/地图/禁行区膨胀）";
       res.stats.expanded_nodes = expanded;
       res.stats.windows_tried = attempts;
       return res;
@@ -374,6 +404,17 @@ PlanResult RouteNetworkPlanner::planOnGraph(const PlanRequest &req) {
     appendSlice(path, seq_edge[i], seq_s0[i], seq_s1[i]);
     last_route_edges_.push_back(seq_edge[i]);
   }
+  // 成功但路网里有不可行通道：把"绕开了哪几条"写进 message，让上层日志能看到
+  if (infeasible_count_ > 0) {
+    std::string names;
+    for (int ei = 0; ei < static_cast<int>(edges.size()); ++ei) {
+      if (edges[static_cast<std::size_t>(ei)].feasible)
+        continue;
+      names += (names.empty() ? "" : ", ") + edgeName(ei);
+    }
+    note += "（路网里有 " + std::to_string(infeasible_count_) +
+            " 条车体过不去的通道已绕开：" + names + "）";
+  }
   if (path.empty()) { // 起终点几乎重合
     pushUnique(path, ps.valid ? Pose2D{ps.x, ps.y, 0.0, false} : req.start);
     pushUnique(path, Pose2D{pg.x, pg.y, 0.0, false});
@@ -419,12 +460,12 @@ PlanResult RouteNetworkPlanner::planOnGraph(const PlanRequest &req) {
 
   res.status = PlannerStatus::kSuccess;
   {
-    char buf[256];
-    std::snprintf(buf, sizeof(buf), "沿路网 %zu 条通道（goal_mode=%s）%s%s",
-                  last_route_edges_.size(), goal_mode_.c_str(),
-                  infeasible_count_ > 0 ? "；⚠ 路网里有车体过不去的通道" : "",
-                  note.empty() ? "" : note.c_str());
-    res.message = buf;
+    std::string msg = "沿路网 " + std::to_string(last_route_edges_.size()) +
+                      " 条通道（goal_mode=" + goal_mode_ + "）";
+    if (infeasible_count_ > 0)
+      msg += "；⚠ 路网里有车体过不去的通道";
+    msg += note;
+    res.message = msg;
   }
   res.path = std::move(full);
   res.stats.expanded_nodes = expanded;

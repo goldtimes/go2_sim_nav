@@ -4,7 +4,8 @@
 > 范围：**只动 `src/pnc_2d`**。不碰 `nav2d`（那是官方 nav2 栈的位置）、不碰
 > `perception` / `map_server` / `lightning`；`quadropted_controller`（步态/关节）只通过
 > `/pnc_2d/cmd_vel` 交互。
-> 相关文档：`pnc2d_dev_plan.md`（全局规划的算法细节）、`mpc_nmpc_guide.md`（MPC 原理与调参）。
+> 相关文档：`pnc2d_dev_plan.md`（全局规划的算法细节）、`mpc_nmpc_guide.md`（MPC 原理与调参）、
+> **`mpc_local_planner_plan.md`（P5 局部规划 = MPC 的详细方案）**。
 
 ---
 
@@ -22,9 +23,16 @@
 | 8 | 路网贴线严格度（2026-09-21） | **允许偏离**；`corridor_width: 0.0` 表示**严格贴线，遇障即停**（按通道逐条配置） |
 | 9 | 路网画线工具（2026-09-21） | **Python 离线编辑器**（读 map.pgm 当底图 + 鼠标点选 → `routes.yaml`），不依赖 ROS |
 | 10 | 路网目标输入（2026-09-21） | **只给坐标**（`/goal_pose`，自动投影到最近通道）；**站点**作为带语义的节点保留（type: station/charge/park，RViz 命名显示），不做“按站名下发目标”的话题；最后一段默认 **`hybrid`** |
+| 11 | **局部规划算法**（2026-09-22） | **MPC（单套）+ 两套 profile（`route`/`free`）**。profile **数据驱动**：有走廊 ⇒ `route`，无 ⇒ `free`。求解器 **OSQP**（`ros-humble-osqp-vendor` 0.6.2，已装并验证） | 详 `mpc_local_planner_plan.md` §0 |
+| 12 | 走廊严格度（2026-09-22） | **硬约束、不可违反**（方案 A）：路网模式遇障 ⇒ `BLOCKED` 停车；动态避障的自由度只在 `free` 模式 | 用户确认 |
+| 13 | 避障能力（2026-09-22） | **v1 只做反应式**（当前帧距离场）；动态障碍速度/轨迹估计列为未来优化点（先“点云聚类 + CV-KF”） | 接口现在就预留 |
+| 14 | 降级链（2026-09-22） | `MPC 成功 → 用` / `失败或超时 → 停车 + 报错`；**不做 pure_pursuit 兜底** | 停车比“凑合走”可预测 |
+| 15 | 局部状态枚举与钩子（2026-09-22） | `LocalStatus` 用**独立枚举**；保留 `producesCmdVel()` | 用户确认 |
+| 16 | 距离场来源（2026-09-22） | 软代价用 `grid_map/esdf_2d`（点云→栅格化+插值）；**硬碰撞一律用 `grid_map/occupancy_inflate_2d`**（esdf 抽点 0.20 m 且不含障碍本体）；自算 EDT 作兜底/一致性校验 | 详同文档 §3 |
 
-**本期（整改）交付范围**：**P1 目录重排（✅ 已完成）+ P2 路网 + P3 三类抽象齐备 + P4 状态机与三节点空跑**。
-局部规划的**具体算法**（含 C++ MPC，见 §6 P5）与重规划/恢复（P6）是整改之后的独立议题。
+**本期（整改）交付范围**：**P1 目录重排（✅）+ P2 路网（✅）+ P3 三类抽象齐备（✅）+ P4 状态机与三节点空跑（✅）—— 四阶段均已完成**。
+局部规划算法已定案为 **MPC**（决策 11~16），详细方案与验收见 **`mpc_local_planner_plan.md`**；
+恢复行为/重规划（P6）仍是之后的独立议题。
 
 ---
 
@@ -63,48 +71,62 @@
 
 ```text
 src/pnc_2d/
-├── CMakeLists.txt                 # 1 个库(pnc_2d_core) + 3 个可执行 + 测试
+├── CMakeLists.txt                 # 1 个库(pnc_2d_planner) + 3 个可执行 + 测试
 ├── package.xml
+├── msg/                          # ✅ 已落地
+│   ├── PlannerStatus.msg         #   规划状态（失败上报，latched）
+│   ├── LocalStatus.msg           # ★P4 局部状态（latched）
+│   └── ManagerState.msg          # ★P4 状态机状态（latched）
+├── srv/                          # ✅ 已落地
+│   ├── SwitchPlanner.srv         #   运行时热切换算法（全局/局部公用）
+│   └── PlanPath.srv              # ★P4 manager → global
+├── action/                       # ★P4
+│   └── FollowPath.action         #   manager → local（feedback + cancel）
 ├── include/pnc_2d/
 │   ├── core/
 │   │   ├── types.hpp  cost_map_2d.hpp  footprint_collision.hpp  clearance_field.hpp
 │   │   ├── param_reader.hpp
 │   │   ├── route_graph.hpp               # ★P2 路网数据结构（节点/边/属性 + yaml 读写）
+│   │   ├── map_zones.hpp                 # ★P2 区域层（禁行/限速）
+│   │   ├── local_distance_field.hpp      # ★P5 距离场适配（esdf 点云↔栅格 / 自算 EDT 兜底）
 │   │   ├── global_planner.hpp            # 抽象类 A（已有）
-│   │   ├── local_planner.hpp             # 抽象类 B ★P3 新增
-│   │   ├── recovery_behavior.hpp         # 抽象类 C ★P3 新增
-│   │   └── factory.hpp                   # 全局/局部/恢复 三套工厂（合并原 planner_factory）
+│   │   ├── local_planner.hpp             # 抽象类 B ★P3 已交付
+│   │   ├── recovery_behavior.hpp         # 抽象类 C ★P3 已交付
+│   │   └── factory.hpp                   # 全局/局部/恢复 三套工厂 ★P3 已交付（合并原 planner_factory）
 │   ├── global/
 │   │   ├── astar_planner.hpp
 │   │   └── route_network_planner.hpp     # ★P2 图上路由（Dijkstra + 折线拼接）
 │   ├── local/
-│   │   └── null_local_planner.hpp        # ★本期唯一"实现"：不做控制，只回报状态
+│   │   ├── null_local_planner.hpp        # ★P3 唯一“实现”：不做控制，只回报状态（已交付）
+│   │   └── mpc_local_planner.hpp         # ★P5 MPC（差分模型 + OSQP 热启动 + 两套 profile）
 │   ├── recovery/
 │   │   └── recovery_interface_only.md    # 占位说明（接口在 core/）
-│   └── sm/
-│       ├── events.hpp  states.hpp
-│       └── manager_sm.hpp                # 状态 + 转移表（无 ROS，可单测）
+│   ├── sm/
+│   │   ├── events.hpp  states.hpp        # ★P4 已交付（事件集/状态集 + toString）
+│   │   └── manager_sm.hpp                # 状态 + 转移表（无 ROS，可单测）★P4 已交付
 ├── src/
 │   ├── core/  global/  local/  sm/       # 与 include 一一对应
 │   └── nodes/                            # ★ROS 薄壳：只做 IO / 参数 / frame 校验
-│       ├── global_planner_node.cpp       （搬移现有）
-│       ├── local_planner_node.cpp        （新增，本期只跑 Null 实现）
-│       ├── pnc_manager_node.cpp          （新增）
+│       ├── global_planner_node.cpp       （已有，★P4 加 ~/plan_path 服务）
+│       ├── local_planner_node.cpp        （★P4 已交付：action + 到达兜底）
+│       ├── pnc_manager_node.cpp          （★P4 已交付）
 │       └── ros_param_reader.hpp          （从 src/ 挪入）
 ├── config/
-│   ├── pnc_2d.yaml                       # 总入口：planner.type / local.type / sm.* / common.* / footprint.*
-│   ├── global_astar.yaml                 # 全局算法片段（现有 global_planner.yaml 改名）
-│   ├── route_network.yaml                # ★P2 路网参数（routes_file / goal_mode / turn_penalty）
-│   └── local_null.yaml                   # 局部片段（本期只有 none）
+│   ├── pnc_2d.yaml                       # 总入口：话题/common/footprint/clear + 类型默认值 ★P3 已交付
+│   ├── global_astar.yaml                 # 全局算法片段（已由 global_planner.yaml 改名）★P3 已交付
+│   ├── route_network.yaml                # ★P2 路网参数（routes_file / goal_mode / reject_infeasible）
+│   ├── local_null.yaml                   # 局部片段：local.type: none ★P3 已交付
+│   └── local_mpc.yaml                    # ★P5 局部片段：MPC 权重/时域/距离场/超时
 ├── launch/
-│   ├── pnc_2d.launch.py                  # ★一键三节点（P4 后 tmux 用这个）
+│   ├── pnc_2d.launch.py                  # ★P4 已交付：一键三节点（支持 ns / extra_config）
 │   ├── global_planner.launch.py          # 保留：单跑调试 / 兼容现有 tmux 脚本
-│   └── local_planner.launch.py           # 新增
+│   └── local_planner.launch.py           # ★P4 已交付
 ├── test/
 │   ├── test_astar_planner.cpp            （现有，路径调整）
 │   ├── test_route_network.cpp            # ★P2 路网：yaml 解析 / 单双向 / 断网无解 / 最短路
-│   ├── test_factory.cpp                  # 三个工厂 + Null 实现
-│   └── test_state_machine.cpp            # 事件序列 → 状态断言（无 ROS）
+│   ├── test_clearance_field.cpp          # ★P3 EDT 距离场：暴力对拍 / 上下界 / 未知格策略 / 耗时
+│   ├── test_factory.cpp                  # 三个工厂 + Null 实现 ★P3 已交付
+│   └── test_state_machine.cpp            # 事件序列 → 状态断言（无 ROS）★P4 已交付（19 用例）
 ├── scripts/                              # 离线工具/原型（保留，非运行时代码）
 │   └── mpc.py  nmpc.py  traj_utils.py  legacy/   # 算法离线原型
 # 注：路网画线器 route_editor.py 随资产放在 map_server/scripts/（见其 README 操作手册）
@@ -289,13 +311,48 @@ zones:                              # ★区域层（可选）
 
 **尚未做（不阻塞使用）**：站点语义在画线器里已支持（`k` 键切换 waypoint/station/charge/park），但还没做“按站名下发目标”的话题；换图联动（见上）；真实站点的路网需要你在 GUI 里画（我无法操作鼠标）。
 
-### P3 抽象补齐（原 P2）
+### P3 抽象补齐（原 P2）✅ **已完成（2026-09-22）**
 - 内容：`LocalPlanner` / `RecoveryBehavior` 接口；`NullLocalPlanner`；`factory.hpp`（三套工厂）；
   `config/pnc_2d.yaml`（含 `local.type: none`）；`test/test_factory.cpp`。
 - 验收：新单测全绿；`local.type: none` 时全局规划行为与 P1 **完全一致**。
 - 不做：不写任何真实局部算法。
 
-### P4 状态机 + 三节点可空跑（原 P3）
+**P3 实测记录（2026-09-22）**
+
+| 项 | 结果 |
+|---|---|
+| 新增单测 | `test_factory.cpp` **15 用例全绿**（三套工厂 + Null 契约 + 基类多态使用 + `LocalStatus` 全值有名字） |
+| 单测总量 | 5 个可执行文件 / **54 用例**，`colcon test-result` **0 failures**（含 EDT `test_clearance_field` 5 用例） |
+| 新增 E2E | `test_launch_config.py` **17 项全绿**（见下） |
+| E2E 回归 | `run_all.sh` 四组全绿：11+11 / 6 / 14 / 17 项 |
+| 编译 | `-DCMAKE_BUILD_TYPE=Release` 通过，无新增 warning |
+
+**交付的抽象（`include/pnc_2d/core/`）**
+
+| 文件 | 内容 | 关键约定 |
+|---|---|---|
+| `local_planner.hpp` | `Twist2D` / `LocalStats` / `LocalPlanResult` / 抽象类 `LocalPlanner` | **模式由数据决定**：`setCorridor(nullptr)`=free，非空=route（`mode()`）；`producesCmdVel()` 声明"我会不会真的发速度"；`setDistanceField(LocalDistanceField*)` 只前向声明，P5 才实现 |
+| `recovery_behavior.hpp` | `RecoveryContext`（清图/请求重规划/小幅移动/上次规划时长四个 `std::function` 注入）/ `RecoveryResult` / 抽象类 | 行为不直接碰 ROS，单测可用假函数断言"到底被调了什么" |
+| `types.hpp` | 新增 `LocalStatus`（**独立于 `PlannerStatus`**）/ `RouteCorridor` / `DynamicObstacle` | 局部状态与全局失败语义不同，混用会让状态机写不清 |
+| `factory.hpp` | `createPlanner` / `createLocalPlanner` / `createRecoveryBehavior` + 三个 `available*()` | 未知类型**返回 nullptr**，不静默回退；`availableRecoveries()` 本期**故意为空** |
+
+**配置拆分（这次最容易出错的地方，已单独测）**
+
+| 顺序 | 文件 | 内容 |
+|---|---|---|
+| 1 | `config/pnc_2d.yaml` | 总入口：话题/坐标系/`common.*`/`footprint.*`/`clear.*` + 类型默认值 |
+| 2 | `config/local_<局部>.yaml` | 局部片段（现有 `local_null.yaml`） |
+| 3 | `config/global_<算法>.yaml` | 算法片段，**自述 `planner.type`**（`global_planner.yaml` 已 `git mv` → `global_astar.yaml`） |
+| 4 | `extra_config:=<路径>` | 追加片段，优先级最高 |
+| 5 | `planner_type` / `local_type` | launch 参数，最终强制覆盖 |
+
+**开发中踩到并已修/已记的 3 个坑**
+
+1. **局部片段名不能按类型名拼**：`local.type: none` 对应的文件叫 `local_null.yaml`（yaml 写 `none` 更自然，实现类叫 `NullLocalPlanner`），拼字符串会去找 `local_none.yaml` → 已改成显式映射表 `LOCAL_FRAGMENT_BY_TYPE`。
+2. **`install/` 只拷不删**：`install(DIRECTORY config ...)` 不会删掉改名前的 `global_planner.yaml`，残留副本会留在 `share/pnc_2d/config/` 里误导排查 → 已手工清理，并写进 README 的排查提示。
+3. **同名节点连着起停时 DDS 有服务残影**：上一个用例的 `/global_planner` 刚被杀，`wait_for_service` 会立刻成功但异步调用石沉大海，看起来像"节点没起来"（实际日志显示它正常起来了）→ E2E-4 改成**重试 + 每轮重建客户端**，并在用例之间等 3 s。
+
+### P4 状态机 + 三节点可空跑（原 P3）✅ **已完成（2026-09-22）**
 - 内容：`sm/manager_sm`（ROS1 风格显式状态表）；
   `pnc_manager_node`（订阅 odom/map/goal → 调全局 service → 调局部 action → 发布状态）；
   `local_planner_node`（只跑 Null 实现，`/pnc_2d/cmd_vel` 输出恒为 0）；
@@ -308,13 +365,53 @@ zones:                              # ★区域层（可选）
   `Idle→Planning→Following→GoalReached`；**不发任何速度指令**（Null 局部）。
 - 不做：不做恢复行为的具体实现；不做重规划。
 
-### P5（整改之后，另立议题）局部规划算法（**C++**）（原 P4）
-- 候选顺序（待单独评审）：先 `pure_pursuit` 打通链路 → 再 **C++ MPC**（`local/mpc_local_planner`，
-  求解器 `OSQP`/`CasADi`，与 `scripts/mpc.py` 同构：偏差输入前馈 + 每步线性化 + Δu 平滑）。
-- **路网贴线**（P2 对应的控制侧）：横向偏差按 `corridor_width` 约束；
-  `corridor_width > 0` 时允许在走廊内侧移绕障并回线；`= 0.0` 时严格贴线，
-  遇障碍直接报 `BLOCKED` 停车等状态机处理。
-- 验收（届时定）：仿真 A→B 全程无碰撞、到点停车、横向误差 < 10 cm；与 Python 版逐指标对比。
+**P4 实测记录（2026-09-22）**
+
+| 项 | 结果 |
+|---|---|
+| 新增单测 | `test_state_machine.cpp` **19 用例全绿**，其中一条**穷举 6 状态 × 11 事件 = 66 组**，断言"要么有条规则、要么明确拒绝且状态不变" |
+| 单测总量 | 6 个可执行文件 / **73 用例**，`colcon test-result` **0 failures** |
+| 新增 E2E | `test_three_node_smoke.py` **15 项全绿**：起三节点 → 点目标 → `IDLE→PLANNING→FOLLOWING→GOAL_REACHED`；地图外目标 → `FAILED` + 原因；`~/cancel` → `IDLE`；**`/pnc_2d/cmd_vel` 上零发布者** |
+| E2E 回归 | `run_all.sh` 五组全绿：11+11 / 6 / 14 / 17 / 15 项 |
+| 真机栈冒烟 | 根命名空间 `pnc_2d.launch.py planner_type:=route_network`：全局节点收到真实 latched 地图（607×307）+ 路网（10 节点/1 通道），三节点参数全部就位 |
+
+**交付的接口（新增 msg/srv/action）**
+
+| 接口 | 类型 | 用途 | 关键约定 |
+|---|---|---|---|
+| `msg/LocalStatus.msg` | 话题（latched） | 局部状态 + 命令 + 诊断 | `produces_cmd_vel` 一并报出去："cmd=0"到底是"停车"还是"我不管" |
+| `msg/ManagerState.msg` | 话题（latched） | 状态机状态 + 目标 + 路径概况 + 统计 | 监控/"为什么车不动"的第一现场 |
+| `srv/PlanPath.srv` | manager → global | 同步规划 | 响应与 `PlannerStatus` 同构，便于透传；`publish_result` 控制要不要发 latched 话题 |
+| `action/FollowPath.action` | manager → local | 跟路径 | 四选一结束原因 `goal_reached / blocked / failed / canceled`；BLOCKED 要**连续超时**才结束 |
+
+**P4 期间踩到并修掉的 6 个问题（都是"只有跑起来才暴露"的）**
+
+1. **`ns:=` 会让按节点名写的 yaml 段落全部失效**（FQN 变 `/e2e/global_planner`，不再匹配 `global_planner:`，且**无任何报错**）。实测：同一文件根命名空间下生效 4 项参数，加 `ns` 后只剩 `/**` 那 2 项 → 配置段落统一改 `/**`（同文件只能有一个：YAML 顶层重复键互相覆盖）。
+2. **测试里 `pkill -f <节点名>` 会杀掉用户正在跑的节点**（经查 `run_loc_online` 一直在后台发布 `/lightning/perception/pose`）→ 测试改为 `ns` + `extra_config` 隔离，只 `killpg` 自己的 launch。
+3. **两个定位源交替喂位姿 → "跳变"刷屏 → 重规划风暴**（1 秒几百条 WARN）→ 加 `sm.odom_jump_cooldown`（默认 2 s）。
+4. **`NullLocalPlanner` 永远不报"到达"** → action 永不结束、状态机永远停在 FOLLOWING → 到位判定改在**节点层**兜底（`remaining() ≤ local.goal_tolerance`），不依赖算法自报（任何算法忘了报，任务都会永远不结束）。
+5. **`ServerGoalHandle::canceled()` 只在 `is_canceling()` 时合法**（否则抛 `UnawareGoalHandleError`）→ 服务端强制停止（`~/stop`、被新目标顶掉）只能走 `abort()`，但 `result.canceled=true` 标清"不是失败"；manager 判结果时**先看语义标志再看 action code**。
+6. **`local.type` 原本写在 `global_planner:` 段下**（P3 遗留）→ 三节点拆分时移到局部段；用 `/**` 之后这类"放错段落静默失效"从根上不可能了。
+
+**已知缺口（显式留给 P5）**
+
+- **走廊没有端到端打通**：`PlanPath.srv` 的响应里还没有 `corridor_width[]` / `strict` 字段，manager 因此一律按自由空间模式下发 `FollowPath`。路径本身仍是路网算出来的（沿通道），缺的只是 MPC 用的"贴线"硬约束。P5 要加：`PlanResult` 加走廊信息 → `PlanPath.srv` 响应透出 → manager 填进 action goal。
+- `local_mpc.*` 算法参数、距离场栅格化、`local.type` 热切换实测，都属于 P5。
+
+### P5 局部规划算法 = **MPC**（2026-09-22 定案；详细方案见 `mpc_local_planner_plan.md`）
+
+> **参考实现（2026-09-22 修订）**：以 **`/home/gmd/SLAM-PNC/PNC` 的 `MpcController`** 为准
+> （阿克曼 + `(a,δ)` + 稀疏 OSQP），按差速底盘映射成 `(a,ω)`；
+> 本仓库 `scripts/mpc.py` **不再作参考**（仅保留原型）。
+> **P5.0 工具链 ✅ / P5.1 库层 + 单测 ✅（2026-09-22，实测见 `mpc_local_planner_plan.md` §5.1）**，
+> P5.3 节点接线 / P5.4 仿真 E2E 待做。
+
+- **算法**：单套 **MPC**（差分驱动、`N=15 @ dt=0.1 s`、控制 `[v, ω]`），求解器 **OSQP**（已装 0.6.2 + 热启动）。
+- **两套 profile，数据驱动切换**：`setCorridor()` 非空 ⇒ `route`（走廊横向偏差**硬约束**，`corridor_width=0` 即严格贴线，遇障 `BLOCKED` 停车）；否则 `free`（跟踪全局路径 + 距离场软代价避障）。
+- **距离场**：软代价用 `grid_map/esdf_2d`（点云 → 栅格化 + 双线性插值）；**硬碰撞判定一律用 `grid_map/occupancy_inflate_2d`**（esdf 抽点 0.20 m 且不含障碍本体）；自算 EDT（复用 `core/clearance_field.hpp`）作兜底/一致性校验。
+- **降级**：`MPC 成功 → 用`；`失败/超时 → 停车 + 报错`；**不做 pure_pursuit 兜底**。
+- **分步**：P5.1 库层 + 单测（走廊越界 1000 组 = 0 次、P99 < 20 ms）→ P5.2 与 `scripts/mpc.py` 逐指标对比（≤5%）→ P5.3 节点接线 + `local.type` 热切换 → P5.4 仿真 E2E（A→B 无碰撞、到点停车 ≤0.15 m、横向误差 < 10 cm、路网贴线 < 5 cm）。
+- **不做**：动态障碍速度/轨迹估计（v1 反应式，接口先预留）、pure_pursuit 兜底、MINCO/SFC。
 - 备注：`scripts/mpc.py` / `nmpc.py` 继续作**离线基准**，用于验证 C++ 实现数值一致。
 
 ### P6（可选）重规划管理器 / 恢复行为 / pluginlib（原 P5）

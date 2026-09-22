@@ -34,6 +34,9 @@ echo "================ E2E-1b 路径有效期（打开 clear.auto_on_goal_reache
 EXPECT_AUTOCLEAR=1 python3 "$HERE/test_clear_semantics.py" || rc=1
 run "E2E-2 换算法重启后的清场" "$HERE/test_restart_cleanup.py"
 run "E2E-3 运行时热切换 / 热重载" "$HERE/test_hot_switch.py"
+run "E2E-4 launch + yaml 合并（配置拆分回归）" "$HERE/test_launch_config.py"
+run "E2E-5 三节点空跑（状态机 Idle→Planning→Following→GoalReached，不发 cmd_vel）" "$HERE/test_three_node_smoke.py"
+run "E2E-6 MPC 接线（局部图/ESDF 订阅 → 降级/恢复 → 闭环真的动起来）" "$HERE/test_mpc_wiring.py"
 
 echo
 if [[ $rc -eq 0 ]]; then

@@ -1,0 +1,59 @@
+# 跟随路径（manager → local_planner_node，action）
+#
+# 为什么用 action 而不是 service：跟路径是**长时任务**，状态机需要
+#   · 周期反馈（进度/横向偏差/是否被挡住）→ 决定要不要重规划；
+#   · 取消（新目标来了 / 任务取消）→ 立刻停车。
+#   service 做不到这两件事（只能"等它跑完"）。
+#
+# 阻塞语义（重要，P4 定案）：
+#   · 局部报 BLOCKED 时**不立刻结束** action，先停车并开始计时；
+#     连续 blocked_abort_cycles 个控制周期仍 BLOCKED 才以 result.blocked=true 结束，
+#     把"要不要恢复/重规划"的决定权交回状态机（决策 12/14：不擅自绕障）。
+#   · 因此状态机看到的 result 有四种：goal_reached / blocked / failed / canceled。
+
+std_msgs/Header header
+
+# 要跟随的路径（世界系；每点带朝向）
+nav_msgs/Path path
+
+# 走廊约束（route 模式）。corridor_width <= 0 表示**没有走廊** ⇒ 自由空间模式；
+# 有走廊时各点作为中心线，允许横向偏离 ±corridor_width。
+# 用同一个数组长度表达"每个点的半宽"，是为了将来支持"逐段变宽"而不改接口；
+# 现在通常全填同一个值（来自 routes.yaml 的 corridor_width）。
+float64[] corridor_width
+
+float64 speed_limit        # 限速 [m/s]，<=0 表示不限（用算法上限 / 限速区）
+bool strict_corridor       # true = 严格贴线，遇障即停（BLOCKED）
+                           # false = 允许在走廊内避障
+---
+# 结束原因：四选一，状态机按它决定下一步
+bool goal_reached          # 正常到达
+bool blocked               # 连续 BLOCKED 超时（走廊被占 / 绕不过去）
+bool failed                # 求解失败/内部错误/缺必要输入
+bool canceled              # 被调用方取消（cancel 不算失败）
+
+uint8 status               # 结束时的 LocalStatus（core/types.hpp）
+string status_name
+string message             # 人类可读原因（失败/被挡时必须说明）
+
+# 统计
+float64 elapsed_s          # 从接受目标到结束的时长 [s]
+float64 traveled_m         # 实际走过的路程 [m]
+float64 final_cross_track_m# 结束时的横向偏差 [m]
+float64 progress           # 结束时路径进度 0~1
+---
+# ---------------- 周期反馈 ----------------
+std_msgs/Header header
+
+uint8 status               # 当前 LocalStatus
+string status_name
+string message             # 状态变化时的说明（不必每周期都有）
+
+float64 progress           # 路径进度 0~1
+float64 cross_track_m      # 横向偏差 [m]
+float64 remaining_m        # 剩余路程 [m]
+float64 cmd_v
+float64 cmd_w
+bool blocked               # 本周期是否处于"被挡住"状态（尚未超时结束时也报）
+float64 blocked_for_s      # 已连续被挡多久 [s]
+float64 solve_time_ms

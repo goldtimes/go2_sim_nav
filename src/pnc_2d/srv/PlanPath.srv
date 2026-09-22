@@ -1,0 +1,45 @@
+# 全局规划请求（manager → global_planner_node，同步 service）
+#
+# 为什么用 service 而不是话题：状态机的"规划"是一个**一次性、短时**动作
+#   （实测 6~33 ms），同步返回最直观 —— 状态机在一个回调里就能拿到
+#   "成/败 + 路径 + 原因"，不必自己维护"这条路径对应哪次请求"的配对状态。
+#
+# 与 /goal_pose 话题的关系：
+#   · 话题触发 = 有人（RViz/脚本）直接给目标 → 节点自己规划并发布（保留，方便调试）；
+#   · service = 状态机主导的规划（P4 起为主线），**不依赖** /goal_pose。
+#   两者共用同一段规划逻辑，因此行为完全一致。
+
+std_msgs/Header header
+
+geometry_msgs/PoseStamped start      # 起点（通常就是当前位姿；留空 x/y=0 亦可，节点会用当前位姿）
+geometry_msgs/PoseStamped goal       # 目标（PoseStamped：位置 + 朝向）
+bool use_current_pose                # true = 忽略 start 的位置，直接用最近一次定位位姿
+                                     #   （定位比状态机缓存的新；默认应传 true）
+bool publish_result                  # true = 同时把路径/标记/状态发到话题（RViz 可见）
+                                     #   false = 只回给调用方（"想先看看再走"时用）
+---
+# 下面三个字段与 msg/PlannerStatus.msg 同构，便于调用方直接透传/记录
+uint8 status            # core/types.hpp 的 PlannerStatus（0 = SUCCESS）
+string status_name
+string message
+
+bool success            # 等价于 status == 0
+
+nav_msgs/Path path      # 规划结果（失败时为空 Path）
+
+float64 plan_time_ms
+int32 expanded_nodes
+int32 windows_tried
+
+# ---- 走廊（P5.3：route 模式"贴线走"的硬约束）----
+# 语义：**path 本身就是走廊中心线**，允许横向偏离 ±corridor_half_width。
+# has_corridor=false ⇒ 自由空间跟踪（局部只需跟踪，不必贴线）。
+# ★ 为什么由全局规划给出：只有路网规划器知道"这段路有多宽"（通道属性
+#   corridor_width / speed_limit）。局部规划器拿到路径时已经无从判断该贴线
+#   还是该自由绕障，所以必须在这里透传，否则 route 模式永远是自由空间模式
+#   （踩过：manager 里一直 clear() 走廊字段，走廊约束从来没生效过）。
+bool has_corridor
+float64 corridor_half_width       # [m]；0 = 严格贴线（遇障只能停）
+float64 corridor_speed_limit      # [m/s]；0 = 不限
+bool strict_corridor              # = has_corridor 且 half_width <= 0
+int32[] route_edges               # 用到的通道下标（诊断/可视化）

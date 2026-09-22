@@ -467,6 +467,26 @@ PlanResult RouteNetworkPlanner::planOnGraph(const PlanRequest &req) {
     msg += note;
     res.message = msg;
   }
+  // 走廊摘要：只统计**真正走到**的通道（last_route_edges_）。取最严的一条：
+  // 半宽取最小、限速取最小（0 = 不限，不参与取最小，否则"不限"会被误当成 0 限速）。
+  if (!last_route_edges_.empty()) {
+    double hw = std::numeric_limits<double>::infinity();
+    double sl = std::numeric_limits<double>::infinity();
+    for (const int ei : last_route_edges_) {
+      if (ei < 0 || ei >= static_cast<int>(edges.size()))
+        continue;
+      const RouteEdge &e = edges[static_cast<std::size_t>(ei)];
+      hw = std::min(hw, std::max(0.0, e.corridor_width));
+      if (e.speed_limit > 0.0)
+        sl = std::min(sl, e.speed_limit);
+    }
+    res.has_corridor = std::isfinite(hw);
+    if (res.has_corridor)
+      res.corridor_half_width = hw;
+    if (std::isfinite(sl))
+      res.corridor_speed_limit = sl;
+    res.route_edges = last_route_edges_;
+  }
   res.path = std::move(full);
   res.stats.expanded_nodes = expanded;
   res.stats.windows_tried = attempts;

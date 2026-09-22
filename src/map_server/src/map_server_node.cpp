@@ -23,6 +23,7 @@
 #include <nav2_msgs/srv/load_map.hpp>
 #include <nav_msgs/msg/map_meta_data.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -85,6 +86,25 @@ public:
     burn_zones_ = declare_parameter<bool>("zones.burn_into_map", true);
     zone_inflate_ =
         declare_parameter<double>("zones.inflate", -1.0); // <0 = 自动
+    // 参数改动立即写回成员。
+    // ★ 为什么必须有：`declare_parameter` 只在启动时读一次，成员变量不会跟着
+    //   `ros2 param set` 变。踩过：运行时设 zones.inflate=0 再调 LoadMap 重载，
+    //   **烧入还是按启动时的 0.472 算的**，而 `ros2 param get` 显示 0.0 ——
+    //   "改了没反应"，极难排查。
+    //   ⚠ 重载（LoadMap）会从磁盘重读未烧入的原图并重新 applyZones，所以
+    //     "设参数 + 调 LoadMap" 是一个可用的小闭环；不重载则只影响下次加载。
+    param_cb_ = add_on_set_parameters_callback(
+        [this](const std::vector<rclcpp::Parameter> &ps) {
+          rcl_interfaces::msg::SetParametersResult r;
+          r.successful = true;
+          for (const auto &p : ps) {
+            if (p.get_name() == "zones.inflate")
+              zone_inflate_ = p.as_double();
+            else if (p.get_name() == "zones.burn_into_map")
+              burn_zones_ = p.as_bool();
+          }
+          return r;
+        });
     // 车体轮廓与代价语义（与 pnc_2d 同名，便于对齐；仅用于路网可行性校验）
     fp_.enable = declare_parameter<bool>("footprint.enable", true);
     fp_.length = declare_parameter<double>("footprint.length", 0.70);
@@ -842,6 +862,7 @@ private:
   // 区域层（禁行 / 限速）
   pnc_2d::ZoneSet zones_;
   bool burn_zones_{true};
+  OnSetParametersCallbackHandle::SharedPtr param_cb_;
   double zone_inflate_{-1.0};
   double zone_inflate_used_{0.0};
   std::size_t burned_cells_{0};

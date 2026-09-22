@@ -34,9 +34,136 @@ ros2 launch pnc_2d global_planner.launch.py
 # 2) 沿路网走
 ros2 launch pnc_2d global_planner.launch.py planner_type:=route_network
 
-# 3) 单测（不需要 ROS 环境）
+# 3) ★ 三节点一键起（P4 起的推荐入口：manager + global + local）
+ros2 launch pnc_2d pnc_2d.launch.py
+ros2 launch pnc_2d pnc_2d.launch.py planner_type:=route_network
+```
+
+```bash
+# 4) 单测（不需要 ROS 环境）
 colcon test --packages-select pnc_2d --event-handlers console_direct+
 ```
+
+**节点拓扑（P4）**
+
+```mermaid
+graph LR
+  G["/goal_pose"] --> M["pnc_manager<br/>状态机"]
+  M -->|"service PlanPath"| P["global_planner<br/>A* / 路网"]
+  P -->|"nav_msgs/Path"| M
+  M -->|"action FollowPath"| L["local_planner<br/>P4 = Null"]
+  L -.->|"/pnc_2d/cmd_vel（P5 才有）"| C["quadropted_controller"]
+  M -->|"latched"| S["/pnc_2d/state"]
+  L -->|"latched"| LS["/pnc_2d/local_status"]
+```
+
+| 节点 | 职责 | 不做什么 |
+|---|---|---|
+| `pnc_manager_node` | 任务状态机（`Idle→Planning→Following→GoalReached`，异常 → `Recovering`/`Failed`）；订 `/goal_pose`，调全局 service、调局部 action | **不发 cmd_vel**（不控车），不做几何计算 |
+| `global_planner_node` | 几何规划（A* / 路网）；对外提供 `~/plan_path` service | 不跟路径、不管任务生命周期 |
+| `local_planner_node` | 跟踪路径 → 出速度；`/pnc_2d/cmd_vel` 的**唯一 owner** | P4 只有空实现，**不发任何速度** |
+
+⚠ **`/goal_pose` 由 manager 独占**：三节点 launch 会把全局节点的话题入口重映射到
+`/pnc_2d/manual_goal`（调试时仍可用 `ros2 topic pub` 直接指挥全局节点）。否则点一次目标会**规划两次**
+（一次直接发路径、一次经状态机），出现"路径被清掉又冒出来"这种难查的现象。
+
+**状态机（`sm/`，纯库 + ROS 薄壳）**
+
+状态转移表全在 `src/sm/manager_sm.cpp` 的一张表里，单测**穷举 6 状态 × 11 事件 = 66 组**
+（每条要么有条规则、要么明确拒绝并给原因——静默忽略事件是状态机最难查的问题）。
+
+| 关键语义 | 说明 |
+|---|---|
+| `Following --Blocked/Stuck--> Recovering` | 入口先**停车**，再跑恢复行为 |
+| 恢复次数上限 `sm.max_recoveries`（默认 2） | **恢复成功也不清零**——这就是"挡住→恢复→再挡→再恢复…"无限循环的防线 |
+| `Recovering --RecoveryFail-->` | 未超限则再试一次，超限 → `Failed` |
+| `Following --OdomJump--> Planning` | 定位跳变 ⇒ 基于旧位姿的路径不可信 ⇒ 重规划 |
+| `Following --GoalReceived--> Planning` | 新目标打断旧任务（并复位恢复计数） |
+| 卡住判据 | 用**自车位移**判（不依赖局部反馈）：`stuck_timeout`（默认 10 s）内位移 < `stuck_min_progress`（0.20 m）→ `Stuck` |
+| 跳变冷却 `sm.odom_jump_cooldown`（2 s） | 跳变可能**连续**发生（两条定位源同时喂、重定位恢复期）→ 没冷却就是重规划风暴（实测踩过） |
+| `Cancel` | 从**任何**状态都能回 `Idle` |
+
+```bash
+ros2 topic echo /pnc_2d/state                 # 状态机状态（latched）
+ros2 service call /pnc_manager/cancel std_srvs/srv/Trigger
+ros2 service call /local_planner/stop std_srvs/srv/Trigger
+```
+
+**P4 的局部规划 = 空实现（重要）**
+
+`local.type: none` 时 `NullLocalPlanner::producesCmdVel() == false`：
+节点**连 cmd_vel 发布者都不创建**（否则 `ros2 topic info` 会看到一个恒零的发布端，
+而恒零会被下游误读成"停车指令"而**不是**"我不管"）。所以 `local_type:=none` 起栈后
+**不要期待车会动**。
+
+**MPC（P5.1 库层 + P5.3 节点接线已完成，可用）**
+
+```bash
+./build/pnc_2d/test_mpc_local_planner    # 15 用例：跟踪/走廊/避障/耗时
+./build/pnc_2d/test_mpc_qp_reference     #  8 用例：QP 矩阵/KKT 一致性
+```
+
+| 指标 | 实测（Go2 参数） |
+|---|---|
+| 直线跟踪 | 稳态 RMSE **0.0002 m**（含 0.30 m 初始偏差的全局 RMSE 0.0484 m） |
+| 圆弧跟踪 | 径向偏差 RMSE **0.0099 m**（R=3 m） |
+| **走廊硬约束** | 1000 组扰动：**出解 1000 / 越界 0**，预测横向最大 0.337 m（限 0.50） |
+| 求解耗时 | **P50 0.13 ms / P99 2.1 ms**（94 变量 / 182 约束 / 25 次迭代） |
+| 障碍 | 软代价方向正确；硬下界 0.25 m 实测最小 0.2490 m |
+| 端到端 | 空场巡航 max\|v\|=1.0 m/s、闭环前进正常；墙横在路上 → `BLOCKED` |
+
+算法结构参考 **`SLAM-PNC/PNC` 的 `MpcController`**（阿克曼 `(a,δ)` → 差速 `(a,ω)`），
+新增走廊硬约束与 ESDF 避障。
+
+```bash
+ros2 launch pnc_2d pnc_2d.launch.py planner_type:=route_network local_type:=mpc
+```
+
+接线要点（详见 `doc/mpc_local_planner_plan.md` §5.3）：
+
+- 局部节点订阅 `grid_map/occupancy_inflate_2d`（硬判定）与 `grid_map/esdf_2d`
+  （避障软代价）。**感知的 ESDF 只在有订阅者时才计算**，所以这两个订阅就是"让感知
+  开算"的开关。
+- 点云按**字段名**解析（不能硬编码偏移：PCL 的 `PointXYZI` 实测 `intensity` 在
+  偏移 **16**、`point_step=32**）。
+- **空点云 = 这一片很开阔**（感知只发 `0<d≤3 m` 的格），不是"拿不到距离场"；
+  当成后者会让车在空旷处以 0.3 m/s 爬行。
+- 距离场 `local.esdf_timeout`（0.3 s）过期 → 降级限速，**不用过期场做硬约束**。
+- route 模式下全局规划把走廊宽度通过 `PlanPath.srv` → `FollowPath.action` 透传给
+  局部（**path 即中心线**，允许横向偏离 ±半宽）；没接通时"贴线走"会静默失效。
+
+
+**参数与片段（`config/` + `launch/`）**
+
+launch 会把**三份 yaml 按顺序合并**，**后面的覆盖前面的**：
+
+| 顺序 | 文件 | 内容 |
+|---|---|---|
+| 1 | `config/pnc_2d.yaml` | **总入口**：三个节点的公共参数——话题名、坐标系、代价语义（`common.*`）、车体轮廓（`footprint.*`）、路径有效期（`clear.*`）、局部控制参数（`local.*`）、状态机参数（`sm.*`），以及各类型的**默认值** |
+| 2 | `config/global_<算法>.yaml` | **全局算法片段**：自述 `planner.type` + 该算法私有参数（`astar` → `global_astar.yaml`，`route_network` → `route_network.yaml`） |
+| 3 | `config/local_<局部>.yaml` | **局部算法片段**：自述 `local.type`（`local_null.yaml` / `local_mpc.yaml`） |
+| 4 | `extra_config:=<路径>` | 追加的自定义片段，优先级最高 |
+| 5 | `planner_type` / `local_type` | launch 参数，最终强制覆盖类型 |
+
+```bash
+ros2 launch pnc_2d pnc_2d.launch.py planner_type:=route_network
+ros2 launch pnc_2d pnc_2d.launch.py ns:=/e2e extra_config:=/tmp/isolate.yaml
+```
+
+**三条硬规则（都实测过，踩过坑）**
+
+1. **段落必须写 `/**:`，不能写节点名**。节点 FQN 带命名空间时（`ns:=/e2e` → `/e2e/global_planner`），
+   按节点名写的段落**完全不匹配**，整份文件的参数**静默失效**（只有 `/**` 或 `/e2e/global_planner` 才匹配）。
+   实测：同一文件在根命名空间下生效 4 项，加 `ns` 后只剩 `/**` 那 2 项。
+   ⚠ 一个文件里只能有**一个** `/**` 段：YAML 顶层重复键会互相覆盖（只留最后一个）。
+2. **外部的绝对、自己的相对**。别人的话题（`/global_map/occupancy`、`/lightning/perception/pose`、
+   `/goal_pose`）写绝对名；本包自己的（`pnc_2d/state`、`pnc_2d/cmd_vel`、IPC 服务名）写**相对**名。
+   根命名空间下两者完全等价，但加上 `ns` 就能整套搬走——仿真/实车双栈共存、E2E 隔离都靠它。
+3. **`install/` 只拷不删**：重命名/删除 `config/` 下的文件后，`install/pnc_2d/share/pnc_2d/config/`
+   里的旧副本会留下来误导排查——先看一眼那里。
+
+改错类型不会静默生效：`planner_type:=xxx` 找不到对应片段时 launch **直接报错并列出可用片段**。
+⚠ 新增算法时要**同时**加 `config/global_<类型>.yaml` 并在 launch 的映射表里登记（局部同理）。
 
 前置输入（本节点不做 TF 变换，三者必须已在同一坐标系）：
 
@@ -213,11 +340,22 @@ colcon test-result --test-result-base build/pnc_2d     # 期望 0 failures
 ./build/pnc_2d/test_astar_planner                      # A*：15 用例
 ./build/pnc_2d/test_route_network                      # 路网：13 用例
 ./build/pnc_2d/test_map_zones                          # 区域层：6 用例
+./build/pnc_2d/test_clearance_field                    # 距离场(EDT)：5 用例
+./build/pnc_2d/test_distance_field                     # 局部 ESDF：7 用例
+./build/pnc_2d/test_mpc_local_planner                  # MPC：21 用例（含 1000 组走廊验收）
+./build/pnc_2d/test_mpc_qp_reference                   # QP 参考/KKT：8 用例
+./build/pnc_2d/test_factory                            # 工厂/局部接口：15 用例
+./build/pnc_2d/test_state_machine                      # 状态机：19 用例（穷举 66 组状态×事件）
 ```
+
+合计 **109 个 gtest 用例**（9 个可执行文件）；`colcon test-result` 汇总为
+**118 tests, 0 errors, 0 failures**（109 个用例 + 9 个程序级记录）。
 
 **② 端到端测试（ROS 图级别，`test/e2e/`）**
 
-覆盖单测碰不到的东西：latched 话题的路径有效期、清场时机、换算法重启、运行时热切换。
+覆盖单测碰不到的东西：latched 话题的路径有效期、清场时机、换算法重启、运行时热切换、
+**launch 与多份 yaml 的合并顺序**、**三节点状态机全链路**、**感知输入到 cmd_vel 的接线**
+（其它脚本用 `-p` 传参，绕过了配置文件，所以 4/5/6 三项必须单独测）。
 
 ```bash
 colcon build --packages-select pnc_2d
@@ -229,9 +367,41 @@ bash src/pnc_2d/test/e2e/run_all.sh
 | `test_clear_semantics.py` | 失败清空 / 成功发布 / 到达目标（按参数）/ `~/clear_path` | 11 + 11 项 |
 | `test_restart_cleanup.py` | 换算法重启后旧路径与通路高亮被清掉 | 6 项 |
 | `test_hot_switch.py` | `param set planner.type` 热切换 / 非法被拒 / `~/switch_planner` / `~/reload_params` | 14 项 |
+| `test_launch_config.py` | **launch + yaml 合并**：片段路由、公共参数落地、`extra_config` 覆盖顺序、类型写错要报错、相对名解析正确 | 17 项 |
+| `test_three_node_smoke.py` | **三节点空跑（P4 验收）**：`Idle→Planning→Following→GoalReached` 全链路、不可达 → `FAILED`、`~/cancel`，以及**绝不能有 cmd_vel 发布者** | 15 项 |
+| `test_mpc_wiring.py` | **MPC 接线（P5.3 验收）**：降级→恢复、空点云≠缺距离场、真发 cmd_vel、闭环前进、墙真的进规划器、`route` 走廊一路传到局部、`none` 反例 | 22 项 |
 
 要点：**不需要 map_server**（脚本自带地图，语义一致）、话题全部重映射到 `/t/*`（不干扰运行中的系统）、
-节点日志在 `/tmp/pnc2d_e2e_<pid>.log`。细节与两个坑见 `test/e2e/README.md`。
+节点日志在 `/tmp/pnc2d_e2e_<pid>.log`。细节与踩过的坑见 `test/e2e/README.md`。
+
+**③ 仿真闭环验收（`test/sim/`，P5.4）**
+
+在**已经跑着的仿真栈**上跑（gazebo + lightning 定位 + perception + map_server 都由你自己起），
+脚本只起 pnc_2d 三节点、选目标、进程内高频采样、算指标：
+
+```bash
+export CYCLONEDDS_URI=$PWD/src/bringup/cyclonedds.xml ROS_DOMAIN_ID=30 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+source install/setup.bash
+python3 src/pnc_2d/test/sim/test_drive_goal.py      # 自由空间（astar + mpc）
+python3 src/pnc_2d/test/sim/test_route_lane.py      # 严格贴线（route_network + mpc）
+```
+
+| 脚本 | 覆盖 | 实测 |
+|---|---|---|
+| `test_drive_goal.py` | 到点误差、末速、横向误差（全程/稳态）、无碰撞、指令不越界、**被控对象保真度** | 6/6：到点 **0.017~0.043 m**、末速 0.012~0.013 m/s、横向 0.016~0.026（稳态）/0.051~0.058（全程）m、保真度 0.93~0.96 |
+| `test_route_lane.py` | 严格贴线（自带 `corridor_width=0` 临时通道）、`route_mode`、到点、无碰撞 | 7/7：贴线 **0.048（全程）/0.025（稳态）m**、到点 0.017 m |
+
+指标一律用**高频位姿轨迹**自己算（不用 `local_status`、更不用 `twist`：低速噪声大、均值偏低），
+并用**独立重算的几何量**与控制器自报的 `cross_track` 对照。两点要知道：
+
+- **到点误差只有在 `local.goal_tolerance` 严格小于验收阈值时才可信**（`go2_run.yaml` 里
+  设 0.08 < 验收 0.15）；容差也设 0.15 时量到的就是管理器自己的停机条件（同义反复）。
+- 局部节点每 1 Hz 打一行 MPC 内部量（`v_ref/v_now/e_v0/curv/e_yaw0/lat0/走廊行/障碍行/`
+  最小距/求解状态`）—— 出问题先看这行，比加 printf 快。字段含义见 `test/sim/README.md`。
+
+细节（参数陷阱、指标踩坑、诊断三步骤）见 `test/sim/README.md`；
+仿真里定位到的 5 个真问题（含“硬状态约束没考虑可达集”“参考切线在 mm 基线上算成噪声”）
+见 `doc/mpc_local_planner_plan.md` §5.4。
 
 ---
 
@@ -240,3 +410,10 @@ bash src/pnc_2d/test/e2e/run_all.sh
 - **不碰** `nav2d`（官方 nav2 栈，与本包互不依赖）、`perception`、`lightning`、`map_server`（本包只订阅它的话题）。
 - `quadropted_controller`（步态/关节）是下游消费者，将在 P5 通过 `/pnc_2d/cmd_vel` 对接。
 - 路网文件与区域层由 `map_server` 加载/校验/发布；本包只消费。
+- **局部规划**：接口层（`LocalPlanner` / `RecoveryBehavior` / 三套工厂）、`NullLocalPlanner`
+  与 **MPC（`local_type:=mpc`，已接线可用）** 就位。`none` 声明 `producesCmdVel() == false`，
+  **不产生任何 `cmd_vel`**（起栈后不要期待车会动）；`mpc` 会真的发速度。
+  恢复行为（清图/后退/重规划）在 P6。
+- **恢复行为（P4 现状）**：`availableRecoveries()` 是**空的**。被挡/卡住会进 `Recovering` 并
+  如实报告“没有可用行为”→“失败”，但会顺手清掉局部跟随与全局旧路径。
+  这是刻意的：P6 之前不做恢复。

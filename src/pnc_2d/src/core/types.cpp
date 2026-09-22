@@ -26,6 +26,19 @@ const char * toString(PlannerStatus s)
   return "UNKNOWN";
 }
 
+const char * toString(LocalStatus s)
+{
+  switch (s) {
+    case LocalStatus::kIdle: return "IDLE";
+    case LocalStatus::kFollowing: return "FOLLOWING";
+    case LocalStatus::kGoalReached: return "GOAL_REACHED";
+    case LocalStatus::kBlocked: return "BLOCKED";
+    case LocalStatus::kDegraded: return "DEGRADED";
+    case LocalStatus::kFailed: return "FAILED";
+  }
+  return "UNKNOWN";
+}
+
 CostModel::Kind CostModel::classify(int8_t raw) const
 {
   if (raw < 0) return unknown_as_occupied ? Kind::kHard : Kind::kFree;

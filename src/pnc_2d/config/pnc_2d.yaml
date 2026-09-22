@@ -1,0 +1,162 @@
+#######################################################################
+# 总入口参数（pnc_2d）—— 三节点共用一份文件，各自只看自己那一段
+#
+# 用法（launch 会自动合并多份 yaml，**后加载的覆盖先加载的**）：
+#   pnc_2d.launch.py                                  → 三节点一键起（推荐）
+#   global_planner.launch.py                          → 只起全局（调试用）
+#   global_planner.launch.py planner_type:=route_network
+#   local_planner.launch.py   local_type:=none         → 只起局部
+#
+# 分工约定（重要，别把参数放错地方）：
+#   · 本文件 = **跨模式/跨节点共用**：话题名、坐标系、代价语义、车体轮廓、
+#     路径有效期、状态机心跳周期…；这里写的 planner.type / local.type 只是
+#     "默认值"，会被片段覆盖；
+#   · config/<算法名>.yaml = **算法私有参数**，并**自述自己的类型**
+#     （planner.type: "astar" / local.type: "none"），单独看就知道它给谁用；
+#   · 节点**自己**的参数用 `节点前缀.*`：全局 `planner.*`、局部 `local.*`、
+#     状态机 `sm.*`；**算法**的参数用算法前缀（`astar.*` / `route_network.*` /
+#     将来的 `local_mpc.*`）—— 两类不要混；
+#   · 节点允许未声明参数（allow_undeclared_parameters）+ 自动声明覆盖项，
+#     所以片段里加新键不用改代码。
+#
+# 【段落为什么写 `/**` 而不是节点名】两个原因，都实测过：
+#   ① **namespace 无关**：段名写成节点名时，`ns:=/e2e` 会让**整个文件的参数失效**
+#      —— 节点 FQN 变成 /e2e/global_planner，不再匹配 `global_planner:` 这个键，
+#      而且不会有任何报错（只有 `/**` 或 `/e2e/global_planner` 才匹配）。
+#      验证：同一文件在根命名空间下生效 4 项参数，加 ns 后只剩 `/**` 的那 2 项。
+#   ② 三个节点的参数前缀本来就是错开的（planner./common./footprint. vs local.* vs
+#      sm.*），共用一个段落不会打架；而且再也不可能出现"把 local.type 写到
+#      global_planner 段下、静默不生效"这种坑（P3 真实踩过）。
+#   ⚠ 一个文件里只能有**一个** `/**` 段：YAML 顶层重复键会互相覆盖（只留最后一个），
+#     所以三组参数写在同一个段落里，用注释分组。
+#   代价：`ros2 param dump` 会多出其它节点的键（不影响行为）。
+#######################################################################
+/**:
+  ros__parameters:
+    use_sim_time: false
+
+    # ---------------- 算法选择（默认值，会被 fragment 覆盖）----------------
+    planner.type: "astar"
+    planner.frame_id: "map"
+
+    # ---------------- 接口话题 ----------------
+    # 【命名规则】外部的（别人的包发的）写**绝对**名；自家的（本包发/收的）
+    #   写**相对**名。在根命名空间下两者完全等价（相对名会拼上节点命名空间），
+    #   但加上 namespace 就能整套搬走 —— 仿真/实车双栈共存、E2E 隔离都靠它。
+    #   E2E 测试就是这么做的：ns:=/e2e + extra_config 把外部 IO 指到 /t/*。
+    topics.map: "/global_map/occupancy"          # 外部：map_server 发布（latched）
+    topics.odom: "/lightning/perception/pose"    # 外部：定位（Odometry, map -> lidar_link）
+    topics.goal: "/goal_pose"                    # 外部：RViz "2D Goal Pose"（三节点模式下由 manager 独占）
+    topics.path: "pnc_2d/global_path"            # 自家：输出几何路径
+    topics.markers: "pnc_2d/plan_markers"        # 自家：起终点箭头 + 起点处车体轮廓
+    topics.status: "pnc_2d/global_status"        # 自家：规划状态（latched，失败上报用）
+
+    # ---------------- 路径有效期 ----------------
+    # 失败时总是自动清空（发空 Path），避免上层拿到过期路径；
+    # 到达目标是否清空默认 **false**："任务是否结束"由状态机（P4）判断，
+    # 规划器不替它决定。需要这个便利行为就打开。
+    clear.auto_on_goal_reached: false
+    clear.goal_tolerance: 0.30                    # 判定"到达"的距离 [m]
+
+    # ==================================================================
+    # 代价语义（所有算法共用）
+    # ==================================================================
+    # ⚠ 未知区域策略必须与全局图一致：
+    #   map_server 已把未知当空闲发布（unknown_as_free: true），所以这里默认保守
+    #   （把 -1 当障碍）不会误伤；若将来全局图保留 -1，需要把两边一起改。
+    common.hard_threshold: 80          # ≥ 该值视为硬障碍（100 = 占据）
+    common.unknown_as_occupied: true   # 未知格是否当障碍（保守）
+    common.soft_cost_weight: 5.0       # 软代价权重：(raw/阈值)² × 该值；0 = 关闭
+
+    # ==================================================================
+    # 矩形车体轮廓（footprint）—— 与 perception 的命名保持一致
+    # ==================================================================
+    # 只查致命格、不看膨胀梯度：安全性由 footprint 保证，舒适性由软代价保证。
+    footprint.enable: true
+    footprint.length: 0.70             # 机体系 x：前后（m）← Go2
+    footprint.width: 0.40              # 机体系 y：左右（m）
+    footprint.offset_x: 0.0            # 参考点不在矩形中心时用
+    footprint.offset_y: 0.0
+    footprint.safe_margin: 0.05        # 四边各外扩（m）
+    footprint.check_edges: true        # 边扫掠（四角轨迹 + 中心线），防"擦角"
+    footprint.fast_path: true          # 内切/外接双阈值快路径（距离场，1 次查表）
+
+
+#######################################################################
+# ---- 局部规划节点（local_planner）：P4 只有 Null 实现，**不产生任何速度指令** ----
+#######################################################################
+    use_sim_time: false
+
+    # 算法选择（默认值，会被 config/local_<类型>.yaml 片段覆盖）
+    local.type: "none"
+    local.frame_id: "map"
+
+    # ---------------- 接口话题 ----------------
+    topics.odom: "/lightning/perception/pose"          # 外部：与全局节点同一个位姿源
+    topics.local_map: "/grid_map/occupancy_inflate_2d"  # 外部：局部膨胀图（硬判定/障碍）
+    topics.esdf: "/grid_map/esdf_2d"                    # 外部：距离场（PointXYZI 点云）
+    topics.local_status: "pnc_2d/local_status"          # 自家：局部状态（latched）
+
+    # ---------------- 控制 ----------------
+    # cmd_vel 的**唯一 owner 是局部节点**（谁控车谁发速度），状态机不插手，
+    # 避免两个节点同时发速度打架。接底盘时把这里改到实车话题。
+    local.cmd_vel_topic: "pnc_2d/cmd_vel"
+    local.control_rate: 20.0           # 控制周期 [Hz]
+    local.goal_tolerance: 0.30         # 距路径终点 ≤ 该值算"到达" [m]
+    local.pass_distance: 0.50          # 距路径点 ≤ 该值算"经过"（用于算进度）[m]
+    local.odom_timeout: 1.0            # 位姿超过该时长没更新 → 降级停发 [s]
+    # ---- 距离场（P5.3 接线）----
+    # 注意：感知的 esdf_2d **只在有订阅者时才计算**，所以下面这两个订阅就是
+    # "让感知开始算距离场"的开关，删掉订阅感知就不算了。
+    local.esdf_timeout: 0.3            # 距离场超过该时长没更新 → 降级限速 [s]
+    local.esdf_max_distance: 3.0       # 距离场截断上限 [m]（必须 ≥ 感知的 esdf_max_dist，
+                                       # 否则未覆盖格子会被低估成"有障碍"）
+    local.esdf_fill_radius: 2           # 点云→栅格的邻域填充半径 [格]
+                                       # （感知采样步长默认 2 格 = 0.2 m，至少要填 1 圈）
+    # 被挡要**连续**持续这么久才结束跟随（把决定权交回状态机）：
+    # 瞬时遮挡（有人走过、点云抖一帧）不该让任务失败。
+    local.blocked_abort_s: 1.0
+
+
+#######################################################################
+# ---- 任务状态机节点（pnc_manager）：三节点的主控 ----
+#######################################################################
+    use_sim_time: false
+
+    sm.frame_id: "map"
+
+    # ---------------- 接口话题 ----------------
+    topics.goal: "/goal_pose"                    # 外部：RViz "2D Goal Pose"（本节点独占消费）
+    topics.odom: "/lightning/perception/pose"    # 外部：定位
+    topics.state: "pnc_2d/state"                 # 自家：状态机状态（latched）
+
+    # ---------------- 与另两个节点的 IPC ----------------
+    # 写**相对**名：根命名空间下等价于 /global_planner/plan_path，
+    # 加上 namespace（如 ns:=/e2e）就整套跟着搬，不会指到别人家的服务上。
+    sm.global_plan_service: "global_planner/plan_path"
+    sm.global_clear_service: "global_planner/clear_path"
+    sm.local_follow_action: "local_planner/follow_path"
+    sm.local_stop_service: "local_planner/stop"
+
+    # ---------------- 状态机上限 ----------------
+    # 一次任务内允许的恢复尝试次数。**恢复成功也不清零** —— 这就是
+    # "挡住→恢复→再挡→再恢复…"无限循环的防线。
+    sm.max_recoveries: 2
+    # 全局规划失败允许的重试次数（0 = 一次失败即任务失败）。
+    # 默认 0：失败通常是"目标不可达"这类确定性结论，重试没意义。
+    sm.max_plan_failures: 0
+
+    # ---------------- 卡住/跳变判据 ----------------
+    # 用**自车位移**判断卡住（不依赖局部反馈）：参照点挪动超过
+    # stuck_min_progress 就重新计时，否则超过 stuck_timeout 发 Stuck 事件。
+    sm.stuck_timeout: 10.0             # [s]
+    sm.stuck_min_progress: 0.20        # [m]
+    # 两帧位姿之间位移超过该值 → 认为定位跳变（正常步态不可能），
+    # 基于旧位姿的路径不再可信 → 触发重规划。0 = 关闭该检测。
+    sm.odom_jump_threshold: 1.0        # [m]
+    # 跳变的冷却时间：跳变是异常事件，但可能**连续**发生（两条定位源同时在发、
+    # 重定位后的恢复期…）。没有冷却的话每次跳变都会触发一次重规划，形成
+    # "重规划风暴"（实测踩过：20 Hz 位姿 × 两条源交替 → 每秒几十次）。
+    sm.odom_jump_cooldown: 2.0         # [s]
+    sm.heartbeat_hz: 5.0               # 心跳周期（卡住检测 + 状态话题刷新）
+

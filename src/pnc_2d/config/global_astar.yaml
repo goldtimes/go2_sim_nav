@@ -1,0 +1,30 @@
+#######################################################################
+# A* 模式参数片段（pnc_2d / astar）
+#
+# 这份文件**只放 A* 私有参数**，并自述 planner.type；话题/代价语义/车体轮廓在
+# config/pnc_2d.yaml（总入口）里。launch 会把两份按顺序合并，**本文件在后、覆盖总入口**。
+#
+# 单独用：ros2 launch pnc_2d global_planner.launch.py planner_type:=astar
+# 值的含义见 doc/pnc2d_dev_plan.md §6；触发方式是事件驱动：收到 /goal_pose 才规划一次。
+#######################################################################
+/**:
+  ros__parameters:
+    # 自述类型：单独看这份文件就知道它给哪个算法用
+    planner.type: "astar"
+
+    # ==================================================================
+    # A* 参数
+    # ==================================================================
+    astar.connectivity: 8              # 4 或 8 邻域（8 邻域含斜穿保护）
+    astar.heuristic_weight: 1.0        # >1 加速但可能次优（<1 会破坏最优性）
+    astar.use_search_window: true      # 只在起终点包围盒附近搜索（大图省一个量级）
+    astar.search_window_margin: 10.0   # 首次窗口余量（m）
+    astar.search_window_retry_margins: [30.0, 100.0, 1.0e9]   # 失败后逐级扩大
+    astar.max_iterations: 300000       # 扩展节点上限
+    astar.max_search_time_ms: 2000.0   # 单次搜索时间上限（ms）
+
+    # ---------------- 路径后处理 ----------------
+    astar.path_prune_mode: "line_of_sight"   # line_of_sight / collinear / none
+    astar.path_prune_max_span: 8.0           # 单次捷径检查的最大跨度（m）
+    astar.path_resample_spacing: 0.0         # >0 时按弧长重采样（m）
+    astar.keep_start_yaw: true               # 首点保留当前朝向（供控制器原地对正）

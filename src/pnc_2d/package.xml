@@ -12,11 +12,13 @@
     <buildtool_depend>rosidl_default_generators</buildtool_depend>
 
     <depend>rclcpp</depend>
+    <depend>rclcpp_action</depend>
     <depend>std_msgs</depend>
     <depend>std_srvs</depend>
     <depend>nav_msgs</depend>
     <depend>geometry_msgs</depend>
     <depend>visualization_msgs</depend>
+    <depend>sensor_msgs</depend>
     <depend>yaml-cpp</depend>
 
     <exec_depend>rosidl_default_runtime</exec_depend>

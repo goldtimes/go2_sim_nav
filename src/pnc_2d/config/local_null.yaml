@@ -1,0 +1,18 @@
+#######################################################################
+# 局部规划参数片段："空"实现（local.type: none）
+#
+# 用途：三节点链路先跑通（manager → global → local → 状态机），但**不发速度指令**
+#   （NullLocalPlanner::producesCmdVel() == false，连 cmd_vel 发布者都不创建）。
+#   详见 doc/mpc_local_planner_plan.md。
+#
+# 换真算法：ros2 launch pnc_2d local_planner.launch.py local_type:=mpc
+# 公共参数（话题/坐标系/控制周期）在 config/pnc_2d.yaml（总入口），launch 会自动合并。
+#
+# ⚠ 段落名是 `local_planner`（= 局部节点名），不是 `global_planner`：
+#    `local.type` 是**局部节点**的参数（P3 时曾错放在 global_planner 段下，
+#    P4 三节点拆分时修正 —— 放在别的节点段里不会生效，而且不会报错）。
+#######################################################################
+/**:
+  ros__parameters:
+    # 自述类型：单独看这份文件就知道它给哪个局部算法用
+    local.type: "none"

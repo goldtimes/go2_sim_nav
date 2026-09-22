@@ -101,7 +101,7 @@ flowchart LR
 
 1. `common.*` 参数键名不生效：`loadCommonParams` 曾按 `<算法前缀>.*` 读取，导致
    yaml 里的 `common.hard_threshold/unknown_as_occupied/soft_cost_weight` 被静默忽略
-   （一律回到代码默认值）。已改为固定读 `common.*`，与 `config/global_planner.yaml` 一致。
+   （一律回到代码默认值）。已改为固定读 `common.*`，与 `config/pnc_2d.yaml` 一致。
 2. `map_server` 按 `republish_interval`（1 Hz）重发同一张图，节点曾每次重发都重建
    距离场并刷日志。**根治**（已改 map_server 本身，详见 `src/map_server/README.md`）：
    默认改成"载图/换图发一次 + 新订阅者出现时按需补发一次"，稳态零流量
@@ -113,7 +113,8 @@ flowchart LR
 
 3. **⚠ 参数机制失效（影响最大）**：只开 `allow_undeclared_parameters(true)` 时，
    `get_parameter_or()` 对**未声明**参数**不会去查覆盖项**，会静默返回代码默认值 ——
-   也就是说 `config/global_planner.yaml` 里的 `footprint.*` / `common.*` / `astar.*`
+   也就是说 `config/pnc_2d.yaml`（跨模式共用）+ `config/global_astar.yaml`（A* 私有）里的
+   `footprint.*` / `common.*` / `astar.*`
    曾经**全部无效**（`planner.type` 之类节点自己 `declare_parameter` 过的键反倒是有效的，
    所以极难发现）。修法：
    - 节点侧加 `automatically_declare_parameters_from_overrides(true)`，让 yaml/命令行
@@ -342,7 +343,7 @@ struct PlanResult {
 
 ## 6. 参数（初版）
 
-参数从 ROS 参数服务器读取，命名空间 `planner.*` 与 `<算法>.*`（`config/global_planner.yaml`）：
+参数从 ROS 参数服务器读取，命名空间 `planner.*` 与 `<算法>.*`（`config/pnc_2d.yaml` + `config/global_astar.yaml`）：
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
@@ -386,7 +387,9 @@ struct PlanResult {
 ```text
 src/pnc_2d/
 ├── CMakeLists.txt / package.xml
-├── config/global_planner.yaml        # 参数默认值（与本文第 6 节一致）
+├── config/pnc_2d.yaml                # 总入口：公共参数 + 类型默认值（与本文第 6 节一致）
+├── config/global_astar.yaml          # A* 片段：planner.type + astar.*
+├── config/local_null.yaml            # 局部片段：local.type: none（P5 加 local_mpc.yaml）
 ├── launch/global_planner.launch.py   # 启动规划节点
 ├── include/pnc_2d/
 │   ├── core/                         # 公共层：与具体算法无关

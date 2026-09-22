@@ -36,6 +36,7 @@
 #include "pnc_2d/core/global_planner.hpp"
 #include "pnc_2d/core/route_graph.hpp"
 #include "pnc_2d/msg/planner_status.hpp"
+#include "pnc_2d/srv/plan_path.hpp"
 #include "pnc_2d/srv/switch_planner.hpp"
 #include "ros_param_reader.hpp"
 
@@ -154,6 +155,13 @@ public:
           res->success = true;
           res->message = "路径与规划标记已清空";
         });
+
+    // 状态机（manager）主导的规划入口：同步返回"成/败 + 路径 + 原因"。
+    // 与 /goal_pose 话题触发共用同一段规划逻辑（见 onPlanPathRequest）。
+    srv_plan_path_ = create_service<pnc_2d::srv::PlanPath>(
+        "~/plan_path",
+        std::bind(&GlobalPlannerNode::onPlanPathRequest, this,
+                  std::placeholders::_1, std::placeholders::_2));
 
     // 运行时热切换算法（不重启）。P4 的状态机切模式时就用它。
     srv_switch_ = create_service<pnc_2d::srv::SwitchPlanner>(
@@ -480,13 +488,131 @@ private:
     const double dist =
         std::hypot(req.goal.x - req.start.x, req.goal.y - req.start.y);
     RCLCPP_INFO(get_logger(),
-                "[planner] 规划请求：(% .2f, % .2f, % .1f°) → (% .2f, % .2f, "
-                "%.1f°)，直线距离 %.2f m",
+                "[planner] 规划请求（话题）：(% .2f, % .2f, %.1f°) → (% .2f, "
+                "% .2f, %.1f°)，直线距离 %.2f m",
                 req.start.x, req.start.y, req.start.yaw * 180.0 / M_PI,
                 req.goal.x, req.goal.y, req.goal.yaw * 180.0 / M_PI, dist);
 
-    const PlanResult result = planner_->plan(req);
-    publishResult(result, req);
+    publishResult(planner_->plan(req), req);
+  }
+
+  /// 输入检查：通过返回 true；不通过时往 `err` 写原因（同时打日志）。
+  /// 话题触发与服务触发**共用**，避免两条路径的前置条件慢慢分叉。
+  bool inputReady(std::string &err, const char *who) {
+    if (!has_map_ || planner_->costMap() == nullptr) {
+      err = "还没收到地图（" + topic_map_ + "）";
+      RCLCPP_WARN(get_logger(), "[planner] %s：%s，忽略本次目标", who,
+                  err.c_str());
+      return false;
+    }
+    if (!has_odom_) {
+      // 区分"定位没起"与"QoS 不匹配"：后者最坑 —— 话题上有发布者、数据也在刷，
+      // 但 DDS 因为 reliability 不兼容根本不投递，且没有任何报错。
+      const std::size_t pubs = count_publishers(topic_odom_);
+      err = "还没收到位姿（" + topic_odom_ + "），无法确定起点";
+      RCLCPP_WARN(get_logger(),
+                  "[planner] %s：%s | 该话题发布者 %zu 个%s", who, err.c_str(),
+                  pubs,
+                  pubs == 0
+                      ? "（定位节点似乎没在跑）"
+                      : "（有发布者 → 多为 QoS 不匹配：本节点订阅 best_effort，"
+                        "请用 ros2 topic info -v 核对两端 reliability）");
+      return false;
+    }
+    if (!odom_frame_.empty() && odom_frame_ != frame_id_) {
+      err = "位姿 frame='" + odom_frame_ + "' != '" + frame_id_ +
+            "'，拒用（本节点不做 TF 变换）";
+      RCLCPP_WARN(get_logger(), "[planner] %s：%s", who, err.c_str());
+      return false;
+    }
+    return true;
+  }
+
+  /// 服务入口：manager（状态机）主导的规划。
+  ///
+  /// 与话题触发的差别只有两点，规划逻辑完全共用：
+  ///   · start 可以用请求里给的（默认用最近一次定位位姿，它更新）；
+  ///   · `publish_result=false` 时只看结果、不动 latched 话题（"先试算"场景）。
+  void onPlanPathRequest(
+      const std::shared_ptr<pnc_2d::srv::PlanPath::Request> req,
+      std::shared_ptr<pnc_2d::srv::PlanPath::Response> res) {
+    res->success = false;
+
+    if (!req->goal.header.frame_id.empty() &&
+        req->goal.header.frame_id != frame_id_) {
+      res->status = static_cast<uint8_t>(PlannerStatus::kInvalidInput);
+      res->status_name = toString(PlannerStatus::kInvalidInput);
+      res->message = "目标 frame='" + req->goal.header.frame_id +
+                     "' != planner.frame_id='" + frame_id_ + "'";
+      RCLCPP_WARN(get_logger(), "[planner] 服务请求被拒：%s",
+                  res->message.c_str());
+      return;
+    }
+
+    std::string err;
+    if (!inputReady(err, "服务请求")) {
+      res->status = static_cast<uint8_t>(PlannerStatus::kNotInitialized);
+      res->status_name = toString(PlannerStatus::kNotInitialized);
+      res->message = err;
+      return;
+    }
+
+    PlanRequest pr;
+    // 默认用最近一次定位位姿（它总比调用方缓存的更新）
+    pr.start = start_;
+    if (!req->use_current_pose &&
+        (req->start.pose.position.x != 0.0 ||
+         req->start.pose.position.y != 0.0)) {
+      // 调用方显式指定了起点：只在"给得像样"（不是默认的 0,0）时才采信，
+      // 否则会把 (0,0) 当成一个真实起点（那是地图外或墙里）→ 报莫名其妙的无解。
+      pr.start.x = req->start.pose.position.x;
+      pr.start.y = req->start.pose.position.y;
+      pr.start.yaw = yawFromQuaternion(req->start.pose.orientation);
+      pr.start.has_yaw = true;
+    }
+    pr.goal.x = req->goal.pose.position.x;
+    pr.goal.y = req->goal.pose.position.y;
+    pr.goal.yaw = yawFromQuaternion(req->goal.pose.orientation);
+    pr.goal.has_yaw = true;
+
+    RCLCPP_INFO(get_logger(),
+                "[planner] 规划请求（服务）：(% .2f, % .2f) → (% .2f, % .2f)，"
+                "直线距离 %.2f m | 发布结果到话题：%s",
+                pr.start.x, pr.start.y, pr.goal.x, pr.goal.y,
+                std::hypot(pr.goal.x - pr.start.x, pr.goal.y - pr.start.y),
+                req->publish_result ? "是" : "否");
+
+    const PlanResult result = planner_->plan(pr);
+    if (req->publish_result)
+      publishResult(result, pr);
+
+    const auto &st = result.stats;
+    res->status = static_cast<uint8_t>(result.status);
+    res->status_name = toString(result.status);
+    res->message = result.message;
+    res->success = result.ok();
+    res->plan_time_ms = st.plan_time_ms;
+    res->expanded_nodes = static_cast<int32_t>(st.expanded_nodes);
+    res->windows_tried = st.windows_tried;
+    // 走廊（P5.3）：只有路网规划器会填 has_corridor；A* 始终是自由空间。
+    // 这里只做透传 + 一个一致性修正（strict 必须与 half_width 一致，避免调用方
+    // 自己再判一次而判歪）。
+    res->has_corridor = result.has_corridor;
+    res->corridor_half_width = result.corridor_half_width;
+    res->corridor_speed_limit = result.corridor_speed_limit;
+    res->strict_corridor = result.strictCorridor();
+    res->route_edges.assign(result.route_edges.begin(), result.route_edges.end());
+    res->path.header.stamp = now();
+    res->path.header.frame_id = frame_id_;
+    for (const auto &p : result.path) {
+      geometry_msgs::msg::PoseStamped ps;
+      ps.header = res->path.header;
+      ps.pose.position.x = p.x;
+      ps.pose.position.y = p.y;
+      ps.pose.position.z = 0.0;
+      ps.pose.orientation = quaternionFromYaw(p.has_yaw ? p.yaw : 0.0);
+      res->path.poses.push_back(ps);
+    }
   }
 
   void publishResult(const PlanResult &result, const PlanRequest &req) {
@@ -899,6 +1025,7 @@ private:
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srv_clear_;
   rclcpp::Service<pnc_2d::srv::SwitchPlanner>::SharedPtr srv_switch_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srv_reload_;
+  rclcpp::Service<pnc_2d::srv::PlanPath>::SharedPtr srv_plan_path_;
   /// 当前地图（latched 收到后留着：热切换/热重载要交给新规划器）
   std::shared_ptr<CostMap2D> map_;
 

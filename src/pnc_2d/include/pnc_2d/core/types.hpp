@@ -35,6 +35,43 @@ enum class PlannerStatus {
 
 const char * toString(PlannerStatus s);
 
+/// 局部规划（跟随）状态。**独立枚举**，不复用 PlannerStatus：
+/// "全局规划失败"与"局部被挡住/到达终点"是两类语义，混用会让状态机写不清。
+enum class LocalStatus {
+  kIdle = 0,      // 没有可跟随的路径，或尚未启动
+  kFollowing,     // 正在沿路径走
+  kGoalReached,   // 到达路径终点（局部负责判定）
+  kBlocked,       // 前方被挡且不可绕（路网模式下走廊被占 ⇒ 停车等状态机）
+  kDegraded,      // 降级运行（例如距离场超时，只用硬碰撞兜底 + 减速）
+  kFailed         // 求解失败/内部错误
+};
+
+const char * toString(LocalStatus s);
+
+/// 走廊约束：`route` profile 的来源（全局路网规划给出的中心线 + 允许偏离半宽）
+struct RouteCorridor {
+  std::vector<Pose2D> centerline;  ///< 世界系中心线（已填 yaw 更佳）
+  double half_width{0.0};          ///< 允许横向偏离半宽 [m]；0 = 严格贴线
+  double speed_limit{0.0};         ///< 该走廊限速 [m/s]；0 = 不限（用算法上限）
+  int edge_index{-1};              ///< 来源通道下标（诊断/可视化用）
+
+  bool valid() const { return centerline.size() >= 2; }
+  bool strict() const { return half_width <= 1e-9; }
+};
+
+/// 动态障碍（供 MPC 做"预测位置处的代价"）。
+/// v1（反应式）只收不用；速度/置信度由感知侧的跟踪器在未来提供，
+/// 见 doc/mpc_local_planner_plan.md §7。
+struct DynamicObstacle {
+  int id{0};
+  Pose2D pose;              ///< 当前位姿（世界系）
+  double vx{0.0};           ///< 世界系速度 [m/s]
+  double vy{0.0};
+  double radius{0.3};       ///< 等效半径 [m]
+  double confidence{1.0};   ///< 置信度 0~1
+  double stamp{0.0};        ///< 观测时刻 [s]
+};
+
 /// 栅格代价语义（所有算法共用；逐算法可用不同参数）
 struct CostModel {
   /// ≥ 该值视为硬障碍（nav2 的惯例是 253/80 这一类阈值）
@@ -72,7 +109,26 @@ struct PlanResult {
   std::vector<Pose2D> path;    // 世界系，已填 yaw
   PlannerStats stats;
 
+  // ---- 走廊（"贴路网通道走"）----
+  // 语义：**path 本身就是走廊中心线**，允许横向偏离 ±corridor_half_width。
+  // has_corridor=false ⇒ 自由空间跟踪（局部只需跟踪，不必贴线）。
+  //
+  // 为什么只存"摘要"而不是每个点一份宽度：本仓库的接收端
+  // （local_planner_node）就是按这一条语义实现的——用整条路径当中心线，
+  // 宽度取各点最小值。一条任务跨多条通道时取**最严**的那条（半宽最小、
+  // 限速最小），宁可保守：偏出严格通道比在宽通道里少偏一点严重得多。
+  bool has_corridor{false};
+  double corridor_half_width{0.0};   ///< 允许横向偏离半宽 [m]；0 = 严格贴线
+  double corridor_speed_limit{0.0};  ///< 走廊限速 [m/s]；0 = 不限
+  std::vector<int> route_edges;      ///< 用到的通道下标（诊断/可视化）
+
   bool ok() const { return status == PlannerStatus::kSuccess; }
+
+  /// 严格贴线的走廊：宽度 0，遇障只能停（不能绕）。
+  bool strictCorridor() const
+  {
+    return has_corridor && corridor_half_width <= 1e-9;
+  }
 };
 
 /// 栅格搜索窗口（闭区间，含边界）

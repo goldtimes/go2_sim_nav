@@ -1,15 +1,18 @@
 #######################################################################
-# 路网模式参数（pnc_2d / route_network）
+# 路网模式参数片段（pnc_2d / route_network）
 #
-# 用法：把这份文件里的 route_network.* 合进 config/global_planner.yaml，
-#       或直接：ros2 launch pnc_2d global_planner.launch.py planner_type:=route_network
+# 这份文件**只放路网私有参数**，并自述 planner.type；话题/代价语义/车体轮廓在
+# config/pnc_2d.yaml（总入口）里。launch 会把两份按顺序合并，**本文件在后、覆盖总入口**。
+#
+# 用法：ros2 launch pnc_2d global_planner.launch.py planner_type:=route_network
 #
 # 路网文件约定（与 map.yaml 同目录，换站点同源）：
 #   ~/rcs/maps/<站点>/routes.yaml
 #   用 map_server 的 scripts/route_editor.py 在地图上点选生成（见 map_server/README.md）
 #######################################################################
-global_planner:
+/**:
   ros__parameters:
+    # 自述类型：单独看这份文件就知道它给哪个算法用
     planner.type: "route_network"
 
     # ---------------- 路网 ----------------
@@ -32,20 +35,7 @@ global_planner:
     # 代码里会强制 prune_mode = "collinear"，这里写出来只为提示。
     route_network.path_prune_mode: "collinear"
 
-    # ---------------- 代价语义（与 A* 模式共用）----------------
-    common.hard_threshold: 80          # ≥ 该值视为硬障碍（100 = 占据）
-    common.unknown_as_occupied: true   # 未知格是否当障碍（保守）
-    common.soft_cost_weight: 5.0       # 软代价权重（路网模式下主要用于 hybrid 的离网段）
-
-    # ---------------- 车体轮廓（与 A* 模式共用）----------------
-    footprint.enable: true
-    footprint.length: 0.70             # Go2：机体系 x（前后）
-    footprint.width: 0.40              # 机体系 y（左右）
-    footprint.safe_margin: 0.05        # 四边各外扩
-    footprint.check_edges: true
-    footprint.fast_path: true
-
-    # ---------------- hybrid 的"最后一段"用这套 A* 参数 ----------------
+    # ---------------- hybrid 的"第一段/最后一段"用这套 A* 参数 ----------------
     astar.connectivity: 8
     astar.use_search_window: true
     astar.search_window_margin: 10.0

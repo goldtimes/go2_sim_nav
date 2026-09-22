@@ -263,7 +263,7 @@ def in_any_forbidden(x: float, y: float, zones: List[Dict], inflate: float) -> b
 
 def lane_free(grid: GridMap, pts: List[Tuple[float, float]], half_len: float,
               half_wid: float, zones: Optional[List[Dict]] = None,
-              zone_inflate: float = -1.0) -> bool:
+              zone_inflate: float = 0.0) -> bool:
     """沿通道逐位姿检查（朝向取该段方向，与 C++ 侧 lineIsCollisionFree 同口径）。
 
     zones 非空时**禁行区也算障碍**，并按 `zone_inflate` 膨胀（<0 = 车体外接圆半径）。
@@ -314,7 +314,7 @@ def smooth(points: List[Tuple[float, float]], n: int = 6
 class RouteEditor:
     def __init__(self, map_dir: str, routes_file: str, lane_len: float,
                  lane_wid: float, margin: float, snap: float,
-                 zone_inflate: float = -1.0) -> None:
+                 zone_inflate: float = 0.0) -> None:
         self.grid = GridMap(map_dir)
         self.routes_file = routes_file
         self.half_len = lane_len / 2.0 + margin
@@ -969,7 +969,7 @@ def main() -> int:
     ap.add_argument("--margin", type=float, default=0.05, help="safety margin [m]")
     ap.add_argument("--snap", type=float, default=0.30,
                     help="reuse an existing point within this radius [m]")
-    ap.add_argument("--zone-inflate", type=float, default=-1.0,
+    ap.add_argument("--zone-inflate", type=float, default=0.0,
                     help="forbidden-zone inflation [m]; <0 = auto (vehicle "
                          "circumscribed radius). Keep it equal to map_server's "
                          "zones.inflate, otherwise the editor and map_server "

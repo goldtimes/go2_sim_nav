@@ -34,8 +34,10 @@
 #include "pnc_2d/core/cost_map_2d.hpp"
 #include "pnc_2d/core/factory.hpp"
 #include "pnc_2d/core/global_planner.hpp"
+#include "pnc_2d/core/map_zones.hpp"
 #include "pnc_2d/core/route_graph.hpp"
 #include "pnc_2d/msg/planner_status.hpp"
+#include "pnc_2d/msg/zone_array.hpp"
 #include "pnc_2d/srv/plan_path.hpp"
 #include "pnc_2d/srv/switch_planner.hpp"
 #include "ros_param_reader.hpp"
@@ -87,9 +89,8 @@ public:
         std::string names;
         for (const auto &n : availablePlanners())
           names += (names.empty() ? "" : ", ") + n;
-        RCLCPP_ERROR(get_logger(),
-                     "[planner] %s（可用：%s）→ 回退 astar", err.c_str(),
-                     names.c_str());
+        RCLCPP_ERROR(get_logger(), "[planner] %s（可用：%s）→ 回退 astar",
+                     err.c_str(), names.c_str());
         planner_type_ = "astar";
         buildPlanner(planner_type_, err);
       }
@@ -133,6 +134,12 @@ public:
     sub_goal_ = create_subscription<geometry_msgs::msg::PoseStamped>(
         topic_goal_, 1,
         std::bind(&GlobalPlannerNode::onGoal, this, std::placeholders::_1));
+    // 区域层：map_server 的 latched 话题 ⇒ 必须 transient_local 订阅，
+    // 否则一条都收不到（volatile 收不到 latched 的历史样本）。
+    topic_zones_ = paramString("topics.zones", "/global_map/zones");
+    sub_zones_ = create_subscription<pnc_2d::msg::ZoneArray>(
+        topic_zones_, rclcpp::QoS(1).transient_local(),
+        std::bind(&GlobalPlannerNode::onZones, this, std::placeholders::_1));
 
     // 路径/标记是"事件驱动的一次性产物"：为了让后连接的订阅者（RViz
     // 后开、控制器 后启）也能拿到最近一次结果，用 latched(transient_local)
@@ -159,9 +166,8 @@ public:
     // 状态机（manager）主导的规划入口：同步返回"成/败 + 路径 + 原因"。
     // 与 /goal_pose 话题触发共用同一段规划逻辑（见 onPlanPathRequest）。
     srv_plan_path_ = create_service<pnc_2d::srv::PlanPath>(
-        "~/plan_path",
-        std::bind(&GlobalPlannerNode::onPlanPathRequest, this,
-                  std::placeholders::_1, std::placeholders::_2));
+        "~/plan_path", std::bind(&GlobalPlannerNode::onPlanPathRequest, this,
+                                 std::placeholders::_1, std::placeholders::_2));
 
     // 运行时热切换算法（不重启）。P4 的状态机切模式时就用它。
     srv_switch_ = create_service<pnc_2d::srv::SwitchPlanner>(
@@ -196,20 +202,21 @@ public:
         });
 
     const FootprintParams &fp = planner_->footprintParams();
+    RCLCPP_INFO(get_logger(),
+                "[planner] type=%s frame=%s | 地图 %s | 位姿 %s | 目标 %s | "
+                "路径 %s | 状态 %s",
+                planner_type_.c_str(), frame_id_.c_str(), topic_map_.c_str(),
+                topic_odom_.c_str(), topic_goal_.c_str(), topic_path_.c_str(),
+                topic_status_.c_str());
     RCLCPP_INFO(
         get_logger(),
-        "[planner] type=%s frame=%s | 地图 %s | 位姿 %s | 目标 %s | 路径 %s | 状态 %s",
-        planner_type_.c_str(), frame_id_.c_str(), topic_map_.c_str(),
-        topic_odom_.c_str(), topic_goal_.c_str(), topic_path_.c_str(),
-        topic_status_.c_str());
-    RCLCPP_INFO(get_logger(),
-                "[planner] 清空策略：失败时自动清空 | 到达目标(≤ %.2f m)自动清空：%s%s "
-                "| 也可调服务 ~/clear_path",
-                reach_tol_, clear_on_reach_ ? "开" : "关",
-                clear_on_reach_
-                    ? ""
-                    : "（clear.auto_on_goal_reached:=true 可打开；默认由状态机决定"
-                      "何时清）");
+        "[planner] 清空策略：失败时自动清空 | 到达目标(≤ %.2f m)自动清空：%s%s "
+        "| 也可调服务 ~/clear_path",
+        reach_tol_, clear_on_reach_ ? "开" : "关",
+        clear_on_reach_
+            ? ""
+            : "（clear.auto_on_goal_reached:=true 可打开；默认由状态机决定"
+              "何时清）");
     RCLCPP_INFO(
         get_logger(),
         "[planner] QoS：地图 transient_local（匹配 map_server latched）| "
@@ -223,8 +230,8 @@ public:
     // "writer 与 reader 匹配完成之后"发布的消息；启动瞬间发一次会早于 DDS
     // discovery，被直接丢掉（实测就是这个问题：旧高亮留在 RViz 里）。
     // 一旦有过规划结果就不再重发，避免反过来把刚发的新路径清掉。
-    timer_startup_cleanup_ = create_wall_timer(
-        std::chrono::milliseconds(500), [this]() {
+    timer_startup_cleanup_ =
+        create_wall_timer(std::chrono::milliseconds(500), [this]() {
           if (first_result_seen_)
             return;
           publishStartupCleanup();
@@ -233,9 +240,10 @@ public:
         });
     publishStartupCleanup();
 
-    // planner.type 支持**热切换**：按参数改会真的重建规划器（见 switchPlanner）。
-    // 失败时拒绝这次参数修改（successful=false）—— 保证"参数值 = 实际生效值"，
-    // 否则会出现"以为切成 A* 了，结果还在走路网"这种最难查的误解。
+    // planner.type 支持**热切换**：按参数改会真的重建规划器（见
+    // switchPlanner）。 失败时拒绝这次参数修改（successful=false）——
+    // 保证"参数值 = 实际生效值"， 否则会出现"以为切成 A*
+    // 了，结果还在走路网"这种最难查的误解。
     cb_set_params_ = add_on_set_parameters_callback(
         [this](const std::vector<rclcpp::Parameter> &ps) {
           rcl_interfaces::msg::SetParametersResult r;
@@ -255,8 +263,8 @@ public:
                           planner_type_.c_str());
             } else {
               r.successful = false;
-              r.reason = "热切换失败：" + err + "（仍在使用 " + planner_type_ +
-                         "）";
+              r.reason =
+                  "热切换失败：" + err + "（仍在使用 " + planner_type_ + "）";
               RCLCPP_ERROR(get_logger(),
                            "[planner] planner.type → '%s' 失败：%s",
                            want.c_str(), err.c_str());
@@ -436,8 +444,8 @@ private:
     // latched 话题上（RViz 会一直显示）。
     // 只在"规划时本来就离目标更远"时生效，避免目标就在车边时刚发就清。
     if (clear_on_reach_ && has_active_plan_ && plan_start_dist_ > reach_tol_) {
-      const double d = std::hypot(start_.x - active_goal_.x,
-                                  start_.y - active_goal_.y);
+      const double d =
+          std::hypot(start_.x - active_goal_.x, start_.y - active_goal_.y);
       if (d <= reach_tol_)
         clearPlan("已到达目标");
     }
@@ -493,7 +501,10 @@ private:
                 req.start.x, req.start.y, req.start.yaw * 180.0 / M_PI,
                 req.goal.x, req.goal.y, req.goal.yaw * 180.0 / M_PI, dist);
 
-    publishResult(planner_->plan(req), req);
+    // 区域层信息（限速 + 起终点在禁行区内的点名）要在发布前用上
+    PlanResult result = planner_->plan(req);
+    applyZoneInfo(result, req);
+    publishResult(result, req);
   }
 
   /// 输入检查：通过返回 true；不通过时往 `err` 写原因（同时打日志）。
@@ -510,9 +521,8 @@ private:
       // 但 DDS 因为 reliability 不兼容根本不投递，且没有任何报错。
       const std::size_t pubs = count_publishers(topic_odom_);
       err = "还没收到位姿（" + topic_odom_ + "），无法确定起点";
-      RCLCPP_WARN(get_logger(),
-                  "[planner] %s：%s | 该话题发布者 %zu 个%s", who, err.c_str(),
-                  pubs,
+      RCLCPP_WARN(get_logger(), "[planner] %s：%s | 该话题发布者 %zu 个%s", who,
+                  err.c_str(), pubs,
                   pubs == 0
                       ? "（定位节点似乎没在跑）"
                       : "（有发布者 → 多为 QoS 不匹配：本节点订阅 best_effort，"
@@ -533,9 +543,9 @@ private:
   /// 与话题触发的差别只有两点，规划逻辑完全共用：
   ///   · start 可以用请求里给的（默认用最近一次定位位姿，它更新）；
   ///   · `publish_result=false` 时只看结果、不动 latched 话题（"先试算"场景）。
-  void onPlanPathRequest(
-      const std::shared_ptr<pnc_2d::srv::PlanPath::Request> req,
-      std::shared_ptr<pnc_2d::srv::PlanPath::Response> res) {
+  void
+  onPlanPathRequest(const std::shared_ptr<pnc_2d::srv::PlanPath::Request> req,
+                    std::shared_ptr<pnc_2d::srv::PlanPath::Response> res) {
     res->success = false;
 
     if (!req->goal.header.frame_id.empty() &&
@@ -560,9 +570,8 @@ private:
     PlanRequest pr;
     // 默认用最近一次定位位姿（它总比调用方缓存的更新）
     pr.start = start_;
-    if (!req->use_current_pose &&
-        (req->start.pose.position.x != 0.0 ||
-         req->start.pose.position.y != 0.0)) {
+    if (!req->use_current_pose && (req->start.pose.position.x != 0.0 ||
+                                   req->start.pose.position.y != 0.0)) {
       // 调用方显式指定了起点：只在"给得像样"（不是默认的 0,0）时才采信，
       // 否则会把 (0,0) 当成一个真实起点（那是地图外或墙里）→ 报莫名其妙的无解。
       pr.start.x = req->start.pose.position.x;
@@ -582,7 +591,8 @@ private:
                 std::hypot(pr.goal.x - pr.start.x, pr.goal.y - pr.start.y),
                 req->publish_result ? "是" : "否");
 
-    const PlanResult result = planner_->plan(pr);
+    PlanResult result = planner_->plan(pr);
+    applyZoneInfo(result, pr);
     if (req->publish_result)
       publishResult(result, pr);
 
@@ -600,8 +610,27 @@ private:
     res->has_corridor = result.has_corridor;
     res->corridor_half_width = result.corridor_half_width;
     res->corridor_speed_limit = result.corridor_speed_limit;
+    res->zone_speed_limit = result.zone_speed_limit;
     res->strict_corridor = result.strictCorridor();
-    res->route_edges.assign(result.route_edges.begin(), result.route_edges.end());
+    res->route_edges.assign(result.route_edges.begin(),
+                            result.route_edges.end());
+    // ★ 逐点走廊：长度必须与路径一致才透传（否则调用方按下标取会错位）。
+    //   路网规划器在 hybrid 模式下会只给"落在通道上的点"填半宽，入口/出口自由段
+    //   填 <=0 —— 局部据此只在车真在车道里时才启用硬约束（见
+    //   local_planner_node）。
+    if (result.corridor_width_per_point.size() == result.path.size())
+      res->corridor_width = result.corridor_width_per_point;
+    else if (result.has_corridor) {
+      RCLCPP_WARN(get_logger(),
+                  "[planner] 逐点走廊长度 (%zu) 与路径 (%zu) 不一致 → 退回标量 "
+                  "半宽 %.3f（整条路径）",
+                  result.corridor_width_per_point.size(), result.path.size(),
+                  result.corridor_half_width);
+      res->corridor_width.assign(result.path.size(),
+                                 result.corridor_half_width);
+      if (result.strictCorridor())
+        std::fill(res->corridor_width.begin(), res->corridor_width.end(), 0.0);
+    }
     res->path.header.stamp = now();
     res->path.header.frame_id = frame_id_;
     for (const auto &p : result.path) {
@@ -657,13 +686,98 @@ private:
                 result.path.size(), st.path_length, st.plan_time_ms,
                 st.expanded_nodes, st.discovered_nodes, st.max_open_set,
                 st.windows_tried, st.footprint_full_checks,
-                result.message.empty() ? "" : " | ",
-                result.message.c_str());
+                result.message.empty() ? "" : " | ", result.message.c_str());
     has_active_plan_ = true;
     active_goal_ = req.goal;
-    plan_start_dist_ = std::hypot(req.goal.x - req.start.x,
-                                  req.goal.y - req.start.y);
+    plan_start_dist_ =
+        std::hypot(req.goal.x - req.start.x, req.goal.y - req.start.y);
     publishMarkers(&result, &req);
+  }
+
+  // ------------------------------------------------------------ 区域层
+  /// 区域层（禁行区/限速区）：map_server latched 发布。
+  ///
+  /// 禁行区**已经**被 map_server 烧进全局图 ⇒
+  /// 路由/可行性校验自动避开它。这里额外做 两件事：
+  ///   ① **限速区**：沿规划出的路径取最严限速交给管理器合成"任务限速"。不做的话
+  ///      就会出现"局部按区限速、任务限速还是旧值"两边打架；
+  ///   ②
+  ///   **起终点落在禁行区内时点名**：否则只能看到含糊的"目标不可达/起点在障碍里"，
+  ///      而真实原因往往就是区域（现场排查最耗时的一类）。
+  void onZones(const pnc_2d::msg::ZoneArray::SharedPtr msg) {
+    std::vector<pnc_2d::MapZone> zs;
+    zs.reserve(msg->zones.size());
+    for (const auto &zin : msg->zones) {
+      pnc_2d::MapZone z;
+      z.name = zin.name;
+      bool ok = false;
+      z.type = pnc_2d::zoneTypeFromString(zin.type, &ok);
+      if (!ok)
+        continue;
+      z.value = zin.value;
+      for (const auto &p : zin.polygon.points)
+        z.polygon.push_back(pnc_2d::Pose2D{p.x, p.y, 0.0});
+      zs.push_back(std::move(z));
+    }
+    zones_.adopt(std::move(zs));
+    zone_inflate_ = msg->inflate;
+    RCLCPP_INFO(get_logger(),
+                "[planner] 区域层：禁行 %zu / 限速 %zu（inflate %.3f m）",
+                zones_.forbiddenCount(), zones_.speedCount(), zone_inflate_);
+  }
+
+  /// 把区域信息用到规划结果上（见 onZones 的说明）。
+  /// 采样按**弧长 0.25 m**走，不是只查路径点：路径点密度由后处理决定，稀疏时
+  /// 会整个跳过一个小限速区。
+  void applyZoneInfo(PlanResult &r, const PlanRequest &req) const {
+    if (zones_.empty())
+      return;
+    if (r.ok() && r.path.size() >= 2 && zones_.speedCount() > 0) {
+      // lookahead<=0 会“只看起点那一点”，所以这里用很大的值表达“整条路径”
+      const double anywhere =
+          pnc_2d::zoneSpeedLimitAhead(zones_, r.path, 0, 1e9);
+      // ★ 只在「整条任务都在限速区里」时把它当成**任务级**限速（起点、终点都在
+      //   限速区内 ⇒ 全程都该慢）。只是**路过**一小段时**不设**任务限速。
+      //
+      //   为什么必须这么分：任务限速会被 manager 折进 `goal.speed_limit`，成为
+      //   局部**整条路径**的硬上界。若"路过"也设，一条 100 m 的路线里路过 2 m
+      //   的 限速区，整趟就只能爬 0.15 m/s。实测（2026-09-23 test_zones 段
+      //   3）： 限速区只是路径中的一小段，机器人出区后速度仍是 0.15 ⇒
+      //   "出区后恢复" 这个断言永远测不出来，看着像区域没生效。
+      //   路过段的减速由**局部节点的几何前瞻**负责（每周期算"到下一个限速区还有
+      //   多远"，前瞻距离 = 刹车距离 v²/(2a) + 0.3 m ⇒ 进区时速度已经合规）。
+      double lim_start = 0.0;
+      double lim_goal = 0.0;
+      const bool start_in_zone =
+          zones_.inSpeedZone(r.path.front().x, r.path.front().y, lim_start);
+      const bool goal_in_zone =
+          zones_.inSpeedZone(r.path.back().x, r.path.back().y, lim_goal);
+      if (start_in_zone && goal_in_zone) {
+        r.zone_speed_limit = anywhere;
+        RCLCPP_INFO(get_logger(),
+                    "[planner] 起点与终点都在限速区内 → 任务限速 %.2f m/s",
+                    anywhere);
+      } else if (anywhere > 0.0) {
+        RCLCPP_INFO(
+            get_logger(),
+            "[planner] 路径经过限速区（%.2f m/s，起终点不在区内）→ 不设任务"
+            "限速，改由局部按几何前瞻在该段减速",
+            anywhere);
+      }
+    }
+    const std::string gz = zones_.forbiddenNameAt(req.goal.x, req.goal.y);
+    const std::string sz = zones_.forbiddenNameAt(req.start.x, req.start.y);
+    if (gz.empty() && sz.empty())
+      return;
+    std::string note;
+    if (!sz.empty())
+      note += "起点在禁行区 " + sz + " 内";
+    if (!sz.empty() && !gz.empty())
+      note += "，";
+    if (!gz.empty())
+      note += "目标在禁行区 " + gz + " 内";
+    r.message += "；区域：" + note;
+    RCLCPP_WARN(get_logger(), "[planner] 区域：%s", note.c_str());
   }
 
   /// 发一条空 Path：latched 话题上"当前没有有效路径"就靠这个表达
@@ -715,7 +829,8 @@ private:
       }
     }
     // route_active 的 id 从 0 连续编号，但**上一个进程**发过几条本进程并不知道
-    // （active_marker_count_ 重启后从 0 开始），所以这里按一个足够大的范围全部删掉。
+    // （active_marker_count_ 重启后从 0
+    // 开始），所以这里按一个足够大的范围全部删掉。
     for (int i = 0; i < kStaleMarkerIds; ++i)
       del("route_active", i, visualization_msgs::msg::Marker::LINE_STRIP);
     active_marker_count_ = 0;
@@ -1014,6 +1129,11 @@ private:
   std::string topic_status_;
 
   std::unique_ptr<GlobalPlanner> planner_;
+  /// 区域层（禁行/限速）：map_server latched 发过来，见 onZones
+  pnc_2d::ZoneSet zones_;
+  double zone_inflate_{0.0};
+  std::string topic_zones_;
+  rclcpp::Subscription<pnc_2d::msg::ZoneArray>::SharedPtr sub_zones_;
   rclcpp::QoS odom_qos_{rclcpp::SensorDataQoS()};
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr sub_map_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_odom_;

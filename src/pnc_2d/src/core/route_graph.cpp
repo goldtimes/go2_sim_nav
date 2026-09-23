@@ -186,6 +186,28 @@ double RouteEdge::yawAt(double s) const {
   return std::atan2(b.y - a.y, b.x - a.x);
 }
 
+double distanceToPolyline(double x, double y,
+                          const std::vector<Pose2D> &polyline) {
+  // 量的是到**中心线**的最近距离（开放折线）：点偏出 0.2 m 就返回 0.2。
+  // 与 distanceToPolygon（区域，内部返回 0）不同，这里不能有"内部"的概念。
+  if (polyline.empty())
+    return std::numeric_limits<double>::infinity();
+  if (polyline.size() == 1)
+    return std::hypot(x - polyline[0].x, y - polyline[0].y);
+  double best = std::numeric_limits<double>::infinity();
+  for (std::size_t i = 0; i + 1 < polyline.size(); ++i) {
+    const double ax = polyline[i].x, ay = polyline[i].y;
+    const double bx = polyline[i + 1].x, by = polyline[i + 1].y;
+    const double dx = bx - ax, dy = by - ay;
+    const double l2 = dx * dx + dy * dy;
+    double t = 0.0;
+    if (l2 > 1e-18)
+      t = std::clamp(((x - ax) * dx + (y - ay) * dy) / l2, 0.0, 1.0);
+    best = std::min(best, std::hypot(x - (ax + t * dx), y - (ay + t * dy)));
+  }
+  return best;
+}
+
 // ---------------------------------------------------------------------------
 // 载入
 // ---------------------------------------------------------------------------

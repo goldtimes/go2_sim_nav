@@ -36,6 +36,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/PlannerStatus.msg"
   "msg/LocalStatus.msg"
   "msg/ManagerState.msg"
+  "msg/Zone.msg"
+  "msg/ZoneArray.msg"
   "srv/SwitchPlanner.srv"
   "srv/PlanPath.srv"
   "action/FollowPath.action"
@@ -64,6 +66,7 @@ add_library(pnc_2d_planner
   src/core/map_zones.cpp
   src/core/local_distance_field.cpp
   src/core/global_planner.cpp
+  src/core/replan_recovery.cpp
   src/core/factory.cpp
   src/global/astar_planner.cpp
   src/global/route_network_planner.cpp

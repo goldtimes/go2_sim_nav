@@ -1,7 +1,9 @@
 // 恢复行为的抽象基类（对齐 ROS 1 nav_core::RecoveryBehavior）。
 //
-// 本期（P3）**只留接口**，不实现具体行为 —— 状态机（P4）先能编译、能空跑；
-// 具体动作（清图、后退、请求重规划…）在 P6 里做。
+// 接口与 cote（P3）不变；P5.4 接上了**第一个**具体实现
+// `ReplanRecoveryBehavior`（见 replan_recovery.hpp）。仍未实现的：
+// "清图" 与 "小幅移动" —— `nudge` 这一类物理动作属底盘范畴，
+// 本阶段明确不做（用户 2026-09-23 决定）。
 //
 // 为什么用 std::function 注入而不是直接拿节点指针：
 //   · 库保持 ROS-free，单测可以用假函数断言"到底被调了什么"；
@@ -31,7 +33,7 @@ struct RecoveryContext {
 
 struct RecoveryResult {
   bool success{false};
-  std::string message;  ///< 失败时必须说明原因
+  std::string message; ///< 失败时必须说明原因
 };
 
 class RecoveryBehavior {
@@ -48,4 +50,4 @@ public:
   virtual void reset() {}
 };
 
-}  // namespace pnc_2d
+} // namespace pnc_2d

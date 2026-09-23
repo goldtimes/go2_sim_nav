@@ -52,4 +52,12 @@ install(PROGRAMS
   scripts/route_editor.py
   DESTINATION lib/${PROJECT_NAME})
 
+# ---- 单测（纯算法，不需要 ROS 图）----
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  # 栅格膨胀：几何+索引的活，写错了不报错、只会静默改行为（见测试文件头）
+  ament_add_gtest(test_grid_dilate test/test_grid_dilate.cpp)
+  target_link_libraries(test_grid_dilate map_io)
+endif()
+
 ament_package()

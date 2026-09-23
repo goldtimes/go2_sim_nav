@@ -69,6 +69,35 @@ public:
   /// 位姿处车体是否与致命格相交（enable=false 时退化为"中心格是否致命"）
   bool poseInCollision(double wx, double wy, double yaw) const;
 
+  /// 参考点到**最近致命格**的距离 [m]（需要距离场；拿不到时返回 NaN）。
+  /// 用途：把"轮廓与障碍重叠"拆成"真的压上去了"和"只擦到安全余量"——
+  /// 后者（比如全局图与感知图差 1~2 cm、运行中新加了一块禁行区）不应该把
+  /// 任务判死，但需要能**量出来**才能这么判（见 A* 的起点松弛）。
+  double distanceToLethal(double wx, double wy) const;
+
+  /// 把 safe_margin 当成 0 再判一次（= "真实轮廓压上障碍了吗"）。
+  /// 与 poseInCollision 的关系：后者含余量（保守），这个只回答"是不是真撞"。
+  /// 因为方向预计算表是按当前 footprint 建的，这里走完整检查（每次几十格，
+  /// 只在"起点/终点疑似碰撞"这种低频路径上用）。
+  bool poseInCollisionNoMargin(double wx, double wy, double yaw) const;
+
+  /// 用**指定的** safe_margin 判一次（不改内部状态；margin 可为负 = 把轮廓缩小）。
+  /// 用途：起点已经压进障碍时，要知道"压进去多深":
+  ///   margin = 0     → 真实轮廓撞了吗
+  ///   margin = -0.05 → 真实轮廓再往里让 5 cm 还撞吗（= 穿透是否 ≤ 5 cm）
+  bool poseInCollisionAtMargin(double wx, double wy, double yaw,
+                               double margin) const;
+
+  /// 临时改用另一个 safe_margin（**可以是负数** = 把轮廓缩小）。
+  /// 用途：起点已经擦进/压进障碍时，用更松的轮廓再试一次规划
+  /// （见 AStarPlanner::start_penetration_tol）—— 否则"起点在带里"就是不可恢复
+  /// 的死局：起点节点自身过不了含余量的检查，朝任何方向的下一步也过不了。
+  /// 复位用 clearMarginOverride()（**不要用负值当哨兵**：负 margin 是合法取值）。
+  void setMarginOverride(double m);
+  void clearMarginOverride();
+  /// 当前生效的轮廓（可能带 override；诊断用）
+  const FootprintParams & effectiveFootprint() const { return fp_eff_; }
+
   /// 边扫掠检查：机器人沿直线从 (x0,y0) 走到 (x1,y1)，**车身朝向 = 线段方向**
   /// （到点后再原地转向下一段；原地旋转属于平台/局部规划器的职责，不在本检查内）。
   /// 内容：两端位姿 + 中心线 + 四角轨迹。
@@ -99,17 +128,28 @@ private:
   };
 
   /// 求某朝向下车体覆盖的格子偏移集合（相对中心格；用 SAT 判"格与矩形相交"）
-  void rectOffsets(double yaw, std::vector<Cell> & out) const;
+  /// fp 为 nullptr 时用当前配置 fp_（有个按方向预计算的快路径表）。
+  void rectOffsets(double yaw, std::vector<Cell> & out,
+                   const FootprintParams * fp = nullptr) const;
   void buildDirectionOffsets();
   /// 命中 8 个离散方向则返回 0..7，否则 -1
   int directionIndex(double yaw) const;
-  /// 完整矩形检查（无快路径）
-  bool fullCheckAtCell(int cx, int cy, double yaw) const;
+  /// 完整矩形检查（无快路径）；fp 非空时用它（不查预计算表）
+  bool fullCheckAtCell(int cx, int cy, double yaw,
+                       const FootprintParams * fp = nullptr) const;
   void cornerWorld(double x, double y, double yaw, int i, double & ox, double & oy) const;
 
   const CostMap2D * map_{nullptr};
   const ClearanceField * cf_{nullptr};
-  FootprintParams fp_;
+  FootprintParams fp_;        // 配置值（诊断/画标记用它）
+  /// 当前生效的轮廓：= fp_，或 setMarginOverride 之后的那份。
+  /// **所有几何判定都走它**；fp_ 永远保留配置值。
+  FootprintParams fp_eff_{};
+  /// ★ 注：不能用“margin_override_ < 0”当“没 override”的哨兵 —— 负 margin
+  ///   现在是一个**合法取值**（“真实轮廓再往里让”）。两者必须分开存，
+  ///   否则 override 生效时还会去查按原 margin 预计算的方向表，判据就错了。
+  bool margin_overridden_{false};
+  double margin_override_{-1.0};
   int hard_threshold_{80};
   bool unknown_as_occupied_{true};
   std::array<std::vector<Cell>, 8> dir_offsets_;

@@ -13,6 +13,11 @@ latched 话题的"路径有效期"、清场时机、换算法重启、运行时�
 | `test_mpc_wiring.py` | **MPC 接线（P5.3 验收）**：无数据→降级限速、空点云≠缺距离场、真发 cmd_vel、**闭环**前进、墙真的进规划器、`route` 走廊一路传到局部、`none` 反例 |
 | `run_all.sh` | 上面六个 + E2E-1 的两种参数模式，一把跑完 |
 
+> ⚠ `test_mpc_wiring.py` 的 G 阶段（走廊接线）**必须让车真的开起来**（`probe.drive=True`
+> 且给图/给场），并等它回到走廊里：P5.4 起走廊是"**车已在走廊里**才生效"（从车道外
+> 用硬约束收敛实测不可行 ⇒ 先自由上线、再严格贴线）。车钉在原地不动时，
+> `route_mode` 永远为 false —— 那条断言在旧语义下能过、在新语义下必然失败（已修）。
+
 > 为什么要有 `test_launch_config.py`：其它脚本都用 `-p key:=value` 在命令行塞参数，
 > **绕过了 yaml 与 launch**。而"参数放哪、谁覆盖谁"正是 `pnc_2d.yaml(总入口) +
 > local_*.yaml + global_*.yaml(算法片段) + extra_config` 拆分后最容易错的地方。

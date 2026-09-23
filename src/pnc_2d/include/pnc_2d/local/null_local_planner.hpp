@@ -1,7 +1,8 @@
 // NullLocalPlanner：不做任何控制的"空"实现（P3 交付，`local.type: none`）。
 //
 // 存在意义：
-//   1. 让 P4 的三节点链路**能空跑**：manager → global(service) → local(action) → 状态机，
+//   1. 让 P4 的三节点链路**能空跑**：manager → global(service) → local(action)
+//   → 状态机，
 //      但**不发任何速度指令**（producesCmdVel() = false）；
 //   2. 作为"局部规划器"接口的最小契约测试对象（工厂/状态机单测都用它）；
 //   3. 明确区分于"真实算法还没接好"：它报告 kFollowing 表示"我给你了路径，
@@ -42,4 +43,4 @@ private:
   long command_calls_{0};
 };
 
-}  // namespace pnc_2d
+} // namespace pnc_2d

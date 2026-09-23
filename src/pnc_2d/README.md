@@ -99,7 +99,7 @@ ros2 service call /local_planner/stop std_srvs/srv/Trigger
 **MPC（P5.1 库层 + P5.3 节点接线已完成，可用）**
 
 ```bash
-./build/pnc_2d/test_mpc_local_planner    # 15 用例：跟踪/走廊/避障/耗时
+./build/pnc_2d/test_mpc_local_planner    # 33 用例：跟踪/走廊/避障/耗时/到点朝向/自由顺滑
 ./build/pnc_2d/test_mpc_qp_reference     #  8 用例：QP 矩阵/KKT 一致性
 ```
 
@@ -131,7 +131,49 @@ ros2 launch pnc_2d pnc_2d.launch.py planner_type:=route_network local_type:=mpc
 - 距离场 `local.esdf_timeout`（0.3 s）过期 → 降级限速，**不用过期场做硬约束**。
 - route 模式下全局规划把走廊宽度通过 `PlanPath.srv` → `FollowPath.action` 透传给
   局部（**path 即中心线**，允许横向偏离 ±半宽）；没接通时"贴线走"会静默失效。
+  ★ **逐点生效**：hybrid 路径 = [自由入口段, 路网段, 自由出口段]，走廊只对路网段
+  生效（入口/出口段填 -1 = 无走廊），且局部只在"车已回到走廊里"时才启用硬约束
+  —— 否则车会在车道外几厘米处被硬约束判死（实测横向偏差 ≥0.055 m 就一步不动）。
+  语义：`>0` 允许偏离、`==0` **严格贴线**、`<0` **无走廊**。
 
+
+**到点朝向与“顺滑优先”（2026-09-23，用户实测驱动）**
+
+两个都是**行为**问题，不是接线问题，但都定位到了机制层：
+
+1. **到点要保证朝向**。原来的到点判定只看位置（目标天生带 yaw：面向充电桩/通道口），
+   现在：位置到了而朝向还差 > `goal_yaw_tolerance_deg` ⇒ 原地对正（v=0），进容差才算到达。
+   - 容差经 `LocalPlanner::goalYawTolerance()` 给节点（**单一来源**，别在节点侧再配一份）。
+   - 对正要**打破底盘低速死区**：`ω = gain·e` 在 e 小时指令小到车不动 ⇒
+     永远收敛不了。所以有 `align_w_min` 下限（Go2 标定 0.20 rad/s，放在 `go2_run.yaml`）。
+   - `goal_yaw_align_timeout` 兜底：转不出来就报失败并说清还差几度、该查哪个参数。
+   - 阿克曼底盘不能原地转 ⇒ 这种底盘把 `goal_yaw_tolerance_deg` 置 0。
+2. **自由模式顺滑优先**。自由段参考只是“大致往那儿走”的折线，不该像走廊那样严格贴线
+   （否则几 cm/几度偏差就被当成大误差追，`ω` 顶满来回打 ⇒ 摇摇摆摆）。
+   自由模式单独表达代价：`free_lat_scale`/`free_yaw_scale`（权重缩放）、
+   `free_lat_deadband`（横向死区，带内不纠）、`free_w_max`（ω 上限）；
+   **走廊模式完全不受影响**（严格贴线照旧）。库层默认全部中立 = 严格，产品策略写在
+   `config/local_mpc.yaml`。
+
+⚠ **跨层判据必须留正余量**（2026-09-23 实测死锁）：地图/区域的"膨胀层"只能加一次。
+全局图负责多留几 cm（真障碍 `map_server.inflate`、禁行区 `zones.inflate`），
+**局部按原几何判**（`topics.local_map` 用未膨胀图 + `zones.local_inflate: 0`）。
+两边配成同一个值（例如局部也按 0.05 融一遍区域）会让判据**完全相等 = 零余量**，
+±半格（2.5 cm）的离散化就足以造成"全局给路、局部说在障碍里" ⇒ BLOCKED ⇒
+恢复重规划又因起点余量重叠失败 ⇒ 任务永久 FAILED。局部节点启动时若发现两边相等会 WARN。
+
+⚠ **“让路径离障碍远一点”要用偏好，不要用硬膨胀**（2026-09-23 用户定的规则：
+机体 0.40 m + **左右各 10 cm** = 最窄可通 **0.60 m**）：
+- 硬判据已经刚好用满这个预算（半宽 0.20 + `footprint.safe_margin` 0.05 +
+  `map_server.inflate` 0.05 = 0.30 = 各 10 cm）⇒ **硬层再加就会把 0.60 m 通道直接判死**；
+- 所以“走远一点”改用 **`planner.clearance_prefer_dist` / `planner.clearance_cost_weight`**
+  （全局 A* 的净距偏好，直接用精确距离场算，与地图里有没有“软格”无关）：
+  0.4×0.4 柱子实测 —— 关：贴角过 **0.275 m**；开：**1.74 m**、路径只长 **0.06 m**；
+  0.60 m 窄通道仍可通（偏好是软的）。
+- ⚠ 测这个行为时几何要选对：**窄而浅的走廊测不出偏好** —— 车长 0.70 在离墙 0.30 时
+  根本转不了身（任何朝向变化都把 y 向尺度抬到 0.46），栅格 A* 的节点朝向 = 运动方向
+  ⇒ 只能直着走；要留“能绕”的空间（柱子）。同理，指标不能把首末点（车自己/目标）
+  算进去，否则会把差异掩盖掉。
 
 **参数与片段（`config/` + `launch/`）**
 
@@ -139,7 +181,7 @@ launch 会把**三份 yaml 按顺序合并**，**后面的覆盖前面的**：
 
 | 顺序 | 文件 | 内容 |
 |---|---|---|
-| 1 | `config/pnc_2d.yaml` | **总入口**：三个节点的公共参数——话题名、坐标系、代价语义（`common.*`）、车体轮廓（`footprint.*`）、路径有效期（`clear.*`）、局部控制参数（`local.*`）、状态机参数（`sm.*`），以及各类型的**默认值** |
+| 1 | `config/pnc_2d.yaml` | **总入口**：三个节点的公共参数——话题名、坐标系、代价语义（`common.*`）、车体轮廓（`footprint.*`）、路径有效期（`clear.*`）、局部控制参数（`local.*`）、区域在局部侧的额外膨胀（`zones.local_inflate`，**默认 0**）、状态机参数（`sm.*`），以及各类型的**默认值** |
 | 2 | `config/global_<算法>.yaml` | **全局算法片段**：自述 `planner.type` + 该算法私有参数（`astar` → `global_astar.yaml`，`route_network` → `route_network.yaml`） |
 | 3 | `config/local_<局部>.yaml` | **局部算法片段**：自述 `local.type`（`local_null.yaml` / `local_mpc.yaml`） |
 | 4 | `extra_config:=<路径>` | 追加的自定义片段，优先级最高 |
@@ -283,6 +325,40 @@ zones:                                            # 区域层（可选）
 禁行区**不是"只给全局规划器"**：局部规划若不知道就会出现"全局绕开了、局部冲进去"，
 所以统一在地图层注入，任何订阅这张图的模块自动遵守。开关：`zones.burn_into_map`、`zones.inflate`。
 
+#### 2.3.1 下游到底怎么消费（P5.4 落地，2026-09-23）
+
+区域**不止在** `map_server` 烧图那一处生效 —— 规划侧另有一条 latched 通道：
+
+```text
+map_server ──/global_map/zones (ZoneArray, transient_local, 带 inflate)──┬→ global_planner
+                                                                        ├→ local_planner
+                                                                        └→ pnc_manager
+```
+
+⚠ `inflate` 由**消息**携带，消费者必须用它（不能用自己配的值）：它等于 `map_server`
+烧全局图时用的那个，两边不一致就会出现"编辑/全局说通得过、局部说过不去"。
+（latched 话题 `ros2 topic echo` 读不到，要用 `test/sim/topic_probe.py`。）
+
+| 位置 | 禁行区 | 限速区 |
+|---|---|---|
+| `global_planner` | 不绕行（等上游报错/人工处理）；起点/终点落在区内时在消息里点名 | **只有"起点与终点都在限速区内"才给任务限速**（整趟都该慢）；只是路过一小段则不设任务限速，交给局部 |
+| `local_planner` | ① 每帧把区域按 `inflate` **烧进局部栅格**（footprint 检查判死）② 每帧把区域**并进 ESDF**（`d = max(0, d_poly − inflate)`，区内 = 0）③ 车已在区内 ⇒ 立刻停车报 `BLOCKED` 并**点名区域**（不做绕行） | 每周期按**几何前瞻**压速度帽：前瞻距离 = 从 **`v_max`** 减速所需的距离（不是从当前速度！见下），帽 = 前方最严限速值，出区即摘。`v_max`/减速度都**取算法自报值**（`LocalPlanner::maxSpeed()/brakeAcc()`），不是节点参数 —— 减速度必须与终点剖面同一个量 |
+| `pnc_manager` | 把局部/全局的失败原因原样上报（`pnc_2d/state`） | 把任务限速折进 `goal.speed_limit` |
+
+**为什么是"融合"而不是"绕过"**：感知的滑动窗与 ESDF 里**没有任何区域语义**，
+不融合的话车会贴着/开进禁行区 —— 今天只有订阅全局图的模块才遵守它。
+
+**限速前瞻为什么必须用 `v_max` 算（踩过）**：前瞻 = $v^2/(2a) + 0.3$，若用*当前*速度，
+车越慢前瞻越短、越晚减速，形成自锁（"因为开得慢，所以从不减速"）。实测：车以
+0.26 m/s 爬向 0.7 m 外的 0.15 m/s 限速区 ⇒ 前瞻 0.53 m 永远够不到 ⇒ 0.30 m/s 穿区。
+用 `v_max=0.42` 算 ⇒ 0.89 m ⇒ 距离 0.7 m 时就触发。同理前瞻**不能从"路点下标"开始**：
+自由空间路径只有 2 个点，下标在车走到终点附近前一直是 0，扫描窗口会固定在"路径起点
+往后 look 米"，帽戴上就摘不掉（实测：出区 1 m 后仍限 0.15，31 s 爬完全程）。
+两处都写成了单测（`MapZones.SpeedLimitAhead*`）。
+
+**验收**：`test/sim/test_zones.py`（自画区域、三段：禁行带挡路 / 挪开后能到 / 限速）
+**7/7 通过**，见 `test/sim/README.md`。
+
 **膨胀量怎么定（`zones.inflate`）**
 
 | 取值 | 含义 | 感受 |
@@ -338,18 +414,18 @@ cd ~/r41_ws && .venv/bin/python3 src/map_server/scripts/route_editor.py
 colcon test --packages-select pnc_2d --event-handlers console_direct+
 colcon test-result --test-result-base build/pnc_2d     # 期望 0 failures
 ./build/pnc_2d/test_astar_planner                      # A*：15 用例
-./build/pnc_2d/test_route_network                      # 路网：13 用例
-./build/pnc_2d/test_map_zones                          # 区域层：6 用例
+./build/pnc_2d/test_route_network                      # 路网：16 用例
+./build/pnc_2d/test_map_zones                          # 区域层：10 用例
 ./build/pnc_2d/test_clearance_field                    # 距离场(EDT)：5 用例
-./build/pnc_2d/test_distance_field                     # 局部 ESDF：7 用例
-./build/pnc_2d/test_mpc_local_planner                  # MPC：21 用例（含 1000 组走廊验收）
+./build/pnc_2d/test_distance_field                     # 局部 ESDF：8 用例
+./build/pnc_2d/test_mpc_local_planner                  # MPC：33 用例（含 1000 组走廊验收）
 ./build/pnc_2d/test_mpc_qp_reference                   # QP 参考/KKT：8 用例
-./build/pnc_2d/test_factory                            # 工厂/局部接口：15 用例
+./build/pnc_2d/test_factory                            # 工厂/局部接口/恢复行为：18 用例
 ./build/pnc_2d/test_state_machine                      # 状态机：19 用例（穷举 66 组状态×事件）
 ```
 
-合计 **109 个 gtest 用例**（9 个可执行文件）；`colcon test-result` 汇总为
-**118 tests, 0 errors, 0 failures**（109 个用例 + 9 个程序级记录）。
+合计 **132 个 gtest 用例**（9 个可执行文件）；`colcon test-result` 汇总为
+**142 tests, 0 errors, 0 failures**（132 个用例 + 9 个程序级记录 + 命令行参数记录）。
 
 **② 端到端测试（ROS 图级别，`test/e2e/`）**
 
@@ -388,20 +464,35 @@ python3 src/pnc_2d/test/sim/test_route_lane.py      # 严格贴线（route_netwo
 
 | 脚本 | 覆盖 | 实测 |
 |---|---|---|
-| `test_drive_goal.py` | 到点误差、末速、横向误差（全程/稳态）、无碰撞、指令不越界、**被控对象保真度** | 6/6：到点 **0.017~0.043 m**、末速 0.012~0.013 m/s、横向 0.016~0.026（稳态）/0.051~0.058（全程）m、保真度 0.93~0.96 |
-| `test_route_lane.py` | 严格贴线（自带 `corridor_width=0` 临时通道）、`route_mode`、到点、无碰撞 | 7/7：贴线 **0.048（全程）/0.025（稳态）m**、到点 0.017 m |
+| `test_drive_goal.py` | 到点误差、末速、**末朝向**、横向误差（全程/稳态）、无碰撞、指令不越界、**被控对象保真度** | 6/6（+ 末朝向一项）：到点 **0.009~0.043 m**、末速 0.012~0.013 m/s、横向 0.016~0.026（稳态）/0.051~0.058（全程）m、保真度 0.93~0.96 |
+| `test_route_lane.py` | 严格贴线（自带 `corridor_width=0` 临时通道）、**走廊逐点生效**、到点、无碰撞；`--turn <deg>` 强制通道与车头夹角 | **8/8**（含 60°/90° 角度差，以前一步不动）：**走廊生效期间贴线 0.048~0.049 m**、到点 0.015~0.019 m |
+| `test_zones.py` | **区域层三段验收**：① 禁行带横在路中间 ⇒ 不得进入且失败原因可诊断 ② **反证**：把带子挪到 8 m 外 ⇒ 同一目标要能到 ③ 限速区：进区前已 ≤ 限速 / 区内 ≤ 限速 / 出区后恢复 | **7/7**：净距 +0.46 m（没进区）、反证到点 0.011~0.037 m、进区前 0.161~0.174 / 区内 0.166 / 出区后 0.277（限速 0.15） |
+| `park_open.py` | 工具（不是用例）：把车开到全局图里**离障碍最远**的地方停下 —— 贴线验收要求车前有 3~6 m 净距 ≥0.55 m 的直线，而车常停在墙边 0.5 m 处 | 需要时先跑它，再跑 `test_route_lane.py` |
 
 指标一律用**高频位姿轨迹**自己算（不用 `local_status`、更不用 `twist`：低速噪声大、均值偏低），
-并用**独立重算的几何量**与控制器自报的 `cross_track` 对照。两点要知道：
+并用**独立重算的几何量**与控制器自报的 `cross_track` 对照。三点要知道：
 
 - **到点误差只有在 `local.goal_tolerance` 严格小于验收阈值时才可信**（`go2_run.yaml` 里
-  设 0.08 < 验收 0.15）；容差也设 0.15 时量到的就是管理器自己的停机条件（同义反复）。
+  设 0.01，另有 `local_mpc.stop_coast: 0.035` 做“停车惯性”提前量；要求 ≤ 3 cm）。
+  容差等于验收阈值时，量到的就是管理器自己的停机条件（同义反复）。
+- **贴线误差只能按“走廊生效期间”统计**（`route_mode=true` 的样本）：hybrid 路径的前段
+  是自由入口段（先把车带到车道上并对正），那段的外摆是必然的 —— 走廊是硬约束，
+  而硬约束下“从车道外收敛”实测不可行（详情见 §5.4 与 `test/sim/README.md`）。
 - 局部节点每 1 Hz 打一行 MPC 内部量（`v_ref/v_now/e_v0/curv/e_yaw0/lat0/走廊行/障碍行/`
   最小距/求解状态`）—— 出问题先看这行，比加 printf 快。字段含义见 `test/sim/README.md`。
 
 细节（参数陷阱、指标踩坑、诊断三步骤）见 `test/sim/README.md`；
 仿真里定位到的 5 个真问题（含“硬状态约束没考虑可达集”“参考切线在 mm 基线上算成噪声”）
 见 `doc/mpc_local_planner_plan.md` §5.4。
+
+**区域层与恢复行为（P5.4）的实测结论**（同样记在 `doc/mpc_local_planner_plan.md`）：
+
+| 症状 | 真因 | 修法 |
+|---|---|---|
+| 区域挡住一次后，**把区域挪走车也不动**（每个周期都 `maximum iterations reached`，`障碍行0`） | 热启动喂的是上一次**失败**的解（已发散）⇒ OSQP 被毒化，一次不可行即永久不可行 | 只把**可行解**存下来热启动，失败则回零（`SolverRecoversAfterInfeasibleCycle`） |
+| 被挡之后**再也不接受新目标**（任务既不完成也不失败，只能重启） | 进入 `RECOVERING` 的副作用是 `kStopRobot` ⇒ 恢复行为**从未被调用**，也没有事件把它推出去 | 改 `kRunRecovery`；并新增 `ReplanRecoveryBehavior`（`sm.recovery.type: replan`），恢复成功后**先重规划再跟随** |
+| 限速区**完全没生效**（日志 `区域限速0.00`，0.30 m/s 穿区） | ① 前瞻距离用**当前**速度算 ⇒ 越慢看得越近（自锁）② 前瞻从**路点下标**开始 ⇒ 2 点路径下标恒为 0，帽戴上摘不掉 | 前瞻用 `v_max` 算 + 从**车在路径上的投影点**前瞻（两者各有单测） |
+| 验证“区域真的生效”时指标全是 `None` | 三段测试必须**各自从当前位置重新选路**：前一段修好后车会真的开到终点，再沿用“起点+距离”会把区域放在车屁股后面 | 每段重新 `pick_goal`；这个坑写在 `test_zones.py` 里 |
 
 ---
 

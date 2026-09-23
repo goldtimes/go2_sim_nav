@@ -18,6 +18,7 @@
 
 #include <gtest/gtest.h>
 
+#include "pnc_2d/core/corridor_slice.hpp"
 #include "pnc_2d/core/cost_map_2d.hpp"
 #include "pnc_2d/core/param_reader.hpp"
 #include "pnc_2d/core/route_graph.hpp"
@@ -323,6 +324,89 @@ TEST(RouteNetworkPlanner, StrictStopsAtProjectionHybridReachesGoal) {
               pathLen(rh.path));
 }
 
+TEST(RouteNetworkPlanner, HybridMarksOnlyLanePointsAsCorridor) {
+  // ★★ “有角度的路网时机器基本不会动”的根因修复契约：
+  //   hybrid 的路径 = [自由入口段, 路网段, 自由出口段]，**只有路网段带走廊**
+  //   （逐点半宽：路网段 = 通道半宽，自由段 < 0）。
+  //   以前只给一个标量半宽，下游把**整条路径**都当“严格贴线的中心线”，车在车道外
+  //   几厘米处就被硬约束判死（实测横向偏差 ≥0.055 m ⇒
+  //   求解器不收敛、车一步不走）。
+  const PlanRequest req{mkPose(3.0, 3.0),
+                        mkPose(5.0, 3.0)}; // 起终点都在路网外 2 m
+  auto hybrid = makePlanner(ringYaml(false), "hybrid");
+  const PlanResult r = hybrid->plan(req);
+  ASSERT_TRUE(r.ok()) << toString(r.status) << " / " << r.message;
+  ASSERT_TRUE(r.has_corridor) << "在路网上走却没有走廊";
+  ASSERT_EQ(r.corridor_width_per_point.size(), r.path.size())
+      << "逐点走廊长度必须与路径一致（否则下游按下标取会错位）";
+
+  int free_pts = 0, lane_pts = 0;
+  for (double w : r.corridor_width_per_point)
+    (w < 0.0 ? free_pts : lane_pts)++;
+  std::printf(
+      "      [hybrid 逐点走廊] %zu 点：自由 %d / 车道 %d（半宽 %.2f）\n",
+      r.path.size(), free_pts, lane_pts, r.corridor_half_width);
+
+  EXPECT_GT(free_pts, 0) << "离网段应该没有走廊约束";
+  EXPECT_GT(lane_pts, 0) << "路网段必须有走廊约束";
+  // 首末点都在车道外 2 m ⇒ 必须无走廊（这就是“入口/出口段自由”的具体含义）
+  EXPECT_LT(r.corridor_width_per_point.front(), 0.0);
+  EXPECT_LT(r.corridor_width_per_point.back(), 0.0);
+  // 车道段半宽 = 通道半宽（ringYaml 的 corridor_width: 0.5）
+  for (std::size_t i = 0; i < r.path.size(); ++i)
+    if (r.corridor_width_per_point[i] >= 0.0)
+      EXPECT_DOUBLE_EQ(r.corridor_width_per_point[i], 0.5);
+
+  // 起点已经在车道上时，整条路径都应带走廊（向后兼容旧行为：没有“入口段”一说）
+  auto on_lane = makePlanner(ringYaml(false), "hybrid");
+  const PlanResult r2 =
+      on_lane->plan(PlanRequest{mkPose(3.0, 1.0), mkPose(5.0, 1.0)});
+  ASSERT_TRUE(r2.ok()) << r2.message;
+  const bool all_lane = std::all_of(r2.corridor_width_per_point.begin(),
+                                    r2.corridor_width_per_point.end(),
+                                    [](double w) { return w >= 0.0; });
+  EXPECT_TRUE(all_lane) << "起点就在车道上时不该出现无走廊的点";
+}
+
+TEST(RouteGraph, DistanceToPolylineBasics) {
+  const std::vector<Pose2D> line = {Pose2D{0.0, 0.0}, Pose2D{4.0, 0.0}};
+  EXPECT_NEAR(distanceToPolyline(2.0, 0.0, line), 0.0, 1e-12);  // 在线上
+  EXPECT_NEAR(distanceToPolyline(2.0, 0.3, line), 0.3, 1e-12);  // 侧面
+  EXPECT_NEAR(distanceToPolyline(-1.0, 0.0, line), 1.0, 1e-12); // 超出端点
+  const std::vector<Pose2D> bent = {Pose2D{0.0, 0.0}, Pose2D{3.0, 0.0},
+                                    Pose2D{3.0, 3.0}};
+  EXPECT_NEAR(distanceToPolyline(3.5, 3.0, bent), 0.5, 1e-12);
+  EXPECT_NEAR(distanceToPolyline(1.0, 1.0, bent), 1.0, 1e-12);
+  EXPECT_TRUE(std::isinf(distanceToPolyline(0.0, 0.0, {})))
+      << "空折线应返回 inf（不能返回 0：那等于“所有点都在车道上”）";
+}
+
+// ====================================================== 逐点走廊切段
+TEST(CorridorSlice, Semantics) {
+  // 语义（一定要分清）：>0 允许偏离 ±w；==0 **严格贴线**；<0 无走廊约束。
+  // 这两个很容易混（0 当成“没有”），混了就会把严格贴线任务当自由任务，或者把
+  // 自由入口段当“严格贴线的中心线”⇒ 车在车道外几厘米被硬约束判死。
+  EXPECT_FALSE(corridorSlice({}).valid) << "空数组 = 自由空间任务";
+  EXPECT_FALSE(corridorSlice({-1.0, -1.0}).valid) << "全无走廊 = 自由空间任务";
+
+  const auto all_strict = corridorSlice({0.0, 0.0, 0.0});
+  ASSERT_TRUE(all_strict.valid) << "全 0 = 严格贴线（不是“无走廊”）";
+  EXPECT_DOUBLE_EQ(all_strict.half_width, 0.0);
+  EXPECT_EQ(all_strict.begin, 0u);
+  EXPECT_EQ(all_strict.end, 2u);
+
+  // 入口自由 2 点 + 车道 3 点 + 出口自由 1 点
+  const auto mixed = corridorSlice({-1.0, -1.0, 0.5, 0.5, 0.0, -1.0});
+  ASSERT_TRUE(mixed.valid);
+  EXPECT_EQ(mixed.begin, 2u) << "入口段不该算进走廊";
+  EXPECT_EQ(mixed.end, 4u) << "出口段不该算进走廊";
+  EXPECT_DOUBLE_EQ(mixed.half_width, 0.0) << "段内取最严（0 = 严格贴线）";
+  EXPECT_EQ(mixed.size(), 3u);
+
+  const auto wide = corridorSlice({-1.0, 0.6, 0.5, 0.4, -1.0});
+  EXPECT_DOUBLE_EQ(wide.half_width, 0.4) << "段内取最严的半宽";
+}
+
 TEST(RouteNetworkPlanner, BlockedLaneIsSkippedOthersStillRoute) {
   // 用户最关心的语义：路网拆成多段后，**被挡的那段单独剔除，其余仍可路由**。
   // 环 A-B-C-D 上把 B->C 挡死：从 A->B 边上的点去 C->D 边上的点，必须绕 D->A。
@@ -348,9 +432,9 @@ TEST(RouteNetworkPlanner, BlockedLaneIsSkippedOthersStillRoute) {
   ASSERT_NE(g, nullptr);
   for (const int ei : used) {
     const RouteEdge &e = g->edges()[static_cast<std::size_t>(ei)];
-    const std::string nm =
-        g->nodes()[static_cast<std::size_t>(e.from)].name + "->" +
-        g->nodes()[static_cast<std::size_t>(e.to)].name;
+    const std::string nm = g->nodes()[static_cast<std::size_t>(e.from)].name +
+                           "->" +
+                           g->nodes()[static_cast<std::size_t>(e.to)].name;
     EXPECT_NE(nm, "B->C") << "不应使用被挡的通道";
   }
   EXPECT_EQ(used.size(), 3u) << "应走 A->B / D->A / C->D 三条";
@@ -364,7 +448,8 @@ TEST(RouteNetworkPlanner, NoPathMessageNamesTheBlockedLane) {
   // 唯一通路必须经过被挡通道时：报错要**点名**，不能只说"有几条"
   auto map = MapBuilder(300, 300).rect(8.5, 4.5, 9.5, 5.5).build();
   MemoryParamReader p;
-  p.setString("route_network.routes_file", writeTempRoutes(ringYaml(false), "name"));
+  p.setString("route_network.routes_file",
+              writeTempRoutes(ringYaml(false), "name"));
   p.setBool("route_network.reject_infeasible", true);
   RouteNetworkPlanner planner;
   ASSERT_TRUE(planner.configure(p));
@@ -379,7 +464,9 @@ TEST(RouteNetworkPlanner, NoPathMessageNamesTheBlockedLane) {
   std::printf("      [点名] %s\n", r.message.c_str());
 }
 
-TEST(RouteNetworkPlanner, InfeasibleLaneIsRejected) {  // 在 e1（x=9，y 从 1 到 9）中间横一道墙 → 车体过不去
+TEST(RouteNetworkPlanner,
+     InfeasibleLaneIsRejected) { // 在 e1（x=9，y 从 1 到 9）中间横一道墙 →
+                                 // 车体过不去
   auto map = MapBuilder(300, 300).rect(8.5, 4.5, 9.5, 5.5).build();
   const std::string yaml = ringYaml(false);
 

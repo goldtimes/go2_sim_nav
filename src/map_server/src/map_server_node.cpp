@@ -37,6 +37,7 @@
 #include "pnc_2d/core/footprint_collision.hpp"
 #include "pnc_2d/core/map_zones.hpp"
 #include "pnc_2d/core/route_graph.hpp"
+#include "pnc_2d/msg/zone_array.hpp"
 
 namespace fs = std::filesystem;
 
@@ -69,6 +70,16 @@ public:
        false 同一取向）。默认关 = 忠实发布地图原意。 */
     unknown_as_free_ = declare_parameter<bool>("unknown_as_free", false);
 
+    /* 地图本体的**膨胀层** [m]（对障碍做圆形膨胀，默认 0 = 关）。
+       为什么要它：全局图是共享资产，消费它的模块不都会做朝向感知的车体扫掠
+       检查 —— RViz、以后接别的导航栈、以及任何"只看中心格"的快速判定，都会
+       把车使到离墙 0 的地方。给图加几 cm 余量后，"点在图上"就自动带上余量。
+       ⚠ 它会与 `footprint.safe_margin`（规划器自己的安全边）**叠加**：两个都开
+       时实际余量 = 两者之和（日志会把总值打出来，避免历史上踩过的"同一件事
+       算了两次"那种盲区）。不想要双份就把其中一个置 0。
+       ⚠ 只在**载图/重载时**生效（与禁行区烧入同一时机）。 */
+    inflate_ = declare_parameter<double>("inflate", 0.0);
+
     /* ---------------- 路网（**可选**资产） ----------------
        约定：与 map.yaml 同目录的 routes.yaml（换图四件套同源）。
        ⚠ 路网可有可无：站点没这个文件时只打一句
@@ -86,6 +97,13 @@ public:
     burn_zones_ = declare_parameter<bool>("zones.burn_into_map", true);
     zone_inflate_ =
         declare_parameter<double>("zones.inflate", -1.0); // <0 = 自动
+    /* 区域层几何的发布（latched）：**与"烧进全局图"互补**。
+       全局图只解决订阅它的人（全局规划器/RViz）；而局部用的是感知的滑动窗 +
+       ESDF，里面没有区域 ⇒ 必须把几何单独传过去，由局部自己融合。
+       限速区从来就不进栅格，只能靠这个话题传。 */
+    publish_zones_ = declare_parameter<bool>("publish_zones", true);
+    topic_zones_ =
+        declare_parameter<std::string>("topic_zones", "global_map/zones");
     // 参数改动立即写回成员。
     // ★ 为什么必须有：`declare_parameter` 只在启动时读一次，成员变量不会跟着
     //   `ros2 param set` 变。踩过：运行时设 zones.inflate=0 再调 LoadMap 重载，
@@ -102,6 +120,8 @@ public:
               zone_inflate_ = p.as_double();
             else if (p.get_name() == "zones.burn_into_map")
               burn_zones_ = p.as_bool();
+            else if (p.get_name() == "inflate")
+              inflate_ = p.as_double();
           }
           return r;
         });
@@ -154,6 +174,14 @@ public:
                   topic_routes_.c_str(),
                   routes_file_.empty() ? "<地图目录>/routes.yaml"
                                        : routes_file_.c_str());
+    }
+    if (publish_zones_) {
+      zones_pub_ = create_publisher<pnc_2d::msg::ZoneArray>(
+          topic_zones_, rclcpp::QoS(1).transient_local());
+      RCLCPP_INFO(
+          get_logger(),
+          "[map_server] 区域层：发布 %s（latched）| 局部据它适配禁行区/限速区",
+          topic_zones_.c_str());
     }
     if (publish_3d_) {
       cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
@@ -265,6 +293,27 @@ private:
     map_msg_ = toMsg(m);
     has_map_ = true;
 
+    // ---- 地图本体的膨胀层（障碍向外扩 inflate_ 米）：**发布之前**做 ----
+    //   顺序：先膨胀真障碍，再烧禁行区 —— 两者独立，日志也能分开归因。
+    dilated_cells_ = 0;
+    if (inflate_ > 0.0) {
+      const size_t occ_before = m.n_occupied;
+      dilated_cells_ = dilateOccupied(map_msg_.data, m.width, m.height,
+                                      m.resolution, inflate_, hard_threshold_);
+      map_msg_.header.stamp = now();
+      RCLCPP_INFO(
+          get_logger(),
+          "[map_server] 地图膨胀 %.3f m（%d 格，圆形）→ 新增占据 %zu 格"
+          "（%zu → %zu）%s",
+          inflate_,
+          std::max(1,
+                   static_cast<int>(std::ceil(inflate_ / m.resolution - 1e-9))),
+          dilated_cells_, occ_before, occ_before + dilated_cells_,
+          fp_.safe_margin > 0.0
+              ? "｜⚠ 与 footprint.safe_margin 叠加：规划器实际余量 ≈ 两者之和"
+              : "");
+    }
+
     // 区域层（禁行 / 限速）：必须**发布之前**烧进图，否则下游拿到的是旧图
     applyZones(dir_or_yaml);
 
@@ -283,13 +332,13 @@ private:
     const size_t total = m.n_occupied + m.n_free + m.n_unknown;
     /* unknown_as_free 时发布的图与文件语义不同：日志按**发布后**的统计打，
        否则会出现“日志说 93% 未知、图里却没有未知”的迷惑。
-       禁行区烧入的格子算在“占据”里，并从空闲/未知里扣掉。 */
-    const size_t pub_free =
-        m.n_free + (unknown_as_free_ ? m.n_unknown : 0) > burned_cells_
-            ? m.n_free + (unknown_as_free_ ? m.n_unknown : 0) - burned_cells_
-            : 0;
+       膨胀层/禁行区新增的格子都算在“占据”里，并从空闲/未知里扣掉。
+       （不算进去的话日志会自相矛盾：图上明明变多了，统计却说没变。） */
+    const size_t free_base = m.n_free + (unknown_as_free_ ? m.n_unknown : 0);
+    const size_t extra = dilated_cells_ + burned_cells_;
+    const size_t pub_free = free_base > extra ? free_base - extra : 0;
     const size_t pub_unknown = unknown_as_free_ ? 0 : m.n_unknown;
-    const size_t pub_occupied = m.n_occupied + burned_cells_;
+    const size_t pub_occupied = m.n_occupied + extra;
     RCLCPP_INFO(
         get_logger(),
         "[map_server] 已加载 %s\n"
@@ -302,6 +351,11 @@ private:
         m.origin_yaw, frame_id_.c_str(), pub_occupied, pub_free, pub_unknown,
         total, unknown_as_free_ ? "【未知已当空闲】 " : "", ms,
         topic_occ_.c_str());
+    if (dilated_cells_ > 0) {
+      RCLCPP_INFO(get_logger(),
+                  "[map_server] 其中 %zu 格来自**地图膨胀层**（%.3f m）",
+                  dilated_cells_, inflate_);
+    }
     if (burned_cells_ > 0) {
       RCLCPP_INFO(
           get_logger(),
@@ -360,55 +414,97 @@ private:
     zones_ = pnc_2d::ZoneSet();
     burned_cells_ = 0;
     zone_inflate_used_ = 0.0;
-    const std::string path = resolveRoutesFile(dir_or_yaml);
-    if (!fs::exists(path))
-      return; // 没有文件 = 没有区域，完全正常
+    /* 用 do-while(false) 当"带统一成功出口的失败返回"：
+       ★ 无论哪一条失败路上，最后都要**发布一次区域**（哪怕是空数组）——
+         latched 的空数组表示“这张图确实没有区域”，与“还没加载”是两回事，
+         消费者（局部）必须能区分：前者可以正常跑，后者应该保持今天的自由行为。
+     */
+    do {
+      const std::string path = resolveRoutesFile(dir_or_yaml);
+      if (!fs::exists(path))
+        break; // 没有文件 = 没有区域，完全正常
 
-    std::string err;
-    if (!zones_.loadFromFile(path, err)) {
-      RCLCPP_WARN(get_logger(),
-                  "[map_server] 区域层（zones）解析失败（不影响地图）：%s",
-                  err.c_str());
-      zones_ = pnc_2d::ZoneSet();
-      return;
-    }
-    for (const std::string &w : zones_.warnings()) {
-      RCLCPP_WARN(get_logger(), "[map_server] 区域层：%s", w.c_str());
-    }
-    if (zones_.empty())
-      return;
-    RCLCPP_INFO(get_logger(), "[map_server] 区域层：%s",
-                zones_.summary().c_str());
+      std::string err;
+      if (!zones_.loadFromFile(path, err)) {
+        RCLCPP_WARN(get_logger(),
+                    "[map_server] 区域层（zones）解析失败（不影响地图）：%s",
+                    err.c_str());
+        zones_ = pnc_2d::ZoneSet();
+        break;
+      }
+      for (const std::string &w : zones_.warnings()) {
+        RCLCPP_WARN(get_logger(), "[map_server] 区域层：%s", w.c_str());
+      }
+      if (zones_.empty())
+        break;
+      RCLCPP_INFO(get_logger(), "[map_server] 区域层：%s",
+                  zones_.summary().c_str());
 
-    // 膨胀量：默认车体**外接圆半径**（保证任何朝向都不侵入禁行区）
-    double inflate = zone_inflate_;
-    if (inflate < 0.0 && fp_.enable) {
-      inflate = std::hypot(fp_.length * 0.5 + fp_.safe_margin,
-                           fp_.width * 0.5 + fp_.safe_margin);
-    }
-    inflate = std::max(0.0, inflate);
-    zone_inflate_used_ = inflate;
-    if (zones_.forbiddenCount() == 0)
-      return;
-    if (!burn_zones_) {
-      RCLCPP_WARN(get_logger(), "[map_server] zones.burn_into_map=false → "
-                                "禁行区**不生效**（仅可视化）");
-      return;
-    }
+      // 膨胀量：默认车体**外接圆半径**（保证任何朝向都不侵入禁行区）
+      double inflate = zone_inflate_;
+      if (inflate < 0.0 && fp_.enable) {
+        inflate = std::hypot(fp_.length * 0.5 + fp_.safe_margin,
+                             fp_.width * 0.5 + fp_.safe_margin);
+      }
+      inflate = std::max(0.0, inflate);
+      zone_inflate_used_ = inflate;
+      if (zones_.forbiddenCount() == 0)
+        break; // 只有限速区：不进栅格，但要发布几何
+      if (!burn_zones_) {
+        RCLCPP_WARN(get_logger(), "[map_server] zones.burn_into_map=false → "
+                                  "禁行区**不生效**（仅可视化）");
+        break;
+      }
 
-    pnc_2d::CostMap2D cm;
-    if (!cm.set(static_cast<int>(map_msg_.info.width),
-                static_cast<int>(map_msg_.info.height),
-                map_msg_.info.resolution, map_msg_.info.origin.position.x,
-                map_msg_.info.origin.position.y, 0.0, map_msg_.data,
-                frame_id_)) {
-      RCLCPP_WARN(get_logger(), "[map_server] 禁行区烧入失败：地图无效");
+      pnc_2d::CostMap2D cm;
+      if (!cm.set(static_cast<int>(map_msg_.info.width),
+                  static_cast<int>(map_msg_.info.height),
+                  map_msg_.info.resolution, map_msg_.info.origin.position.x,
+                  map_msg_.info.origin.position.y, 0.0, map_msg_.data,
+                  frame_id_)) {
+        RCLCPP_WARN(get_logger(), "[map_server] 禁行区烧入失败：地图无效");
+        break;
+      }
+      std::vector<int8_t> burned;
+      burned_cells_ = pnc_2d::burnForbidden(zones_, cm, inflate, burned);
+      map_msg_.data = std::move(burned);
+      map_msg_.header.stamp = now();
+    } while (false);
+
+    publishZones();
+  }
+
+  /// 发布区域层几何（latched）。与"烧进全局图"互补：全局图只解决订阅它的人
+  /// （全局规划器/RViz），而局部用的是感知滑动窗 + ESDF（里面没有区域）⇒
+  /// 必须单独传几何，由局部自己融合；限速区本来就只能靠这里传。
+  void publishZones() {
+    if (!zones_pub_)
       return;
+    pnc_2d::msg::ZoneArray msg;
+    msg.header.stamp = now();
+    msg.header.frame_id = frame_id_;
+    msg.inflate = zone_inflate_used_;
+    msg.zones.reserve(zones_.zones().size());
+    for (const pnc_2d::MapZone &z : zones_.zones()) {
+      pnc_2d::msg::Zone out;
+      out.name = z.name;
+      out.type = pnc_2d::toString(z.type);
+      out.value = z.value;
+      for (const pnc_2d::Pose2D &p : z.polygon) {
+        geometry_msgs::msg::Point32 pt;
+        pt.x = static_cast<float>(p.x);
+        pt.y = static_cast<float>(p.y);
+        pt.z = 0.0f;
+        out.polygon.points.push_back(pt);
+      }
+      msg.zones.push_back(out);
     }
-    std::vector<int8_t> burned;
-    burned_cells_ = pnc_2d::burnForbidden(zones_, cm, inflate, burned);
-    map_msg_.data = std::move(burned);
-    map_msg_.header.stamp = now();
+    zones_pub_->publish(msg);
+    RCLCPP_INFO(get_logger(),
+                "[map_server] 区域层发布：%zu 个（禁行 %zu / 限速 %zu），"
+                "inflate %.3f m",
+                msg.zones.size(), zones_.forbiddenCount(), zones_.speedCount(),
+                zone_inflate_used_);
   }
 
   /// 区域层可视化：禁行区红框 + 名字；限速区橙框 + "0.3 m/s"
@@ -859,6 +955,9 @@ private:
   pnc_2d::RouteGraph routes_;
   bool has_routes_{false};
   std::vector<int> infeasible_edges_;
+  // 地图本体的膨胀层（障碍向外扩 inflate_ 米；见 loadAndPublish 里的注释）
+  double inflate_{0.0};
+  std::size_t dilated_cells_{0};
   // 区域层（禁行 / 限速）
   pnc_2d::ZoneSet zones_;
   bool burn_zones_{true};
@@ -866,6 +965,10 @@ private:
   double zone_inflate_{-1.0};
   double zone_inflate_used_{0.0};
   std::size_t burned_cells_{0};
+  // 区域层几何的发布（latched，给局部等消费者；与"烧进全局图"互补）
+  bool publish_zones_{true};
+  std::string topic_zones_;
+  rclcpp::Publisher<pnc_2d::msg::ZoneArray>::SharedPtr zones_pub_;
   pnc_2d::FootprintParams fp_;
   int hard_threshold_{80};
   bool unknown_as_occupied_{true};

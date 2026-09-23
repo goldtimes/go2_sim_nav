@@ -238,6 +238,50 @@ bool ZoneSet::loadFromString(const std::string &yaml, std::string &err) {
   return true;
 }
 
+/// 消息 → 内部表示。
+///
+/// 校验规则必须与 loadFromString 一致：不然会出现“文件里合法、运行时消息里非法”
+/// 这种分叉 ——
+/// 两边判定不一致是最难查的一类问题（同一个区域，全局说能过、局部说不能）。
+bool ZoneSet::adopt(std::vector<MapZone> zones) {
+  zones_.clear();
+  warnings_.clear();
+  valid_ =
+      true; // 空集也是“有效的空集”（= 这张图确实没有区域），与“还没加载”不同
+  for (std::size_t i = 0; i < zones.size(); ++i) {
+    MapZone z = std::move(zones[i]);
+    std::string tag = "区域[" + std::to_string(i) + "]";
+    if (z.name.empty())
+      z.name = tag;
+    else
+      tag += "（" + z.name + "）";
+    if (z.polygon.size() < 3) {
+      warnings_.push_back(tag + "顶点 < 3 → 丢弃");
+      continue;
+    }
+    if (z.type == ZoneType::kSpeedLimit && z.value <= 0.0) {
+      warnings_.push_back(tag + "限速值非法 → 按 0.3 m/s 处理");
+      z.value = 0.3;
+    }
+    if (z.type == ZoneType::kForbidden)
+      z.value = 0.0;
+    z.min_x = z.max_x = z.polygon[0].x;
+    z.min_y = z.max_y = z.polygon[0].y;
+    for (const Pose2D &p : z.polygon) {
+      z.min_x = std::min(z.min_x, p.x);
+      z.max_x = std::max(z.max_x, p.x);
+      z.min_y = std::min(z.min_y, p.y);
+      z.max_y = std::max(z.max_y, p.y);
+    }
+    if (z.max_x - z.min_x < 1e-6 || z.max_y - z.min_y < 1e-6)
+      warnings_.push_back(tag + "面积近似为 0，可能退化");
+    zones_.push_back(std::move(z));
+  }
+  if (zones_.empty() && !zones.empty())
+    warnings_.push_back("所有区域都不合法 → 视为无区域（行为回到自由空间）");
+  return !zones_.empty();
+}
+
 std::size_t ZoneSet::forbiddenCount() const {
   std::size_t n = 0;
   for (const MapZone &z : zones_) {
@@ -266,6 +310,18 @@ bool ZoneSet::inForbidden(double x, double y) const {
       return true;
   }
   return false;
+}
+
+std::string ZoneSet::forbiddenNameAt(double x, double y) const {
+  for (const MapZone &z : zones_) {
+    if (z.type != ZoneType::kForbidden)
+      continue;
+    if (x < z.min_x || x > z.max_x || y < z.min_y || y > z.max_y)
+      continue;
+    if (pointInPolygon(x, y, z.polygon))
+      return z.name;
+  }
+  return {};
 }
 
 bool ZoneSet::inSpeedZone(double x, double y, double &limit) const {
@@ -344,6 +400,125 @@ std::size_t burnForbidden(const ZoneSet &zones, const CostMap2D &map,
     }
   }
   return burned;
+}
+
+double zoneSpeedLimitAhead(const ZoneSet &zones, const std::vector<Pose2D> &pts,
+                           std::size_t from, double lookahead, double step) {
+  if (zones.empty() || zones.speedCount() == 0 || pts.empty())
+    return 0.0;
+  if (from >= pts.size())
+    from = pts.size() - 1;
+  const double s = (step > 0.0) ? step : 0.25;
+  double best = 0.0;
+  double acc = 0.0;
+  double l = 0.0;
+  auto consider = [&](double x, double y) {
+    if (zones.inSpeedZone(x, y, l) && (best <= 0.0 || l < best))
+      best = l;
+  };
+  // ★ 起点那一点**无条件**查（这就是 `lookahead <= 0` 的"只看起点"语义：
+  //   把 0 当成"整条路径"会让一个漏传参数的调用方莫名其妙地全程限速）。
+  consider(pts[from].x, pts[from].y);
+  // 之后沿**线段**按弧长步进，而不是只看路径点：路径可能是只有两个点的直线，
+  // 中间的小限速区会被整个跳过（见头文件里的实测记录）。
+  for (std::size_t i = from; i + 1 < pts.size(); ++i) {
+    const double dx = pts[i + 1].x - pts[i].x;
+    const double dy = pts[i + 1].y - pts[i].y;
+    const double seg = std::hypot(dx, dy);
+    if (seg <= 1e-9)
+      continue;
+    const int n = std::max(1, static_cast<int>(std::ceil(seg / s)));
+    for (int k = 1; k <= n; ++k) {
+      acc += seg / n;
+      if (acc > lookahead)
+        return best;
+      const double f = static_cast<double>(k) / static_cast<double>(n);
+      consider(pts[i].x + f * dx, pts[i].y + f * dy);
+    }
+  }
+  return best;
+}
+
+namespace {
+/// 折线上离 (x, y) 最近的投影：段下标 + 段内比例。
+/// 折线为空返回 false；单点折线返回 seg=0、t=0。
+bool closestProjection(const std::vector<Pose2D> &pts, double x, double y,
+                       std::size_t &seg, double &t) {
+  if (pts.empty())
+    return false;
+  if (pts.size() == 1) {
+    seg = 0;
+    t = 0.0;
+    return true;
+  }
+  double best_d = std::numeric_limits<double>::max();
+  for (std::size_t i = 0; i + 1 < pts.size(); ++i) {
+    const double dx = pts[i + 1].x - pts[i].x;
+    const double dy = pts[i + 1].y - pts[i].y;
+    const double L2 = dx * dx + dy * dy;
+    double tt = 0.0;
+    if (L2 > 1e-18)
+      tt = std::max(
+          0.0, std::min(1.0, ((x - pts[i].x) * dx + (y - pts[i].y) * dy) / L2));
+    const double d =
+        std::hypot(x - (pts[i].x + tt * dx), y - (pts[i].y + tt * dy));
+    if (d < best_d) {
+      best_d = d;
+      seg = i;
+      t = tt;
+    }
+  }
+  return true;
+}
+} // namespace
+
+double zoneSpeedLimitAheadFromProjection(const ZoneSet &zones,
+                                         const std::vector<Pose2D> &pts,
+                                         double x, double y, double lookahead,
+                                         double step) {
+  if (zones.empty() || zones.speedCount() == 0 || pts.empty())
+    return 0.0;
+  double l = 0.0;
+  if (pts.size() == 1)
+    return zones.inSpeedZone(pts[0].x, pts[0].y, l) ? l : 0.0;
+
+  std::size_t seg = 0;
+  double t = 0.0;
+  if (!closestProjection(pts, x, y, seg, t))
+    return 0.0;
+  const double s = (step > 0.0) ? step : 0.25;
+
+  // 虚拟折线：0 号点 = 投影点，之后是 pts[seg+1..]。
+  // 于是"从车当前位置往前走"是一段**连续弧长**，与路点密度无关。
+  double cur_x = pts[seg].x + t * (pts[seg + 1].x - pts[seg].x);
+  double cur_y = pts[seg].y + t * (pts[seg + 1].y - pts[seg].y);
+  double best = 0.0;
+  double acc = 0.0;
+  auto consider = [&](double ax, double ay) {
+    if (zones.inSpeedZone(ax, ay, l) && (best <= 0.0 || l < best))
+      best = l;
+  };
+  // 投影点自己（acc = 0）：这就是 `lookahead <= 0` 的"只看当前位置"语义
+  consider(cur_x, cur_y);
+
+  for (std::size_t k = seg + 1; k < pts.size(); ++k) {
+    const double nx = pts[k].x;
+    const double ny = pts[k].y;
+    const double seg_d = std::hypot(nx - cur_x, ny - cur_y);
+    if (seg_d > 1e-9) {
+      const int n = std::max(1, static_cast<int>(std::ceil(seg_d / s)));
+      for (int i = 1; i <= n; ++i) {
+        acc += seg_d / static_cast<double>(n);
+        if (acc > lookahead)
+          return best;
+        const double f = static_cast<double>(i) / static_cast<double>(n);
+        consider(cur_x + f * (nx - cur_x), cur_y + f * (ny - cur_y));
+      }
+    }
+    cur_x = nx;
+    cur_y = ny;
+  }
+  return best;
 }
 
 } // namespace pnc_2d

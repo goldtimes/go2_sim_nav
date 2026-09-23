@@ -330,22 +330,39 @@ def route_plumbing_check():
     local。任何一段断了，**表面上完全看不出来**：路径仍然是沿通道算的，只是局部
     拿不到宽度，于是当自由空间跟——"贴线走"静默失效（实际就静默失效了好几轮）。
     所以这里直接看两处独立证据：manager 日志的走廊摘要 + 局部状态里的 route_mode。
+
+    ★ 2026-09-23 修正（P5.4 “先自由上线、再严格贴线”之后 G1 必领新语义）：
+      走廊**不再在收到目标时立即生效**，而是“车回到走廊里”之后才启用
+      （从车道外用硬约束收敛实测不可行）。所以本阶段必须**让车真的开**
+      （`probe.drive = True` + 给图/给场，否则 MPC 降级爬行），并等它上线；
+      以前车是“钉在原地”的（drive=False），在旧语义下 route_mode 也会立刻为
+      true，于是能勉强通过 —— 现在那样永远等不到，只能看到一直 `走廊行0`。
     """
     proc, log = launch("mpc", planner_type="route_network")
     rclpy.init()
     probe = Probe(start=(0.0, 0.03, 0.0))
+    probe.drive = True          # 必须让车动：走廊只在“车已在走廊里”后生效
+    probe.send_map = True
+    probe.send_esdf = True
     ok = True
     try:
         probe.spin(6.0)
         probe.pub_map.publish(load_map_msg(MAP_DIR))
         probe.spin(1.5)
         probe.send_goal(9.85, -5.33)     # 路网上的点（与 E2E-1/2/3 同一个目标）
-        probe.spin(8.0)
+        # 等它“回到走廊里”（上限 30 s；上线后立即可停）
+        route = False
+        t0 = time.time()
+        while time.time() - t0 < 30.0:
+            probe.spin(0.5)
+            if any(m.route_mode for m in probe.local):
+                route = True
+                break
         seen = {m.status_name for m in probe.local}
-        route = any(m.route_mode for m in probe.local)
-        print(f"       局部状态 {sorted(seen)} / route_mode={route}")
+        print(f"       局部状态 {sorted(seen)} / route_mode={route} "
+              f"/ 走了 {probe.traveled:.2f} m")
         chk("[G1] ★ route 模式到了局部（route_mode=true）", route,
-            f"从来没报过 route_mode，状态 {sorted(seen)}")
+            f"从来没报过 route_mode，状态 {sorted(seen)}，走了 {probe.traveled:.2f} m")
         txt = open(log, encoding="utf-8", errors="replace").read()
         chk("[G2] manager 把走廊写进了日志（说明响应里真的带上了）",
             "走廊 有" in txt, "日志里没有『走廊 有』")

@@ -111,6 +111,20 @@ protected:
   double prune_max_span_m_{8.0};
   double path_resample_spacing_{0.0};
   bool keep_start_yaw_{true};
+  /// ★ **净距偏好**（2026-09-23 用户要求："让局部远离障碍/禁行区"）
+  ///   `planner.clearance_prefer_dist`：希望离障碍至少这么远 [m]（0 = 关）；
+  ///   `planner.clearance_cost_weight`：低于它时每米额外代价的权重（0 = 关）。
+  ///
+  /// 为什么不能用"把 map_server.inflate 调大"来达到同样目的：硬膨胀是**约束**，
+  ///   会直接把窄通道判死（用户定的规则：机体 0.40 + 左右各 10 cm = 最窄可通
+  ///   0.60 m ⇒ 硬判据必须停在 `半宽 + margin + inflate = 0.30 m`）；
+  ///   而这里是**偏好**：窄通道仍可走，只是代价高一点 ⇒ 空处自动走中间，
+  ///   窄处照样过得去。
+  /// 另外一个必要性：全局图（map_server 膨胀后）往往是全 0/100、**没有软代价格**
+  ///   ⇒ `common.soft_cost_weight` 实际上是空转的；这里直接用精确距离场算，与
+  ///   地图原始值无关，一定生效。
+  double clearance_prefer_dist_{0.0};
+  double clearance_cost_weight_{0.0};
 
   std::shared_ptr<const CostMap2D> map_;
   std::unique_ptr<ClearanceField> clearance_;

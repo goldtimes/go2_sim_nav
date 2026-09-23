@@ -41,5 +41,17 @@ int32 windows_tried
 bool has_corridor
 float64 corridor_half_width       # [m]；0 = 严格贴线（遇障只能停）
 float64 corridor_speed_limit      # [m/s]；0 = 不限
+float64 zone_speed_limit          # 限速区沿路径的最严限速 [m/s]；0 = 不限
+                                  # 与 corridor_speed_limit 分开算，调用方取最小
 bool strict_corridor              # = has_corridor 且 half_width <= 0
 int32[] route_edges               # 用到的通道下标（诊断/可视化）
+
+# ---- 逐点走廊半宽（数组长度 = path.poses.size()）----
+#   w >  0  →  该点允许横向偏离 ±w
+#   w == 0  →  该点**严格贴线**（半宽 0）
+#   w <  0  →  该点**没有走廊约束**（自由跟踪：hybrid 的自由入口/出口段）
+#   空数组 →  调用方没提供，按标量 corridor_half_width 整条路径处理（兼容旧行为）
+# ★ 为什么需要它：hybrid 模式下路径 = [自由入口段, 路网段, 自由出口段]，
+#   走廊**只对路网段有意义**。若把入口段也当成"严格贴线的中心线"，车在车道外
+#   几厘米处就被硬约束判死（实测横向偏差 ≥0.055 m ⇒ 求解器不收敛、车一步不动）。
+float64[] corridor_width

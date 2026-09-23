@@ -44,9 +44,28 @@ void FootprintCollisionChecker::configure(const FootprintParams & fp, int hard_t
                                           bool unknown_as_occupied)
 {
   fp_ = fp;
+  fp_eff_ = fp;
+  if (margin_overridden_) setMarginOverride(margin_override_);   // 保留 override 语义
   hard_threshold_ = hard_threshold;
   unknown_as_occupied_ = unknown_as_occupied;
   if (map_) buildDirectionOffsets();
+}
+
+void FootprintCollisionChecker::setMarginOverride(double m)
+{
+  margin_override_ = m;
+  margin_overridden_ = true;
+  fp_eff_ = fp_;
+  fp_eff_.safe_margin = m;
+  // 快路径的方向预计算表是按 fp_ 建的，override 下不适用
+  fp_eff_.fast_path = false;
+}
+
+void FootprintCollisionChecker::clearMarginOverride()
+{
+  margin_overridden_ = false;
+  margin_override_ = -1.0;
+  fp_eff_ = fp_;
 }
 
 void FootprintCollisionChecker::setMap(const CostMap2D * map)
@@ -72,21 +91,33 @@ bool FootprintCollisionChecker::pointLethal(double wx, double wy) const
   return cellLethal(x, y);
 }
 
-void FootprintCollisionChecker::rectOffsets(double yaw, std::vector<Cell> & out) const
+double FootprintCollisionChecker::distanceToLethal(double wx, double wy) const
+{
+  if (!cf_ || !cf_->valid()) return std::numeric_limits<double>::quiet_NaN();
+  if (!map_ || !map_->valid()) return std::numeric_limits<double>::quiet_NaN();
+  int cx = 0;
+  int cy = 0;
+  if (!map_->worldToGrid(wx, wy, cx, cy)) return 0.0;   // 图外：按"贴着障碍"算
+  return cf_->distanceToLethal(cx, cy);
+}
+
+void FootprintCollisionChecker::rectOffsets(double yaw, std::vector<Cell> & out,
+                                            const FootprintParams * fp) const
 {
   out.clear();
   if (!map_ || !map_->valid()) return;
+  const FootprintParams & f = (fp != nullptr) ? *fp : fp_eff_;
 
   const double c = std::cos(yaw);
   const double s = std::sin(yaw);
   const double ux = c;
   const double uy = s;              // 长轴 = 朝向
-  const double hu = fp_.halfLength();
-  const double hv = fp_.halfWidth();
+  const double hu = f.halfLength();
+  const double hv = f.halfWidth();
 
   // 矩形中心相对"当前格中心"的偏移（offset 定义在机体系）
-  const double rx = fp_.offset_x * c - fp_.offset_y * s;
-  const double ry = fp_.offset_x * s + fp_.offset_y * c;
+  const double rx = f.offset_x * c - f.offset_y * s;
+  const double ry = f.offset_x * s + f.offset_y * c;
 
   const double res = map_->resolution();
   const double ext_x = hu * std::fabs(ux) + hv * std::fabs(s);
@@ -134,10 +165,21 @@ std::size_t FootprintCollisionChecker::offsetsAtYaw(double yaw) const
   return tmp.size();
 }
 
-bool FootprintCollisionChecker::fullCheckAtCell(int cx, int cy, double yaw) const
+bool FootprintCollisionChecker::fullCheckAtCell(int cx, int cy, double yaw,
+                                               const FootprintParams * fp) const
 {
   ++full_checks_;
-  const int dir = directionIndex(yaw);
+  // 用外部 footprint（例如"去掉 safe_margin"）：预计算表不适用，直接算
+  if (fp != nullptr) {
+    std::vector<Cell> offs;
+    rectOffsets(yaw, offs, fp);
+    for (const Cell & o : offs) {
+      if (cellLethal(cx + o.dx, cy + o.dy)) return true;
+    }
+    return false;
+  }
+  // override 生效期间同样不能用预计算表（表是按原 margin 建的）
+  const int dir = margin_overridden_ ? -1 : directionIndex(yaw);
   if (dir >= 0) {
     for (const Cell & o : dir_offsets_[static_cast<std::size_t>(dir)]) {
       if (cellLethal(cx + o.dx, cy + o.dy)) return true;
@@ -160,21 +202,42 @@ bool FootprintCollisionChecker::poseInCollision(double wx, double wy, double yaw
   int cy = 0;
   if (!map_->worldToGrid(wx, wy, cx, cy)) return true;   // 图外 = 碰撞
 
-  if (!fp_.enable) return cellLethal(cx, cy);            // 退化为点判定
+  if (!fp_eff_.enable) return cellLethal(cx, cy);          // 退化为点判定
 
-  // ---- 快路径：一次查表 + 两个阈值 ----
-  if (fp_.fast_path && cf_ != nullptr && cf_->valid() &&
+  // ---- 快路径：一次查表 + 两个阈值（override 生效时 fp_eff_.fast_path 已置 false）----
+  if (fp_eff_.fast_path && cf_ != nullptr && cf_->valid() &&
       cf_->width() == map_->width() && cf_->height() == map_->height())
   {
-    const double offs = std::hypot(fp_.offset_x, fp_.offset_y);
-    if (cf_->lowerBoundM(cx, cy) - offs >= fp_.circumscribedRadius()) {
+    const double offs = std::hypot(fp_eff_.offset_x, fp_eff_.offset_y);
+    if (cf_->lowerBoundM(cx, cy) - offs >= fp_eff_.circumscribedRadius()) {
       return false;                                      // 任何朝向都安全
     }
-    if (cf_->upperBoundM(cx, cy) + offs < fp_.inscribedRadius()) {
+    if (cf_->upperBoundM(cx, cy) + offs < fp_eff_.inscribedRadius()) {
       return true;                                       // 任何朝向都碰撞
     }
   }
   return fullCheckAtCell(cx, cy, yaw);
+}
+
+bool FootprintCollisionChecker::poseInCollisionNoMargin(double wx, double wy,
+                                                       double yaw) const
+{
+  return poseInCollisionAtMargin(wx, wy, yaw, 0.0);
+}
+
+bool FootprintCollisionChecker::poseInCollisionAtMargin(double wx, double wy,
+                                                       double yaw,
+                                                       double margin) const
+{
+  if (!map_ || !map_->valid()) return true;
+  int cx = 0;
+  int cy = 0;
+  if (!map_->worldToGrid(wx, wy, cx, cy)) return true;   // 图外 = 碰撞
+  if (!fp_.enable) return cellLethal(cx, cy);            // 退化为点判定
+  FootprintParams f0 = fp_;
+  f0.safe_margin = margin;   // 0 = 真实轮廓；负 = 把轮廓缩小（问“穿透多深”）
+  f0.fast_path = false;      // 快路径表是按含余量的 footprint 建的
+  return fullCheckAtCell(cx, cy, yaw, &f0);
 }
 
 void FootprintCollisionChecker::cornerWorld(double x, double y, double yaw, int i,

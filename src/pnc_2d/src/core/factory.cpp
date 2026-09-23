@@ -1,5 +1,6 @@
 #include "pnc_2d/core/factory.hpp"
 
+#include "pnc_2d/core/replan_recovery.hpp"
 #include "pnc_2d/global/astar_planner.hpp"
 #include "pnc_2d/global/route_network_planner.hpp"
 #include "pnc_2d/local/mpc_local_planner.hpp"
@@ -37,12 +38,14 @@ std::vector<std::string> availableLocalPlanners() {
   return {"none", "null", "mpc"};
 }
 
-std::unique_ptr<RecoveryBehavior> createRecoveryBehavior(const std::string &type) {
-  (void)type;
-  // 本期（P3）无实现：接口先立着，P6 填（清图 / 后退 / 请求重规划…）
+std::unique_ptr<RecoveryBehavior>
+createRecoveryBehavior(const std::string &type) {
+  if (type == "replan")
+    return std::make_unique<ReplanRecoveryBehavior>();
+  // 其它类型（清图 / 后退 / 旋转…）以后再加：接口已立着（P3 起）。
   return nullptr;
 }
 
-std::vector<std::string> availableRecoveries() { return {}; }
+std::vector<std::string> availableRecoveries() { return {"replan"}; }
 
 } // namespace pnc_2d

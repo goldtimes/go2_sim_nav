@@ -310,7 +310,8 @@ PlanResult RouteNetworkPlanner::planOnGraph(const PlanRequest &req) {
       const int k = pa[static_cast<std::size_t>(cur)];
       if (p < 0 || k < 0)
         break;
-      seq.push_back(adj[static_cast<std::size_t>(p)][static_cast<std::size_t>(k)].edge);
+      seq.push_back(
+          adj[static_cast<std::size_t>(p)][static_cast<std::size_t>(k)].edge);
       cur = p;
     }
     std::reverse(seq.begin(), seq.end());
@@ -337,8 +338,8 @@ PlanResult RouteNetworkPlanner::planOnGraph(const PlanRequest &req) {
       if (names.empty())
         names = "（无法定位到具体通道）";
       res.message =
-          "路网内连不通：唯一通路必须经过车体过不去的通道 " + names +
-          "（共 " + std::to_string(infeasible_count_) +
+          "路网内连不通：唯一通路必须经过车体过不去的通道 " + names + "（共 " +
+          std::to_string(infeasible_count_) +
           " 条不可行；可把 route_network.reject_infeasible 设为 false 强行走，"
           "或修通道/地图/禁行区膨胀）";
       res.stats.expanded_nodes = expanded;
@@ -468,7 +469,8 @@ PlanResult RouteNetworkPlanner::planOnGraph(const PlanRequest &req) {
     res.message = msg;
   }
   // 走廊摘要：只统计**真正走到**的通道（last_route_edges_）。取最严的一条：
-  // 半宽取最小、限速取最小（0 = 不限，不参与取最小，否则"不限"会被误当成 0 限速）。
+  // 半宽取最小、限速取最小（0 = 不限，不参与取最小，否则"不限"会被误当成 0
+  // 限速）。
   if (!last_route_edges_.empty()) {
     double hw = std::numeric_limits<double>::infinity();
     double sl = std::numeric_limits<double>::infinity();
@@ -486,6 +488,49 @@ PlanResult RouteNetworkPlanner::planOnGraph(const PlanRequest &req) {
     if (std::isfinite(sl))
       res.corridor_speed_limit = sl;
     res.route_edges = last_route_edges_;
+
+    // ★★ 逐点走廊半宽：**只有真正落在通道上的点才受走廊约束**。
+    //
+    // hybrid 模式下 full = [自由入口段, 路网段, 自由出口段]。入口段是"自由空间
+    // 走位"（车可能离车道几十厘米、机头还偏着），把它也当成"严格贴线的中心线"
+    // 会让局部在车道外几厘米处就被硬约束判死：实测起点横向偏差 ≥ 0.055 m 时
+    // 求解器不收敛（`maximum iterations reached`）、120/120
+    // 周期被挡、车一步不动，
+    // 现场现象就是用户报的"**有角度的路网时机器基本不会动**"。
+    //
+    // 逐点之后语义就清楚了：入口/出口段 `<=
+    // 0`（自由跟踪，先把车带到车道上并对正）， 上了车道才 `=
+    // 通道半宽`（严格贴线）。局部节点据此只在"车真在走廊里"时启用硬约束。
+    //
+    // 用几何判定（点到各通道中心线的距离）而不是下标区间：`pushUnique`
+    // 会把重合点 合并、首尾补段又各加几个点，下标区间很容易错位一两点 ——
+    // 而错一点就是"整段 走廊要么多一截、要么少一截"，症状很难查。
+    {
+      // “这个点在不在车道中心线上”的容差：取**固定的几何误差量级**（地图离散/
+      // 折线简化/重采样），**不能**随走廊半宽放大 —— 拿 max(0.05, w)
+      // 会让“离车道 0.5 m
+      // 的入口点”也算成车道点，于是交给局部的走廊中心线前面挂着一段 偏离车道
+      // 0.5 m 的曲线，严格贴线贴的就是那段（实测贴线偏差 0.12~0.17 m）。
+      const double on_lane_tol = 0.05;
+      std::vector<double> w(full.size(), -1.0); // <0 = 该点无走廊约束
+      for (std::size_t i = 0; i < full.size(); ++i) {
+        double best_d = std::numeric_limits<double>::infinity();
+        double best_w = -1.0;
+        for (const int ei : last_route_edges_) {
+          if (ei < 0 || ei >= static_cast<int>(edges.size()))
+            continue;
+          const RouteEdge &e = edges[static_cast<std::size_t>(ei)];
+          const double d = distanceToPolyline(full[i].x, full[i].y, e.polyline);
+          if (d < best_d) {
+            best_d = d;
+            best_w = std::max(0.0, e.corridor_width);
+          }
+        }
+        if (best_d <= on_lane_tol)
+          w[i] = best_w;
+      }
+      res.corridor_width_per_point = std::move(w);
+    }
   }
   res.path = std::move(full);
   res.stats.expanded_nodes = expanded;

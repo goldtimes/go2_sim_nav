@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 
 namespace pnc_2d {
@@ -22,6 +23,23 @@ struct QNodeGreater {
 
 const int kDx8[8] = {1, 1, 0, -1, -1, -1, 0, 1};
 const int kDy8[8] = {0, 1, 1, 1, 0, -1, -1, -1};
+
+/// 日志里报长度用：固定两位小数（免得出现 0.242412 这种噪声数字）
+std::string number(double v)
+{
+  if (!std::isfinite(v)) return "n/a";
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%.3f", v);
+  return buf;
+}
+
+/// 起点朝向：请求里给了就用它（控制器要先原地对正），没给就用"走向终点"的方向。
+double startYawOf(const PlanRequest & req)
+{
+  const double to_goal =
+      std::atan2(req.goal.y - req.start.y, req.goal.x - req.start.x);
+  return req.start.has_yaw ? req.start.yaw : to_goal;
+}
 
 }  // namespace
 
@@ -50,6 +68,9 @@ bool AStarPlanner::configure(const ParamReader & params)
   max_iterations_ = std::max<long>(iters, 1);
   max_search_time_ms_ = params.getDouble(px + ".max_search_time_ms", max_search_time_ms_);
   if (max_search_time_ms_ <= 0.0) max_search_time_ms_ = 1.0e9;
+  start_escape_radius_ =
+      params.getDouble(px + ".start_escape_radius", start_escape_radius_);
+  if (start_escape_radius_ < 0.0) start_escape_radius_ = 0.0;
 
   clearBuffers();
   return true;
@@ -155,13 +176,21 @@ PlanResult AStarPlanner::searchInWindow(const PlanRequest & req, const SearchWin
     return res;
   }
   if (collision_.poseInCollision(req.start.x, req.start.y, start_yaw)) {
+    const double d = collision_.distanceToLethal(req.start.x, req.start.y);
     res.status = PlannerStatus::kStartFootprintCollision;
-    res.message = "起点处车体轮廓与障碍重叠";
+    res.message = "起点处车体与障碍重叠（中心净距 " + number(d) + " m；需求 " +
+                  number(collision_.footprint().inscribedRadius()) + " m" +
+                  (virtual_start_enabled_
+                       ? "；周边 " + number(start_escape_radius_) +
+                             " m 内没找到可通行的救命位姿"
+                       : "；虚拟起点已关") +
+                  "）";
     return res;
   }
   if (collision_.poseInCollision(req.goal.x, req.goal.y, goal_yaw)) {
     res.status = PlannerStatus::kGoalFootprintCollision;
-    res.message = "终点处车体轮廓与障碍重叠";
+    const double d = collision_.distanceToLethal(req.goal.x, req.goal.y);
+    res.message = "终点处车体轮廓与障碍重叠（净距 " + number(d) + " m）";
     return res;
   }
 
@@ -210,13 +239,13 @@ PlanResult AStarPlanner::searchInWindow(const PlanRequest & req, const SearchWin
     if (expanded > max_iterations_) {
       res.status = PlannerStatus::kMaxIterations;
       res.message = "扩展节点数超过上限";
-      res.stats.expanded_nodes = expanded;
+  res.stats.expanded_nodes = expanded;
       return res;
     }
     if ((expanded & 1023) == 0 && msSince(t0) > max_search_time_ms_) {
       res.status = PlannerStatus::kTimeout;
       res.message = "搜索时间超过上限";
-      res.stats.expanded_nodes = expanded;
+  res.stats.expanded_nodes = expanded;
       return res;
     }
 
@@ -243,7 +272,8 @@ PlanResult AStarPlanner::searchInWindow(const PlanRequest & req, const SearchWin
       double wx = 0.0;
       double wy = 0.0;
       map_->gridToWorld(nx, ny, wx, wy);
-      if (collision_.poseInCollision(wx, wy, yaw)) continue;   // 矩形 footprint
+      const bool hit = collision_.poseInCollision(wx, wy, yaw);
+      if (hit) continue;   // 矩形 footprint
 
       const double step = diagonal ? res_m * kSqrt2 : res_m;
       const double extra = cellExtraCost(nx, ny);
@@ -280,11 +310,108 @@ PlanResult AStarPlanner::searchInWindow(const PlanRequest & req, const SearchWin
   }
   postProcessPath(res.path, req);
   res.status = PlannerStatus::kSuccess;
-  res.message = "ok";
+  res.message = relax_note_.empty() ? std::string("ok") : ("ok | " + relax_note_);
   return res;
 }
 
 PlanResult AStarPlanner::plan(const PlanRequest & req)
+{
+  relax_note_.clear();
+  // ==========================================================================
+  // 起点已经在“余量带”里 ⇒ **换一个虚拟起点**，并把车当前位置插成首点。
+  //
+  // 现场：全局图是 map_server 发的（障碍已按 `map_server.inflate` 膨胀、禁行区已按
+  // `zones.inflate` 烧入），局部用感知的未膨胀图 + 自己的距离场。两边**图不同源**
+  // 加栅格离散化（±半格），“全局刚判过、起点恰好擦进余量”是常态
+  // （实测：车离禁行区多边形 0.28 m，图上量到 0.224 m，含余量需求 0.25 ⇒ 差 1 mm）。
+  // 起点一律判死 ⇒ 恢复重规划也失败 ⇒ 任务永久 FAILED。
+  //
+  // ★ 为什么不能“放宽判据”（试过两版，都被实测否掉，见头文件）：
+  //   ① 放宽整条路径 ⇒ 一路贴墙走；② 只放宽起点附近 ⇒ 车侧面对着墙时，
+  //   栅格 A*（节点朝向 = 运动方向）根本出不去（实测 NO_PATH）。
+  // ★ 正确分工：**全局只规划“从合法位姿出发”的路**；把车从那 10 cm 挪出来的活
+  //   交给**局部**（MPC 真的会转方向，能做侧向挪出来这种动作）。
+  //   所以：在起点周边找一个完整判据可通的**虚拟起点**，从它开始搜；
+  //   成功则把**车当前位置**插成路径首点（这一段由局部走出来）。
+  // ==========================================================================
+  PlanRequest req_eff = req;
+  bool use_virtual = false;
+  double vs_dist = 0.0;
+  if (map_ && map_->valid() && virtual_start_enabled_ &&
+      start_escape_radius_ > 0.0 && std::isfinite(req.start.x) &&
+      std::isfinite(req.start.y) && std::isfinite(req.goal.x) &&
+      std::isfinite(req.goal.y) &&
+      collision_.poseInCollision(req.start.x, req.start.y, startYawOf(req)) &&
+      // 守卫：只有**真实轮廓**（safe_margin=0）仍放得下时才救 —— 真实轮廓都放不下
+      // 说明车已经真的压上去了（或者离障碍只剩不到半车宽），这时应停下来报错交人工，
+      // 而不是规划一条“从重叠位置开出去”的路（那样只会擦得更厉害）。
+      !collision_.poseInCollisionAtMargin(req.start.x, req.start.y,
+                                          startYawOf(req), 0.0)) {
+    int scx = 0;
+    int scy = 0;
+    if (map_->worldToGrid(req.start.x, req.start.y, scx, scy)) {
+      const double d0 = collision_.distanceToLethal(req.start.x, req.start.y);
+      const int r_cells = static_cast<int>(
+          std::ceil(start_escape_radius_ / map_->resolution()));
+      double best_d2 = std::numeric_limits<double>::infinity();
+      int bx = -1;
+      int by = -1;
+      for (int dy = -r_cells; dy <= r_cells; ++dy) {
+        for (int dx = -r_cells; dx <= r_cells; ++dx) {
+          const int nx = scx + dx;
+          const int ny = scy + dy;
+          if (!map_->inside(nx, ny)) continue;
+          if (collision_.cellLethal(nx, ny)) continue;
+          double wx = 0.0;
+          double wy = 0.0;
+          map_->gridToWorld(nx, ny, wx, wy);
+          // 必须是**完整判据**可通的位姿，而且要比车现在**更远离障碍**
+          if (collision_.poseInCollision(wx, wy, startYawOf(req))) continue;
+          if (!(collision_.distanceToLethal(wx, wy) > d0 + 0.005)) continue;
+          const double d2 = static_cast<double>(dx) * dx + dy * dy;
+          if (d2 < best_d2) {
+            best_d2 = d2;
+            bx = nx;
+            by = ny;
+          }
+        }
+      }
+      if (bx >= 0) {
+        map_->gridToWorld(bx, by, req_eff.start.x, req_eff.start.y);
+        req_eff.start.has_yaw = req.start.has_yaw;
+        req_eff.start.yaw = startYawOf(req);
+        use_virtual = true;
+        vs_dist = std::sqrt(best_d2) * map_->resolution();
+        relax_note_ = "⚠ 起点在余量带内（净距 " +
+                      number(collision_.distanceToLethal(req.start.x,
+                                                         req.start.y)) +
+                      " m < 需求 " +
+                      number(collision_.footprint().inscribedRadius()) +
+                      " m）⇒ 从最近的可通行位姿规划（距车 " + number(vs_dist) +
+                      " m），首段由局部把车挪出来。常见原因：运行中新加了禁行区/"
+                      "改了地图膨胀，或全局图与感知图差几个 cm";
+      }
+    }
+  }
+  PlanResult res = planImpl(req_eff);
+  if (use_virtual && res.ok() && !res.path.empty()) {
+    // 把车当前位置插成首点：局部会从“车现在的位置”出发跟着这条路走
+    Pose2D head = req.start;
+    head.has_yaw = true;
+    head.yaw = startYawOf(req);
+    res.path.insert(res.path.begin(), head);
+  }
+  if (!relax_note_.empty()) {
+    if (res.ok()) {
+      res.message = relax_note_;
+    } else {
+      res.message += " | " + relax_note_;
+    }
+  }
+  return res;
+}
+
+PlanResult AStarPlanner::planImpl(const PlanRequest & req)
 {
   const auto t0 = now();
   PlanResult res;

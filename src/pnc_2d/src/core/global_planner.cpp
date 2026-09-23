@@ -12,10 +12,11 @@ namespace {
 
 constexpr double kPi = 3.14159265358979323846;
 
-double wrapAngle(double a)
-{
-  return std::atan2(std::sin(a), std::cos(a));
-}
+/* 角度归一化用公共头里的 `pnc_2d::wrapAngle`（core/types.hpp）：
+   本文件以前自己写了一份同名的 `wrapAngle`（用 atan2
+   实现），而**匿名命名空间里的 声明在语义上等价于一条 using 指令** ⇒
+   两个同名同签名的函数同时可见 ⇒ 调用处报 "ambiguous"（实测报在 path[i].yaw =
+   wrapAngle(...) 上）。 同一件事只能有一份实现。 */
 
 /**
  * 枚举线段穿过的所有格子（Amanatides & Woo 体素遍历）。
@@ -23,9 +24,8 @@ double wrapAngle(double a)
  * 用逐格推进而不是"按分辨率采样"：采样步长会**穿过单格厚的薄墙**（仿真/图纸地图里很常见）。
  */
 template <typename F>
-bool forEachCellOnSegment(const CostMap2D & map, double x0, double y0, double x1,
-                          double y1, F && f)
-{
+bool forEachCellOnSegment(const CostMap2D &map, double x0, double y0, double x1,
+                          double y1, F &&f) {
   double gx0 = 0.0;
   double gy0 = 0.0;
   double gx1 = 0.0;
@@ -38,20 +38,26 @@ bool forEachCellOnSegment(const CostMap2D & map, double x0, double y0, double x1
   const double dxg = gx1 - gx0;
   const double dyg = gy1 - gy0;
 
-  if (!f(x, y, 0.0)) return false;
-  if (std::fabs(dxg) < 1e-12 && std::fabs(dyg) < 1e-12) return true;
+  if (!f(x, y, 0.0))
+    return false;
+  if (std::fabs(dxg) < 1e-12 && std::fabs(dyg) < 1e-12)
+    return true;
 
   const int stepx = (dxg > 0) ? 1 : ((dxg < 0) ? -1 : 0);
   const int stepy = (dyg > 0) ? 1 : ((dyg < 0) ? -1 : 0);
   const double inf = std::numeric_limits<double>::infinity();
   const double tdx = (dxg != 0.0) ? std::fabs(1.0 / dxg) : inf;
   const double tdy = (dyg != 0.0) ? std::fabs(1.0 / dyg) : inf;
-  double tmx = (dxg != 0.0)
-                 ? ((stepx > 0) ? (static_cast<double>(x) + 1.0 - gx0) : (gx0 - x)) / std::fabs(dxg)
-                 : inf;
-  double tmy = (dyg != 0.0)
-                 ? ((stepy > 0) ? (static_cast<double>(y) + 1.0 - gy0) : (gy0 - y)) / std::fabs(dyg)
-                 : inf;
+  double tmx =
+      (dxg != 0.0)
+          ? ((stepx > 0) ? (static_cast<double>(x) + 1.0 - gx0) : (gx0 - x)) /
+                std::fabs(dxg)
+          : inf;
+  double tmy =
+      (dyg != 0.0)
+          ? ((stepy > 0) ? (static_cast<double>(y) + 1.0 - gy0) : (gy0 - y)) /
+                std::fabs(dyg)
+          : inf;
 
   const long max_steps = static_cast<long>(std::fabs(dxg) + std::fabs(dyg)) + 4;
   double t = 0.0;
@@ -65,32 +71,37 @@ bool forEachCellOnSegment(const CostMap2D & map, double x0, double y0, double x1
       y += stepy;
       tmy += tdy;
     }
-    if (t > 1.0) break;
-    if (!f(x, y, t)) return false;
+    if (t > 1.0)
+      break;
+    if (!f(x, y, t))
+      return false;
   }
   return true;
 }
 
-}  // namespace
+} // namespace
 
-double GlobalPlanner::msSince(const std::chrono::steady_clock::time_point & t0)
-{
-  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+double GlobalPlanner::msSince(const std::chrono::steady_clock::time_point &t0) {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now() - t0)
+      .count();
 }
 
 // --------------------------------------------------------------------------
 // 参数
 // --------------------------------------------------------------------------
 
-bool GlobalPlanner::loadCommonParams(const ParamReader & p, const std::string & prefix)
-{
+bool GlobalPlanner::loadCommonParams(const ParamReader &p,
+                                     const std::string &prefix) {
   prefix_ = prefix;
 
   // ---- 代价模型（全算法共用，键名固定为 common.*，与 config/*.yaml 一致）----
-  cost_.hard_threshold = p.getInt("common.hard_threshold", cost_.hard_threshold);
+  cost_.hard_threshold =
+      p.getInt("common.hard_threshold", cost_.hard_threshold);
   cost_.unknown_as_occupied =
-    p.getBool("common.unknown_as_occupied", cost_.unknown_as_occupied);
-  cost_.soft_cost_weight = p.getDouble("common.soft_cost_weight", cost_.soft_cost_weight);
+      p.getBool("common.unknown_as_occupied", cost_.unknown_as_occupied);
+  cost_.soft_cost_weight =
+      p.getDouble("common.soft_cost_weight", cost_.soft_cost_weight);
 
   // ---- 车体轮廓 ----
   fp_.enable = p.getBool("footprint.enable", fp_.enable);
@@ -104,32 +115,44 @@ bool GlobalPlanner::loadCommonParams(const ParamReader & p, const std::string & 
 
   // ---- 路径后处理 ----
   prune_mode_ = p.getString(prefix + ".path_prune_mode", prune_mode_);
-  prune_max_span_m_ = p.getDouble(prefix + ".path_prune_max_span", prune_max_span_m_);
+  prune_max_span_m_ =
+      p.getDouble(prefix + ".path_prune_max_span", prune_max_span_m_);
   path_resample_spacing_ =
-    p.getDouble(prefix + ".path_resample_spacing", path_resample_spacing_);
+      p.getDouble(prefix + ".path_resample_spacing", path_resample_spacing_);
   keep_start_yaw_ = p.getBool(prefix + ".keep_start_yaw", keep_start_yaw_);
 
   // ---- 合法性 ----
-  if (cost_.hard_threshold < 1) cost_.hard_threshold = 1;
-  if (cost_.hard_threshold > 100) cost_.hard_threshold = 100;
-  if (cost_.soft_cost_weight < 0.0) cost_.soft_cost_weight = 0.0;
-  if (fp_.length <= 0.0 || fp_.width <= 0.0) fp_.enable = false;   // 尺寸非法 → 关掉 footprint
-  if (fp_.safe_margin < 0.0) fp_.safe_margin = 0.0;
-  if (prune_max_span_m_ < 0.0) prune_max_span_m_ = 0.0;
+  if (cost_.hard_threshold < 1)
+    cost_.hard_threshold = 1;
+  if (cost_.hard_threshold > 100)
+    cost_.hard_threshold = 100;
+  if (cost_.soft_cost_weight < 0.0)
+    cost_.soft_cost_weight = 0.0;
+
+  clearance_prefer_dist_ =
+      p.getDouble("planner.clearance_prefer_dist", clearance_prefer_dist_);
+  clearance_cost_weight_ =
+      p.getDouble("planner.clearance_cost_weight", clearance_cost_weight_);
+  if (clearance_prefer_dist_ < 0.0) clearance_prefer_dist_ = 0.0;
+  if (clearance_cost_weight_ < 0.0) clearance_cost_weight_ = 0.0;
+  if (fp_.length <= 0.0 || fp_.width <= 0.0)
+    fp_.enable = false; // 尺寸非法 → 关掉 footprint
+  if (fp_.safe_margin < 0.0)
+    fp_.safe_margin = 0.0;
+  if (prune_max_span_m_ < 0.0)
+    prune_max_span_m_ = 0.0;
 
   rebuildCollisionServices();
   return true;
 }
 
-void GlobalPlanner::setCostMap(std::shared_ptr<const CostMap2D> map)
-{
+void GlobalPlanner::setCostMap(std::shared_ptr<const CostMap2D> map) {
   map_ = std::move(map);
   rebuildCollisionServices();
   reset();
 }
 
-void GlobalPlanner::rebuildCollisionServices()
-{
+void GlobalPlanner::rebuildCollisionServices() {
   collision_.configure(fp_, cost_.hard_threshold, cost_.unknown_as_occupied);
   map_has_soft_cells_ = false;
 
@@ -140,14 +163,16 @@ void GlobalPlanner::rebuildCollisionServices()
     return;
   }
 
-  if (!clearance_) clearance_ = std::make_unique<ClearanceField>();
+  if (!clearance_)
+    clearance_ = std::make_unique<ClearanceField>();
   clearance_->build(*map_, cost_.hard_threshold, cost_.unknown_as_occupied);
 
   collision_.setMap(map_.get());
   collision_.setClearanceField(clearance_.get());
   collision_.resetCounters();
 
-  // 地图里是否有"软代价格"（0 < raw < hard_threshold）：没有就可以跳过剪枝时的软代价比较
+  // 地图里是否有"软代价格"（0 < raw <
+  // hard_threshold）：没有就可以跳过剪枝时的软代价比较
   if (cost_.soft_cost_weight > 0.0) {
     for (const int8_t raw : map_->data()) {
       if (raw > 0 && raw < static_cast<int8_t>(cost_.hard_threshold)) {
@@ -162,54 +187,72 @@ void GlobalPlanner::rebuildCollisionServices()
 // 共享工具
 // --------------------------------------------------------------------------
 
-bool GlobalPlanner::isHardOccupiedGrid(int x, int y) const
-{
+bool GlobalPlanner::isHardOccupiedGrid(int x, int y) const {
   return collision_.cellLethal(x, y);
 }
 
-bool GlobalPlanner::isHardOccupiedWorld(double wx, double wy) const
-{
+bool GlobalPlanner::isHardOccupiedWorld(double wx, double wy) const {
   return collision_.pointLethal(wx, wy);
 }
 
-bool GlobalPlanner::lineIsCollisionFree(const Pose2D & a, const Pose2D & b) const
-{
-  // 只用到两端位置：车身朝向取线段方向（见 FootprintCollisionChecker::edgeInCollision）
+bool GlobalPlanner::lineIsCollisionFree(const Pose2D &a,
+                                        const Pose2D &b) const {
+  // 只用到两端位置：车身朝向取线段方向（见
+  // FootprintCollisionChecker::edgeInCollision）
   return !collision_.edgeInCollision(a.x, a.y, b.x, b.y);
 }
 
-bool GlobalPlanner::lineHitsHardObstacle(double x0, double y0, double x1, double y1) const
-{
-  if (!map_ || !map_->valid()) return true;
-  return !forEachCellOnSegment(*map_, x0, y0, x1, y1,
-                               [this](int x, int y, double) {
-                                 return !collision_.cellLethal(x, y);
-                               });
+bool GlobalPlanner::lineHitsHardObstacle(double x0, double y0, double x1,
+                                         double y1) const {
+  if (!map_ || !map_->valid())
+    return true;
+  return !forEachCellOnSegment(
+      *map_, x0, y0, x1, y1,
+      [this](int x, int y, double) { return !collision_.cellLethal(x, y); });
 }
 
-double GlobalPlanner::cellExtraCost(int x, int y) const
-{
-  if (!map_ || !map_->valid()) return 0.0;
-  return cost_.extraCost(map_->rawValue(x, y));
+double GlobalPlanner::cellExtraCost(int x, int y) const {
+  if (!map_ || !map_->valid())
+    return 0.0;
+  double c = cost_.extraCost(map_->rawValue(x, y));
+  // ★ 净距偏好（见头文件里的说明）：与地图原始值无关，直接用精确距离场
+  if (clearance_cost_weight_ > 0.0 && clearance_prefer_dist_ > 0.0 &&
+      clearance_ && clearance_->valid() &&
+      clearance_->width() == map_->width() &&
+      clearance_->height() == map_->height()) {
+    const double d = clearance_->distanceToLethal(x, y);
+    const double pen = clearance_prefer_dist_ - d;
+    if (pen > 0.0) {
+      const double t = pen / clearance_prefer_dist_;   // 0..1 之内
+      c += clearance_cost_weight_ * t * t;
+    }
+  }
+  return c;
 }
 
-double GlobalPlanner::softCostAlong(double x0, double y0, double x1, double y1) const
-{
-  if (!map_ || !map_->valid() || cost_.soft_cost_weight <= 0.0 || !map_has_soft_cells_) return 0.0;
+double GlobalPlanner::softCostAlong(double x0, double y0, double x1,
+                                    double y1) const {
+  // ⚠ 门槛要**同时**看“地图里有没有软格”和“有没有开净距偏好”：开了偏好但地图是
+  //   全 0/100（map_server 膨胀后就是这样）时，早退会让剪枝忽略偏好 ⇒ 剪出来的
+  //   直线又把路径贴回墙边（偏好白开了）。
+  const bool any_soft = map_has_soft_cells_ || clearance_cost_weight_ > 0.0;
+  if (!map_ || !map_->valid() || cost_.soft_cost_weight <= 0.0 ||
+      !any_soft)
+    return 0.0;
   double sum = 0.0;
   // DDA 遍历保证每格只访问一次，直接累加即可
-  forEachCellOnSegment(*map_, x0, y0, x1, y1,
-                       [&](int x, int y, double) {
-                         sum += cellExtraCost(x, y);
-                         return true;
-                       });
+  forEachCellOnSegment(*map_, x0, y0, x1, y1, [&](int x, int y, double) {
+    sum += cellExtraCost(x, y);
+    return true;
+  });
   return sum;
 }
 
-SearchWindow GlobalPlanner::makeSearchWindow(const PlanRequest & req, double margin_m) const
-{
+SearchWindow GlobalPlanner::makeSearchWindow(const PlanRequest &req,
+                                             double margin_m) const {
   SearchWindow w;
-  if (!map_ || !map_->valid()) return w;
+  if (!map_ || !map_->valid())
+    return w;
 
   double sx = 0.0;
   double sy = 0.0;
@@ -232,13 +275,14 @@ SearchWindow GlobalPlanner::makeSearchWindow(const PlanRequest & req, double mar
   w.y0 = std::max(0, static_cast<int>(std::floor(lo_y)));
   w.x1 = std::min(map_->width() - 1, static_cast<int>(std::ceil(hi_x)));
   w.y1 = std::min(map_->height() - 1, static_cast<int>(std::ceil(hi_y)));
-  if (w.x1 < w.x0) w.x1 = w.x0;
-  if (w.y1 < w.y0) w.y1 = w.y0;
+  if (w.x1 < w.x0)
+    w.x1 = w.x0;
+  if (w.y1 < w.y0)
+    w.y1 = w.y0;
   return w;
 }
 
-double GlobalPlanner::pathLength(const std::vector<Pose2D> & path) const
-{
+double GlobalPlanner::pathLength(const std::vector<Pose2D> &path) const {
   double len = 0.0;
   for (std::size_t i = 1; i < path.size(); ++i) {
     len += std::hypot(path[i].x - path[i - 1].x, path[i].y - path[i - 1].y);
@@ -250,8 +294,8 @@ double GlobalPlanner::pathLength(const std::vector<Pose2D> & path) const
 // 路径后处理
 // --------------------------------------------------------------------------
 
-void GlobalPlanner::postProcessPath(std::vector<Pose2D> & path, const PlanRequest & req) const
-{
+void GlobalPlanner::postProcessPath(std::vector<Pose2D> &path,
+                                    const PlanRequest &req) const {
   if (path.size() < 2) {
     if (!path.empty()) {
       path.front().yaw = req.goal.has_yaw ? req.goal.yaw : 0.0;
@@ -267,9 +311,11 @@ void GlobalPlanner::postProcessPath(std::vector<Pose2D> & path, const PlanReques
     std::vector<double> arc(n, 0.0);
     std::vector<double> cost_prefix(n, 0.0);
     for (std::size_t i = 1; i < n; ++i) {
-      arc[i] = arc[i - 1] + std::hypot(path[i].x - path[i - 1].x, path[i].y - path[i - 1].y);
-      cost_prefix[i] = cost_prefix[i - 1] +
-                       softCostAlong(path[i - 1].x, path[i - 1].y, path[i].x, path[i].y);
+      arc[i] = arc[i - 1] +
+               std::hypot(path[i].x - path[i - 1].x, path[i].y - path[i - 1].y);
+      cost_prefix[i] =
+          cost_prefix[i - 1] +
+          softCostAlong(path[i - 1].x, path[i - 1].y, path[i].x, path[i].y);
     }
     const bool check_soft = mapHasSoftCells() && cost_.soft_cost_weight > 0.0;
 
@@ -280,14 +326,15 @@ void GlobalPlanner::postProcessPath(std::vector<Pose2D> & path, const PlanReques
     while (i + 1 < n) {
       std::size_t best = i + 1;
       for (std::size_t j = i + 2; j < n; ++j) {
-        if (arc[j] - arc[i] > prune_max_span_m_) break;         // 跨度上限（限制单次检查长度）
-        if (lineHitsHardObstacle(path[i].x, path[i].y, path[j].x, path[j].y)) break;
+        if (arc[j] - arc[i] > prune_max_span_m_)
+          break; // 跨度上限（限制单次检查长度）
+        if (lineHitsHardObstacle(path[i].x, path[i].y, path[j].x, path[j].y))
+          break;
         if (lineIsCollisionFree(path[i], path[j])) {
           // 只有"软代价不变差"才接受捷径：否则会把"绕开软代价区"的路径又拉回去穿过它
           if (check_soft &&
               softCostAlong(path[i].x, path[i].y, path[j].x, path[j].y) >
-              cost_prefix[j] - cost_prefix[i] + 1e-6)
-          {
+                  cost_prefix[j] - cost_prefix[i] + 1e-6) {
             continue;
           }
           best = j;
@@ -306,7 +353,8 @@ void GlobalPlanner::postProcessPath(std::vector<Pose2D> & path, const PlanReques
       const double ay = path[i].y - out.back().y;
       const double bx = path[i + 1].x - path[i].x;
       const double by = path[i + 1].y - path[i].y;
-      if (std::fabs(ax * by - ay * bx) > 1e-9) out.push_back(path[i]);
+      if (std::fabs(ax * by - ay * bx) > 1e-9)
+        out.push_back(path[i]);
     }
     out.push_back(path.back());
     path.swap(out);
@@ -315,7 +363,8 @@ void GlobalPlanner::postProcessPath(std::vector<Pose2D> & path, const PlanReques
   // ---------- 2) yaw 填充 ----------
   const std::size_t n = path.size();
   for (std::size_t i = 0; i + 1 < n; ++i) {
-    path[i].yaw = wrapAngle(std::atan2(path[i + 1].y - path[i].y, path[i + 1].x - path[i].x));
+    path[i].yaw = wrapAngle(
+        std::atan2(path[i + 1].y - path[i].y, path[i + 1].x - path[i].x));
     path[i].has_yaw = true;
   }
   if (req.goal.has_yaw) {
@@ -338,7 +387,8 @@ void GlobalPlanner::postProcessPath(std::vector<Pose2D> & path, const PlanReques
       const double dx = path[i].x - path[i - 1].x;
       const double dy = path[i].y - path[i - 1].y;
       const double seg = std::hypot(dx, dy);
-      if (seg < 1e-9) continue;
+      if (seg < 1e-9)
+        continue;
       double t = path_resample_spacing_ - carry;
       while (t <= seg) {
         Pose2D p;
@@ -358,4 +408,4 @@ void GlobalPlanner::postProcessPath(std::vector<Pose2D> & path, const PlanReques
   }
 }
 
-}  // namespace pnc_2d
+} // namespace pnc_2d

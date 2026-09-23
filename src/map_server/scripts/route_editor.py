@@ -969,7 +969,7 @@ def main() -> int:
     ap.add_argument("--margin", type=float, default=0.05, help="safety margin [m]")
     ap.add_argument("--snap", type=float, default=0.30,
                     help="reuse an existing point within this radius [m]")
-    ap.add_argument("--zone-inflate", type=float, default=0.0,
+    ap.add_argument("--zone-inflate", type=float, default=0.05,
                     help="forbidden-zone inflation [m]; <0 = auto (vehicle "
                          "circumscribed radius). Keep it equal to map_server's "
                          "zones.inflate, otherwise the editor and map_server "

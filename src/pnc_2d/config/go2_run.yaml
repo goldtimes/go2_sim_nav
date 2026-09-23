@@ -68,6 +68,9 @@
     local_mpc.align_exit_deg: 8.0        # 退出阈值 [°]（滞环）
     local_mpc.align_gain: 1.2            # ω = gain·(−e_ψ)（再受 w_max 限幅）
     local_mpc.align_min_clearance: 0.25  # 离障碍比这更近就不原地转（矩形车体扫略）
+    # 对正时的角速度**下限** [rad/s]：打破底盘低速死区（指令太小时步态不动 ⇒
+    # 车停在容差外永不收敛，用户 2026-09-23 实测）。属底盘特性，在这里标定。
+    local_mpc.align_w_min: 0.20
     local_mpc.lat_acc_max: 0.80     # 侧向加速度上限（低速转弯）
     local_mpc.degraded_speed_limit: 0.15
 

@@ -7,7 +7,23 @@
 #include <string>
 #include <vector>
 
+#include <cmath>
+
 namespace pnc_2d {
+
+/// 把角度归一化到 (−π, π]。
+///
+/// 放在公共头里（而不是各文件自己写一份）：到点判定的"朝向误差"、原地对正增益、
+/// 参考切线都靠它，多份拷贝一定会有一份忘了改 ——
+/// 本文件以前确实有一份**文件私有** 的同名实现（在 mpc_local_planner.cpp
+/// 里），节点侧就算不出来同样的误差。
+inline double wrapAngle(double a) {
+  while (a > M_PI)
+    a -= 2.0 * M_PI;
+  while (a <= -M_PI)
+    a += 2.0 * M_PI;
+  return a;
+}
 
 /// 二维位姿（世界系）。has_yaw=false 表示该点没有明确朝向（例如纯路径点）。
 struct Pose2D {
@@ -20,40 +36,40 @@ struct Pose2D {
 /// 规划结果状态。失败必须能说明**原因** —— 不允许返回"上一次的路径"充数。
 enum class PlannerStatus {
   kSuccess = 0,
-  kNotInitialized,             // 地图未设置 / 地图无效
-  kInvalidInput,               // NaN、起点终点重合、目标在起点搜索范围内不存在等
+  kNotInitialized, // 地图未设置 / 地图无效
+  kInvalidInput,   // NaN、起点终点重合、目标在起点搜索范围内不存在等
   kStartOutOfMap,
   kGoalOutOfMap,
-  kStartOccupied,              // 起点中心格致命
+  kStartOccupied, // 起点中心格致命
   kGoalOccupied,
-  kStartFootprintCollision,    // 起点处车体轮廓与障碍重叠（比"中心格致命"更准确）
+  kStartFootprintCollision, // 起点处车体轮廓与障碍重叠（比"中心格致命"更准确）
   kGoalFootprintCollision,
   kNoPath,
   kTimeout,
   kMaxIterations
 };
 
-const char * toString(PlannerStatus s);
+const char *toString(PlannerStatus s);
 
 /// 局部规划（跟随）状态。**独立枚举**，不复用 PlannerStatus：
 /// "全局规划失败"与"局部被挡住/到达终点"是两类语义，混用会让状态机写不清。
 enum class LocalStatus {
-  kIdle = 0,      // 没有可跟随的路径，或尚未启动
-  kFollowing,     // 正在沿路径走
-  kGoalReached,   // 到达路径终点（局部负责判定）
-  kBlocked,       // 前方被挡且不可绕（路网模式下走廊被占 ⇒ 停车等状态机）
-  kDegraded,      // 降级运行（例如距离场超时，只用硬碰撞兜底 + 减速）
-  kFailed         // 求解失败/内部错误
+  kIdle = 0,    // 没有可跟随的路径，或尚未启动
+  kFollowing,   // 正在沿路径走
+  kGoalReached, // 到达路径终点（局部负责判定）
+  kBlocked,     // 前方被挡且不可绕（路网模式下走廊被占 ⇒ 停车等状态机）
+  kDegraded,    // 降级运行（例如距离场超时，只用硬碰撞兜底 + 减速）
+  kFailed       // 求解失败/内部错误
 };
 
-const char * toString(LocalStatus s);
+const char *toString(LocalStatus s);
 
 /// 走廊约束：`route` profile 的来源（全局路网规划给出的中心线 + 允许偏离半宽）
 struct RouteCorridor {
-  std::vector<Pose2D> centerline;  ///< 世界系中心线（已填 yaw 更佳）
-  double half_width{0.0};          ///< 允许横向偏离半宽 [m]；0 = 严格贴线
-  double speed_limit{0.0};         ///< 该走廊限速 [m/s]；0 = 不限（用算法上限）
-  int edge_index{-1};              ///< 来源通道下标（诊断/可视化用）
+  std::vector<Pose2D> centerline; ///< 世界系中心线（已填 yaw 更佳）
+  double half_width{0.0};         ///< 允许横向偏离半宽 [m]；0 = 严格贴线
+  double speed_limit{0.0};        ///< 该走廊限速 [m/s]；0 = 不限（用算法上限）
+  int edge_index{-1};             ///< 来源通道下标（诊断/可视化用）
 
   bool valid() const { return centerline.size() >= 2; }
   bool strict() const { return half_width <= 1e-9; }
@@ -64,12 +80,12 @@ struct RouteCorridor {
 /// 见 doc/mpc_local_planner_plan.md §7。
 struct DynamicObstacle {
   int id{0};
-  Pose2D pose;              ///< 当前位姿（世界系）
-  double vx{0.0};           ///< 世界系速度 [m/s]
+  Pose2D pose;    ///< 当前位姿（世界系）
+  double vx{0.0}; ///< 世界系速度 [m/s]
   double vy{0.0};
-  double radius{0.3};       ///< 等效半径 [m]
-  double confidence{1.0};   ///< 置信度 0~1
-  double stamp{0.0};        ///< 观测时刻 [s]
+  double radius{0.3};     ///< 等效半径 [m]
+  double confidence{1.0}; ///< 置信度 0~1
+  double stamp{0.0};      ///< 观测时刻 [s]
 };
 
 /// 栅格代价语义（所有算法共用；逐算法可用不同参数）
@@ -93,9 +109,9 @@ struct PlannerStats {
   long expanded_nodes{0};
   long discovered_nodes{0};
   long max_open_set{0};
-  int windows_tried{0};        // 搜索窗口尝试次数（>1 说明触发了扩大重试）
-  long footprint_full_checks{0};  // 走了完整矩形检查的次数（诊断快路径效果）
-  double path_length{0.0};     // 输出路径长度 [m]
+  int windows_tried{0};          // 搜索窗口尝试次数（>1 说明触发了扩大重试）
+  long footprint_full_checks{0}; // 走了完整矩形检查的次数（诊断快路径效果）
+  double path_length{0.0};       // 输出路径长度 [m]
 };
 
 struct PlanRequest {
@@ -106,7 +122,7 @@ struct PlanRequest {
 struct PlanResult {
   PlannerStatus status{PlannerStatus::kNotInitialized};
   std::string message;
-  std::vector<Pose2D> path;    // 世界系，已填 yaw
+  std::vector<Pose2D> path; // 世界系，已填 yaw
   PlannerStats stats;
 
   // ---- 走廊（"贴路网通道走"）----
@@ -118,15 +134,32 @@ struct PlanResult {
   // 宽度取各点最小值。一条任务跨多条通道时取**最严**的那条（半宽最小、
   // 限速最小），宁可保守：偏出严格通道比在宽通道里少偏一点严重得多。
   bool has_corridor{false};
-  double corridor_half_width{0.0};   ///< 允许横向偏离半宽 [m]；0 = 严格贴线
-  double corridor_speed_limit{0.0};  ///< 走廊限速 [m/s]；0 = 不限
-  std::vector<int> route_edges;      ///< 用到的通道下标（诊断/可视化）
+  double corridor_half_width{0.0};  ///< 允许横向偏离半宽 [m]；0 = 严格贴线
+  double corridor_speed_limit{0.0}; ///< 走廊限速 [m/s]；0 = 不限
+  /// **限速区**（地图语义层，不是通道属性）沿路径的最严限速 [m/s]；0 = 不限。
+  /// 与 corridor_speed_limit
+  /// 分开：一个来自通道属性，一个来自叠加在地图上的区域；
+  /// 调用方（管理器）取两者的最小合成"任务限速"。
+  double zone_speed_limit{0.0};
+  std::vector<int> route_edges; ///< 用到的通道下标（诊断/可视化）
+
+  /// ★ **逐点**走廊半宽：长度 = path.size()，语义与 `FollowPath.action` /
+  /// `PlanPath.srv` 的 `corridor_width[]` 一致：
+  ///   `> 0` 该点允许横向偏离 ±w；`== 0` 该点严格贴线；`< 0` 该点无走廊约束。
+  ///
+  /// 为什么必须逐点：hybrid 模式下路径 =
+  ///   [**自由入口段**, 路网段, **自由出口段**]
+  /// 入口/出口段是"自由空间走位"，把它们也当成"严格贴线的中心线"，车就会在
+  /// 车道外几厘米处被硬约束判死（实测：起点横向偏差 ≥ 0.055 m ⇒ 求解器不收敛、
+  /// 120/120
+  /// 周期被挡、车一步不动；现场现象就是"有角度的路网时机器基本不会动"）。
+  /// 逐点之后：入口段是自由跟踪（先把车带到车道上并对正），上了车道再严格贴线。
+  std::vector<double> corridor_width_per_point;
 
   bool ok() const { return status == PlannerStatus::kSuccess; }
 
   /// 严格贴线的走廊：宽度 0，遇障只能停（不能绕）。
-  bool strictCorridor() const
-  {
+  bool strictCorridor() const {
     return has_corridor && corridor_half_width <= 1e-9;
   }
 };
@@ -139,11 +172,14 @@ struct SearchWindow {
   int y1{-1};
 
   bool valid() const { return x1 >= x0 && y1 >= y0; }
-  bool contains(int x, int y) const { return x >= x0 && x <= x1 && y >= y0 && y <= y1; }
-  long cells() const
-  {
-    return valid() ? static_cast<long>(x1 - x0 + 1) * static_cast<long>(y1 - y0 + 1) : 0;
+  bool contains(int x, int y) const {
+    return x >= x0 && x <= x1 && y >= y0 && y <= y1;
+  }
+  long cells() const {
+    return valid()
+               ? static_cast<long>(x1 - x0 + 1) * static_cast<long>(y1 - y0 + 1)
+               : 0;
   }
 };
 
-}  // namespace pnc_2d
+} // namespace pnc_2d

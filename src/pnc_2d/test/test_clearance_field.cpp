@@ -1,6 +1,7 @@
 // ClearanceField（精确欧氏距离变换 / EDT）单元测试：不依赖 ROS。
 //
-// 为什么值得单测：footprint 快路径的两个阈值一个要距离**下界**、一个要**上界**，
+// 为什么值得单测：footprint
+// 快路径的两个阈值一个要距离**下界**、一个要**上界**，
 // 近似距离（棋盘/倒角）只能满足其中一边 → 会引入误判。这里用**暴力法**把"精确"
 // 这件事钉死，并验证上下界确实把"到最近致命格**区域**的距离"夹住。
 //
@@ -35,8 +36,8 @@ constexpr double kRes = 0.10;
 /// 又足以证明"不是棋盘/倒角近似"（那些误差是**厘米级**）
 constexpr double kEpsM = 1e-6;
 
-std::shared_ptr<CostMap2D> makeMap(int w, int h, const std::vector<int8_t> &data,
-                                   double res = kRes) {
+std::shared_ptr<CostMap2D>
+makeMap(int w, int h, const std::vector<int8_t> &data, double res = kRes) {
   auto m = std::make_shared<CostMap2D>();
   if (!m->set(w, h, res, 0.0, 0.0, 0.0, data, "map"))
     return nullptr;
@@ -67,9 +68,9 @@ double bruteToCenter(const CostMap2D &m, int x, int y, bool unk_as_occ) {
     for (int i = 0; i < m.width(); ++i) {
       if (!isLethal(m.rawValue(i, j), unk_as_occ))
         continue;
-      const double d = std::hypot(static_cast<double>(i - x),
-                                  static_cast<double>(j - y)) *
-                       m.resolution();
+      const double d =
+          std::hypot(static_cast<double>(i - x), static_cast<double>(j - y)) *
+          m.resolution();
       best = (best < 0.0) ? d : std::min(best, d);
     }
   }
@@ -103,7 +104,7 @@ TEST(ClearanceField, HandCheckedTinyMap) {
   EXPECT_EQ(cf.lethalCount(), 2u);
   EXPECT_NEAR(cf.distanceToLethal(2, 0), 2.0 * kRes, kEpsM);
   EXPECT_NEAR(cf.distanceToLethal(1, 0), 1.0 * kRes, kEpsM);
-  EXPECT_NEAR(cf.distanceToLethal(0, 0), 0.0, kEpsM);  // 自己就是障碍
+  EXPECT_NEAR(cf.distanceToLethal(0, 0), 0.0, kEpsM); // 自己就是障碍
 
   // 单点障碍在 (1,3)：查 (3,1) → 对角 2√2 格
   std::vector<int8_t> d(25, 0);
@@ -117,7 +118,8 @@ TEST(ClearanceField, HandCheckedTinyMap) {
   EXPECT_NEAR(cf2.distanceToLethal(1, 1), 2.0 * kRes, kEpsM);
 }
 
-// --------------------------------------------------- 与暴力法完全一致（5 组随机）
+// --------------------------------------------------- 与暴力法完全一致（5
+// 组随机）
 TEST(ClearanceField, MatchesBruteForceExactly) {
   const int w = 40, h = 30;
   for (unsigned seed = 1; seed <= 5; ++seed) {
@@ -138,7 +140,8 @@ TEST(ClearanceField, MatchesBruteForceExactly) {
   }
 }
 
-// ------------------------------------------------- 上下界必须夹住"到区域"的距离
+// -------------------------------------------------
+// 上下界必须夹住"到区域"的距离
 TEST(ClearanceField, BoundsBracketRegionDistance) {
   const int w = 30, h = 24;
   auto m = randomMap(w, h, kRes, 0.12, 0.0, 7);
@@ -169,24 +172,31 @@ TEST(ClearanceField, UnknownPolicy) {
   // 左半空闲、右半未知，中间没有真障碍
   std::vector<int8_t> d(20 * 4, 0);
   for (int y = 0; y < 4; ++y)
-    for (int x = 10; x < 20; ++x) d[y * 20 + x] = -1;
+    for (int x = 10; x < 20; ++x)
+      d[y * 20 + x] = -1;
   auto m = makeMap(20, 4, d);
   ASSERT_NE(m, nullptr);
 
-  ClearanceField optimistic;  // 未知 = 空闲（MPC 要的语义）
+  ClearanceField optimistic; // 未知 = 空闲（MPC 要的语义）
   ASSERT_TRUE(optimistic.build(*m, kHard, false));
   EXPECT_EQ(optimistic.lethalCount(), 0u);
   EXPECT_GT(optimistic.distanceToLethal(2, 2), 1e6) << "无致命格时距离应饱和";
 
-  ClearanceField conservative;  // 未知 = 障碍（全局图那套策略）
+  ClearanceField conservative; // 未知 = 障碍（全局图那套策略）
   ASSERT_TRUE(conservative.build(*m, kHard, true));
   EXPECT_EQ(conservative.lethalCount(), 40u);
   EXPECT_NEAR(conservative.distanceToLethal(9, 0), 1.0 * kRes, kEpsM);
 }
 
-// ------------------------------------------------------------- 耗时（信息 + 粗门限）
+// ------------------------------------------------------------- 耗时（信息 +
+// 粗门限）
 TEST(ClearanceField, BuildTimeOnRealisticSizes) {
-  struct Case { int w, h; double res; int trials; const char *name; };
+  struct Case {
+    int w, h;
+    double res;
+    int trials;
+    const char *name;
+  };
   const Case cases[] = {
       {607, 307, 0.05, 10, "全局 607x307 @0.05（186k 格）"},
       {80, 80, 0.05, 200, "局部 4m x 4m @0.05（6.4k 格）"},
@@ -210,5 +220,5 @@ TEST(ClearanceField, BuildTimeOnRealisticSizes) {
   }
 }
 
-}  // namespace
-}  // namespace pnc_2d
+} // namespace
+} // namespace pnc_2d

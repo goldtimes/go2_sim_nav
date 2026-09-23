@@ -182,9 +182,12 @@ class Probe(Node):
         if m.route_mode:
             self.route_mode_seen = True
         if self.pose:
+            # ★ 末位记 route_mode：“严格贴线期间”和“自由上线期间”的横向偏差
+            #   是两回事 —— 混在一起算会把“上线过程的外摆”当成“贴线不合格”。
+            #   贴线质量必须在 route_mode=true 的样本上量。
             self.rows.append((time.time() - self.t0, self.pose[0], self.pose[1],
                               0.0, self.pose_v, m.status_name, m.cmd_v, m.cmd_w,
-                              m.cross_track_m, m.progress))
+                              m.cross_track_m, m.progress, bool(m.route_mode)))
 
     def on_state(self, m):
         self.state_seen.add(m.state_name)
@@ -370,3 +373,23 @@ def load_limits():
     p = list(doc.values())[0]["ros__parameters"]
     return (float(p["local_mpc.v_max"]), float(p["local_mpc.w_max"]),
             float(p["local_mpc.degraded_speed_limit"]))
+
+
+def load_goal_yaw_tol_deg():
+    """到点**朝向**容差 [°]：从 local_mpc.yaml 读（不在测试里写死；容器用的是
+    算法片段里的值，与节点走 `goalYawTolerance()` 取的是同一个参数）"""
+    import os
+    import yaml
+    cfg = os.path.join(os.path.dirname(GO2_CFG), "local_mpc.yaml")
+    doc = yaml.safe_load(open(cfg, encoding="utf-8"))
+    p = list(doc.values())[0]["ros__parameters"]
+    return float(p.get("local_mpc.goal_yaw_tolerance_deg", 0.0))
+
+
+def wrap_pi(a: float) -> float:
+    """角度归一化到 (−π, π]（与库里的 `pnc_2d::wrapAngle` 同语义）"""
+    while a > math.pi:
+        a -= 2.0 * math.pi
+    while a <= -math.pi:
+        a += 2.0 * math.pi
+    return a

@@ -35,6 +35,9 @@ import sim_common as sc
 from sim_common import (chk, load_limits, pose_speed, signed_offset, stop,
                         summary)
 
+# 到点**朝向**容差 [°]：与 local_mpc.goal_yaw_tolerance_deg 同源（不写死）
+GOAL_YAW_TOL_DEG = sc.load_goal_yaw_tol_deg()
+
 
 def self_diagnose(p, obstacle, sx, sy):
     """一条局部状态都没有 ⇒ 根本没进到跟随阶段，最常见的两种原因直接说明"""
@@ -197,11 +200,41 @@ def main():
                 for dt, st, dg in steps[-12:]:
                     print(f"    {dt:+.2f}s  {st * 100:5.2f} cm  {dg * 100:5.2f} cm")
         print(f"末速(位姿差分)  {v_end:.3f} m/s（最后 0.5 s）")
+        # ★ 末朝向：任务目标带 yaw（面向栓/门口），原来只验收 xy ⇒ 机头可以差 90°
+        #   而没人发现（用户 2026-09-23 指出）。容差取 local_mpc.goal_yaw_tolerance_deg。
+        fyaw = p.pose[2] if p.pose else 0.0
+        yaw_err = abs(sc.wrap_pi(fyaw - gyaw))
+        print(f"末朝向误差      {math.degrees(yaw_err):.2f}°（目标 {math.degrees(gyaw):.1f}°"
+              f" / 实际 {math.degrees(fyaw):.1f}°，容差 {GOAL_YAW_TOL_DEG:.0f}°）")
         print(f"横向误差(全程)  max {max(off_all):.3f} m")
         print(f"横向误差(稳态)  max {max(abs(o) for o in off_st):.3f} m | "
               f"均值偏置 {sum(off_st) / len(off_st):+.3f} m")
         print(f"最小障碍净距    {min_clr:.3f} m（内切半径 0.25 m）")
         print(f"指令峰值        |v| {max_cmd_v:.3f} / |w| {max_cmd_w:.3f}")
+        # ★ “摇摇摆摆”要能量化（用户 2026-09-23：“不顺滑，摇摇摆摆”）。
+        #   自由模式原来和走廊共用一套贴线权重 ⇒ 几 cm/几度偏差被当大误差追，
+        #   ω 顶满来回打。这里量两个数（都取稳态窗口）：
+        #     ① ω 反向频率：每秒改变符号多少次（真正的“左右摆”）
+        #     ② RMS|ω|：越大说明越是“顶满方向”而非“小幅修正”
+        #   ⚠ 这两个数是**观测口径**，不设硬门限 —— 阈值要等真机/仿真跑几轮标定
+        #   （先看数、再定线；反过来会把正常行为判成失败）。
+        stw = [r[7] for r in p.rows if r[0] >= settle_t]
+        flips, eps_w = 0, 0.02
+        prev = 0.0
+        for w in stw:
+            if abs(w) < eps_w:
+                continue
+            if prev != 0.0 and (w > 0) != (prev > 0):
+                flips += 1
+            prev = w
+        dur_st = (st_rows[-1][0] - st_rows[0][0]) if len(st_rows) > 1 else 1e-6
+        dur_st = max(1e-6, dur_st)
+        flip_hz = flips / dur_st
+        rms_w = math.sqrt(sum(w * w for w in stw) / len(stw)) if stw else 0.0
+        print(f"★ 顺滑度(稳态)  ω 反向 {flips} 次 / {dur_st:.1f} s = {flip_hz:.2f} Hz | "
+              f"RMS|w| {rms_w:.3f} rad/s"
+              + ("  ⚠ 反向频繁 ⇒ 像摇摆，检查 free_lat_deadband/free_w_max"
+                 if flip_hz > 1.0 else "  ✓ 未见持续左右打摆"))
         print(f"★ 被控对象保真度  稳态段路程/指令积分 = {gain:.3f}"
               f"（{dist_st:.2f} m / {cmd_int:.2f} m·s⁻¹·s；1.0 = 指令完全被实现）")
 
@@ -210,6 +243,10 @@ def main():
             f"判定容差 local.goal_tolerance=0.02")
         chk("[A2] 末速 ≈ 0（位姿差分，不看噪声 twist）", v_end <= 0.05,
             f"{v_end:.3f} m/s")
+        # ★ 末期朝向也算“到达”的一部分：位置对、机头不对不算完成（差速可以原地对正）
+        chk(f"[A3] 末朝向偏差 ≤ {GOAL_YAW_TOL_DEG:.0f}°（到点后原地对正目标朝向）",
+            math.degrees(yaw_err) <= GOAL_YAW_TOL_DEG + 0.5,
+            f"{math.degrees(yaw_err):.2f}°（容差 {GOAL_YAW_TOL_DEG:.0f}°）")
         chk("[B1] 稳态横向误差 ≤ 0.10 m", max(abs(o) for o in off_st) <= 0.10,
             f"max {max(abs(o) for o in off_st):.3f} m，"
             f"均值 {sum(off_st) / len(off_st):+.3f} m")

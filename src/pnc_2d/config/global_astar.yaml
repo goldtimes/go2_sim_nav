@@ -21,8 +21,18 @@
     astar.search_window_margin: 10.0   # 首次窗口余量（m）
     astar.search_window_retry_margins: [30.0, 100.0, 1.0e9]   # 失败后逐级扩大
     astar.max_iterations: 300000       # 扩展节点上限
-    astar.max_search_time_ms: 2000.0   # 单次搜索时间上限（ms）
-
+    astar.max_search_time_ms: 2000.0   # 单次搜索时间上限（ms）    # 起点轮廓已经与障碍重叠时，**只在起点周边**允许放宽的半径 [m]（0 = 不允许）。
+    #   ★ 为什么必须限制在起点附近（2026-09-23 实测）：栅格 A* 没法“只放宽首点”。
+    #     第一版把**整条路径**都换成放宽后的轮廓 ⇒ 起点只要刚好贴到余量（差 1 mm），
+    #     整条路都按零余量规划 ⇒ 一路贴墙走，车最后停在离障碍真净距 0.15 m 的地方
+    #     （footprint 半宽 0.20 ⇒ 已经压上去了），现场就是“绕障效果更差”。
+    #   圈内从大到小试 {0.04,0.03,0.02,0.01,0}（含 0 = 真实轮廓）；**不再到负余量**
+    #   —— 负余量等于规划一条“车体真实轮廓本来就压进障碍”的路，局部跟着开就是擦墙
+    #   （实测：车停在离障碍 0.15 m，而半宽 0.20 ⇒ 已压上去）。
+    #   为什么需要它：全局图（已按 map_server.inflate 膨胀、禁行区已按 zones.inflate
+    #   烧入）与感知图不同源 + 栅格离散化（±半格），“全局图上刚好差 1 mm”是常态；
+    #   起点一律判死会变成“局部 BLOCKED → 恢复重规划又失败 → 任务永久 FAILED”。
+    astar.start_escape_radius: 1.0
     # ---------------- 路径后处理 ----------------
     astar.path_prune_mode: "line_of_sight"   # line_of_sight / collinear / none
     astar.path_prune_max_span: 8.0           # 单次捷径检查的最大跨度（m）

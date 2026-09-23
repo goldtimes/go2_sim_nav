@@ -141,5 +141,195 @@ TEST(MapZones, BurnForbiddenWithInflation) {
   EXPECT_LT(n, 4200u);
 }
 
+TEST(MapZones, AdoptFromGeometryMatchesYamlRules) {
+  // 消息 → 内部表示（map_server 的 ZoneArray 给局部/全局用）。
+  // 校验规则必须与 YAML
+  // 路径**同一套**，否则会出现"文件里合法、运行时消息里非法"
+  // 这种分叉（同一个区域，全局说能过、局部说不能）。
+  MapZone bad; // 顶点 < 3 → 丢弃
+  bad.name = "bad";
+  bad.type = ZoneType::kForbidden;
+  bad.polygon = {Pose2D{0.0, 0.0, 0}, Pose2D{1.0, 0.0, 0}};
+
+  MapZone sp; // 限速值非法 → 按 0.3 处理
+  sp.name = "sp";
+  sp.type = ZoneType::kSpeedLimit;
+  sp.value = 0.0;
+  sp.polygon = {Pose2D{2.0, 2.0, 0}, Pose2D{3.0, 2.0, 0}, Pose2D{3.0, 3.0, 0},
+                Pose2D{2.0, 3.0, 0}};
+
+  MapZone fb; // 禁行区：bbox 要自动算出来，value 强制 0
+  fb.name = "fb";
+  fb.type = ZoneType::kForbidden;
+  fb.value = 5.0;
+  fb.polygon = {Pose2D{4.0, 4.0, 0}, Pose2D{5.0, 4.0, 0}, Pose2D{5.0, 5.0, 0},
+                Pose2D{4.0, 5.0, 0}};
+
+  ZoneSet zs;
+  EXPECT_TRUE(zs.adopt({bad, sp, fb}));
+  EXPECT_EQ(zs.zones().size(), 2u) << "顶点 < 3 的区域应被丢弃";
+  EXPECT_FALSE(zs.warnings().empty())
+      << "丢弃/修正过就要有警告（否则静默不一致）";
+  EXPECT_EQ(zs.forbiddenCount(), 1u);
+  EXPECT_EQ(zs.speedCount(), 1u);
+  double limit = 0.0;
+  ASSERT_TRUE(zs.inSpeedZone(2.5, 2.5, limit));
+  EXPECT_DOUBLE_EQ(limit, 0.3) << "非法限速值应按 0.3 处理（与 YAML 路径一致）";
+  for (const MapZone &z : zs.zones()) {
+    if (z.name != "fb")
+      continue;
+    EXPECT_DOUBLE_EQ(z.min_x, 4.0);
+    EXPECT_DOUBLE_EQ(z.max_y, 5.0) << "bbox 必须自动算";
+    EXPECT_DOUBLE_EQ(z.value, 0.0) << "禁行区的 value 应为 0";
+  }
+  // 全非法 ⇒ 视为无区域（行为回到自由空间），但仍返回 warnings
+  ZoneSet zs2;
+  EXPECT_FALSE(zs2.adopt({bad}));
+  EXPECT_TRUE(zs2.empty());
+  EXPECT_EQ(zs2.forbiddenCount(), 0u);
+
+  // 报错点名（现场一眼看出是哪个区域）
+  EXPECT_EQ(zs.forbiddenNameAt(4.5, 4.5), "fb");
+  EXPECT_TRUE(zs.forbiddenNameAt(0.0, 0.0).empty());
+}
+
+TEST(MapZones, SpeedLimitAheadLooksForwardOnly) {
+  // 局部用它算"进区前就要降到的速度帽"（前瞻 = 刹车距离）；
+  // 全局用它算"这条路径上的任务限速"（前瞻 = 整条路径）。
+  ZoneSet zs;
+  std::string err;
+  ASSERT_TRUE(zs.loadFromString(kYaml, err)) << err;
+  // 一条沿 x 轴的折线：x=0 → 12（0.5 m 一点）
+  std::vector<Pose2D> pts;
+  for (double x = 0.0; x <= 12.0 + 1e-9; x += 0.5)
+    pts.push_back(Pose2D{x, 1.5, 0.0});
+  // 限速区在 x∈[8,10]（0.3）与 [9,11]（0.15，与前者重叠）
+
+  // ① 从起点前瞻 1 m：还没到区 ⇒ 不限
+  EXPECT_DOUBLE_EQ(zoneSpeedLimitAhead(zs, pts, 0, 1.0), 0.0);
+  // ② 前瞻到 x=8.5（8.5 m）⇒ 进入 0.3 的区
+  EXPECT_DOUBLE_EQ(zoneSpeedLimitAhead(zs, pts, 0, 8.6), 0.3);
+  // ③ 前瞻盖住重叠段 ⇒ 取最严 0.15
+  EXPECT_DOUBLE_EQ(zoneSpeedLimitAhead(zs, pts, 0, 9.6), 0.15);
+  // ④ 从进度下标 16（x=8.0）往后看 ⇒ 立刻命中
+  EXPECT_DOUBLE_EQ(zoneSpeedLimitAhead(zs, pts, 16, 0.4), 0.3);
+  // ⑤ 已经过完限速区（x=11.5 之后）⇒ 不限（出区要能恢复，不能被永久压住）
+  EXPECT_DOUBLE_EQ(zoneSpeedLimitAhead(zs, pts, 23, 2.0), 0.0);
+  // ⑥ lookahead<=0 = 只看起点那一点；空集/无速度区 = 不限
+  EXPECT_DOUBLE_EQ(zoneSpeedLimitAhead(zs, pts, 17, 0.0), 0.3);
+  EXPECT_DOUBLE_EQ(zoneSpeedLimitAhead(ZoneSet{}, pts, 0, 1e9), 0.0);
+  EXPECT_DOUBLE_EQ(zoneSpeedLimitAhead(zs, {}, 0, 1e9), 0.0);
+  // ⑦ from 越界要夹住（不能崩、不能漏最后一点）
+  EXPECT_DOUBLE_EQ(zoneSpeedLimitAhead(zs, pts, 999, 1e9), 0.0);
+}
+
+/// ★ 回归：路径**只有两个点**（全局自由空间规划就是这么发的）时，
+/// 也必须看到位于两点**之间**的限速区。
+///
+/// 之前的实现只查"路径点"，于是 2 点路径等于只查起点与终点 ⇒ 中间的限速区被
+/// 整个跳过。实测（2026-09-23 test_zones 段 3）：限速区就在起点前 0.7 m、
+/// 前瞻算到 0.89 m，函数依旧返回 0，车以 0.30 m/s 直接穿区（Z4/Z5 失败）。
+TEST(MapZones, SpeedLimitAheadResamplesSparsePath) {
+  ZoneSet zs;
+  std::string err;
+  ASSERT_TRUE(zs.loadFromString(kYaml, err)) << err;
+  // 只有起点与终点的一条直线（限速区 x∈[8,10]、[9,11] 都在中点之后）
+  const std::vector<Pose2D> sparse{Pose2D{0.0, 1.5, 0.0},
+                                   Pose2D{12.0, 1.5, 0.0}};
+  // 照旧：前瞻不够长 ⇒ 不限（说明不是"无脑全程限速"）
+  EXPECT_DOUBLE_EQ(zoneSpeedLimitAhead(zs, sparse, 0, 1.0), 0.0);
+  // 前瞻到区里 ⇒ 必须命中（旧实现这里是 0）
+  EXPECT_DOUBLE_EQ(zoneSpeedLimitAhead(zs, sparse, 0, 8.6), 0.3);
+  EXPECT_DOUBLE_EQ(zoneSpeedLimitAhead(zs, sparse, 0, 9.6), 0.15);
+  // 步长不影响结果（0.25 默认 vs 更细/更粗都在同一区间内）
+  EXPECT_DOUBLE_EQ(zoneSpeedLimitAhead(zs, sparse, 0, 9.6, 0.1), 0.15);
+  EXPECT_DOUBLE_EQ(zoneSpeedLimitAhead(zs, sparse, 0, 9.6, 1.0), 0.15);
+  // ① 关键不变量：**前瞻必须够"从最大速度减到限速"用**。
+  //    用当前速度算前瞻会形成自锁（车越慢前瞻越短 ⇒ 从不减速），
+  //    所以节点用的是 v_max；这里直接断言 0.89 m 这个真实值够减到 0.15。
+  const double need = (0.42 * 0.42 - 0.15 * 0.15) / (2.0 * 0.15);
+  EXPECT_GT(speedLookahead(0.42, 0.15), need)
+      << "前瞻必须 ≥ 从 v_max 减到限速所需的距离（否则进区时还超速）";
+  // ② 自锁回归：**慢车**的前瞻也要覆盖住 0.7 m 外的限速区
+  //    （旧实现用当前速度 0.26 ⇒ 0.53 m ⇒ 漏掉）
+  EXPECT_LT(speedLookahead(0.26, 0.15), 0.7)
+      << "这条正是踩过的坑：用当前速度算不够";
+  EXPECT_GT(speedLookahead(0.42, 0.15), 0.7)
+      << "用 v_max 算才够（节点就是这么用的）";
+  // ③ 退化输入不炸
+  EXPECT_DOUBLE_EQ(speedLookahead(0.0, 0.15), 0.3);
+  EXPECT_DOUBLE_EQ(speedLookahead(0.4, 0.0), 0.3);
+}
+
+/// ★ 回归：控制周期里的前瞻必须从**车在路径上的投影点**开始。
+///
+/// 为什么不能传 `pass_index_`（路点下标）：自由空间路径常常只有 2 个点，
+/// 而"最近路点"要等车走进 `pass_distance_` 容差才会前进 ⇒ 整段路下标都是 0，
+/// 扫描窗口变成"路径起点往后 look 米"（与车在哪无关）。
+/// 实测（2026-09-23 test_zones 段 3）：车开出限速区 1 m 了速度帽还在，
+/// 全程 0.15 m/s 爬 31 s，"出区后恢复"永远不成立。
+TEST(MapZones, SpeedLimitAheadUsesProjectionNotWaypointIndex) {
+  ZoneSet zs;
+  std::string err;
+  ASSERT_TRUE(zs.loadFromString(kYaml, err)) << err;
+  // 只有两个点的直线：限速区 x∈[8,10]
+  const std::vector<Pose2D> two_pts{Pose2D{0.0, 1.5, 0.0},
+                                    Pose2D{12.0, 1.5, 0.0}};
+
+  // 车在 x=6.0（还没进区），前瞻 0.9 m ⇒ 不限（距离区还有 2.0 m）
+  EXPECT_DOUBLE_EQ(
+      zoneSpeedLimitAheadFromProjection(zs, two_pts, 6.0, 1.5, 0.9), 0.0);
+  // 车在 x=7.3（区前 0.7 m），前瞻 0.9 m ⇒ 触发（这就是仿真里差的那一步）
+  EXPECT_DOUBLE_EQ(
+      zoneSpeedLimitAheadFromProjection(zs, two_pts, 7.3, 1.5, 0.9), 0.3);
+  // 区内取到值（x=9.0 在 [8,10] 内，且重叠段 [9,11] 的 0.15 更严）
+  EXPECT_DOUBLE_EQ(
+      zoneSpeedLimitAheadFromProjection(zs, two_pts, 9.0, 1.5, 0.0), 0.15);
+  // 出区（x=11，已过 1 m）⇒ 立刻摘帽（前瞻只看**前方**）
+  EXPECT_DOUBLE_EQ(
+      zoneSpeedLimitAheadFromProjection(zs, two_pts, 11.0, 1.5, 0.9), 0.0);
+  // 侧向偏离时按投影算（车在轴上 8.5 处、侧向偏 1 m，投影仍落在区内；
+  // 前瞻 0.5 m 会摸到更严的重叠段 0.15）
+  EXPECT_DOUBLE_EQ(
+      zoneSpeedLimitAheadFromProjection(zs, two_pts, 8.5, 2.5, 0.5), 0.15);
+  // 退化：单点路径 / 空集合 / 空路径
+  EXPECT_DOUBLE_EQ(zoneSpeedLimitAheadFromProjection(
+                       zs, {Pose2D{9.0, 1.5, 0.0}}, 9.0, 1.5, 1.0),
+                   0.15);
+  EXPECT_DOUBLE_EQ(
+      zoneSpeedLimitAheadFromProjection(ZoneSet{}, two_pts, 9.0, 1.5, 1e9),
+      0.0);
+  EXPECT_DOUBLE_EQ(zoneSpeedLimitAheadFromProjection(zs, {}, 9.0, 1.5, 1e9),
+                   0.0);
+
+  // ---- 用**仿真的真实几何**对照两个接口（限速区在路径起点前 0.7 m）----
+  // 车的路径只有 2 点、长 4.25 m；限速区沿路径占 [0.7, 2.7]。
+  ZoneSet sim;
+  std::vector<MapZone> z;
+  MapZone speed;
+  speed.name = "slow";
+  speed.type = ZoneType::kSpeedLimit;
+  speed.value = 0.15;
+  speed.polygon = {Pose2D{0.7, -1.5, 0.0}, Pose2D{2.7, -1.5, 0.0},
+                   Pose2D{2.7, 1.5, 0.0}, Pose2D{0.7, 1.5, 0.0}};
+  z.push_back(speed);
+  ASSERT_TRUE(sim.adopt(z));
+  const std::vector<Pose2D> sim_path{Pose2D{0.0, 0.0, 0.0},
+                                     Pose2D{4.25, 0.0, 0.0}};
+  // 区内（x=1.7）：两种算法都该给 0.15
+  EXPECT_DOUBLE_EQ(zoneSpeedLimitAhead(sim, sim_path, 0, 0.89), 0.15);
+  EXPECT_DOUBLE_EQ(
+      zoneSpeedLimitAheadFromProjection(sim, sim_path, 1.7, 0.0, 0.89), 0.15);
+  // ★ 已经**开出区**（x=3.7，区后 1 m）：
+  //   · 下标版（仿真里就是传 pass_index_=0）照样返回 0.15 ⇒ 帽摘不掉
+  //     —— 实测车就这样一路 0.15 m/s 爬到终点，Z6"出区后恢复"永远不成立；
+  //   · 投影版返回 0 ⇒ 恢复正常速度。
+  EXPECT_DOUBLE_EQ(zoneSpeedLimitAhead(sim, sim_path, 0, 0.89), 0.15)
+      << "旧接口（下标版）在出区后仍然命中，这正是 bug 的来源";
+  EXPECT_DOUBLE_EQ(
+      zoneSpeedLimitAheadFromProjection(sim, sim_path, 3.7, 0.0, 0.89), 0.0)
+      << "投影版必须在出区后立刻摘帽";
+}
+
 } // namespace
 } // namespace pnc_2d

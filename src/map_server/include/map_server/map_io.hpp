@@ -85,6 +85,44 @@ std::string resolvePcd(const std::string &dir_or_pcd);
  */
 bool loadPcd(const std::string &pcd_path, PointCloud3D &out, std::string &err);
 
+/* ======================= 栅格后处理 ======================= */
+
+/**
+ * 对占据格做**圆形膨胀**（给共享的全局图加一层几 cm 的安全余量）。
+ *
+ * 做的事情：把"离任意**原始**占据格 ≤ radius"的格也标成占据。
+ *
+ * 为什么要它：全局图是共享资产，消费它的模块不都会做朝向感知的车体扫掠检查
+ * （RViz、以后接 nav2/别的导航栈、以及任何"只看中心格"的快速判定）。图上没有
+ * 余量时，这些消费者会把车使到离墙 0 的地方。几 cm 的膨胀层能让"点在图上"就
+ * 自带安全余量。
+ *
+ * 三个容易写错的点（都有单测钉住）：
+ *  1. **只能对原始占据集合盖章**（先收集索引再写），否则一轮轮扩散成 k·radius；
+ *  2. **用圆盘不用方阵**：方阵在斜角上会多出 (√2−1)·r 的余量，看起来像
+ *     "四个方向半径不一致"；
+ *  3. 膨胀量按**格数取整（ceil）** ⇒ 实际值 ≥ 请求值，误差 < 1 格分辨率；
+ *     判据是格心到格心的距离（`dx²+dy² ≤ cells²`），所以
+ *     **cells=1 是十字（5 格，对角格中心距 √2·res > radius，不在盘内）**，
+ *     cells=2 是 13 格（含对角 (±1,±1)）。想要连对角一起盖住，半径必须 > 1 格
+ *     （例：0.05 m 分辨率下用 0.06 m）。
+ *
+ * 未知格（-1）也会被覆盖成占据：膨胀层的语义就是"这些格不可通行"，而"未知怎么算"
+ * 是消费方的事（`common.unknown_as_occupied`）。如果图本来就是 unknown_as_free
+ * 的语义，调用前 -1 已经被换成 0 了。
+ *
+ * @param data    栅格（行优先，`data[y*width+x]`，y=0 在地图**底部**；-1 =
+ * 未知）
+ * @param resolution 分辨率 [m/格]
+ * @param radius  膨胀半径 [m]；<= 0 = 不做事（返回 0）
+ * @param threshold  ≥ 该值算"占据"（与规划器的 hard_threshold 同语义，默认 50）
+ * @param occupied_value 膨胀出来的格子写什么值（默认 100）
+ * @return 新变成占据的格数（0 = 一格未改）
+ */
+std::size_t dilateOccupied(std::vector<int8_t> &data, int width, int height,
+                           double resolution, double radius, int threshold = 50,
+                           int8_t occupied_value = 100);
+
 } // namespace map_server
 
 #endif // MAP_SERVER__MAP_IO_HPP_

@@ -2,7 +2,8 @@
 //
 // 基准是什么（这是本文件的核心问题）：
 //   · **不是** `scripts/mpc.py`（那是早期原型，用户明确不作为参考）；
-//   · 是 **`/home/gmd/SLAM-PNC/PNC` 的 `MpcController`**（`src/controller/src/controller/mpc.cpp`）
+//   · 是 **`/home/gmd/SLAM-PNC/PNC` 的
+//   `MpcController`**（`src/controller/src/controller/mpc.cpp`）
 //     —— 本仓库 MPC 的结构就是照它做的；
 //   · 加上**解析真值**与**KKT 条件**（这两样不依赖任何实现，是硬事实）。
 //
@@ -34,13 +35,12 @@
 namespace pnc_2d {
 namespace {
 
-constexpr int kStateDim = 4;    // [x, y, yaw, v]
-constexpr int kControlDim = 2;  // [a, w]
+constexpr int kStateDim = 4;   // [x, y, yaw, v]
+constexpr int kControlDim = 2; // [a, w]
 
 using Snap = MpcLocalPlanner::QpSnapshot;
 
-MpcLocalPlanner makeMpc(int horizon = 15)
-{
+MpcLocalPlanner makeMpc(int horizon = 15) {
   MpcLocalPlanner mpc;
   MemoryParamReader p;
   p.setInt("local_mpc.horizon", horizon);
@@ -49,8 +49,7 @@ MpcLocalPlanner makeMpc(int horizon = 15)
   return mpc;
 }
 
-std::vector<Pose2D> straightPath(double length, double res)
-{
+std::vector<Pose2D> straightPath(double length, double res) {
   std::vector<Pose2D> p;
   for (double s = 0.0; s <= length + 1e-9; s += res)
     p.push_back(Pose2D{s, 0.0, 0.0});
@@ -58,8 +57,7 @@ std::vector<Pose2D> straightPath(double length, double res)
 }
 
 /// 解一次并给出快照
-Snap solveAndSnapshot(MpcLocalPlanner &mpc, const Pose2D &pose, double v_now)
-{
+Snap solveAndSnapshot(MpcLocalPlanner &mpc, const Pose2D &pose, double v_now) {
   mpc.setCurrentVelocity(v_now, 0.0);
   const auto r = mpc.computeCommand(pose, mpc.params().dt);
   EXPECT_TRUE(r.ok()) << toString(r.status) << " " << r.message;
@@ -75,10 +73,11 @@ Snap solveAndSnapshot(MpcLocalPlanner &mpc, const Pose2D &pose, double v_now)
 namespace slam_pnc_reference {
 
 /// 对应其 `stateIndex(step, off)`：状态**全部**在前
-int stateIndex(int horizon, int step, int off) { return kStateDim * step + off; }
+int stateIndex(int horizon, int step, int off) {
+  return kStateDim * step + off;
+}
 /// 对应其 `controlIndex(step, off)`：控制接在全部状态之后
-int controlIndex(int horizon, int step, int off)
-{
+int controlIndex(int horizon, int step, int off) {
   return kStateDim * (horizon + 1) + kControlDim * step + off;
 }
 
@@ -87,10 +86,11 @@ int controlIndex(int horizon, int step, int off)
 ///   a(0,2) = -v·sin(yaw)·dt;  a(0,3) = cos(yaw)·dt;
 ///   a(1,2) =  v·cos(yaw)·dt;  a(1,3) = sin(yaw)·dt;
 ///   a(2,3) =  tan(steer)/L·dt;
-std::vector<double> referenceA(const MpcReferencePoint &r, double dt, double L)
-{
+std::vector<double> referenceA(const MpcReferencePoint &r, double dt,
+                               double L) {
   std::vector<double> A(static_cast<std::size_t>(kStateDim) * kStateDim, 0.0);
-  for (int i = 0; i < kStateDim; ++i) A[i * kStateDim + i] = 1.0;
+  for (int i = 0; i < kStateDim; ++i)
+    A[i * kStateDim + i] = 1.0;
   A[0 * kStateDim + 2] = -r.v * std::sin(r.yaw) * dt;
   A[0 * kStateDim + 3] = std::cos(r.yaw) * dt;
   A[1 * kStateDim + 2] = r.v * std::cos(r.yaw) * dt;
@@ -101,15 +101,14 @@ std::vector<double> referenceA(const MpcReferencePoint &r, double dt, double L)
   return A;
 }
 
-}  // namespace slam_pnc_reference
+} // namespace slam_pnc_reference
 
 // ============================================================================
 // ① 结构对拍：用从运动学手推出来的期望值逐项比对
 // ============================================================================
 
-TEST(MpcQpReference, DynamicsRowsStructureMatchesKinematics)
-{
-  const int N = 3;  // 小规模便于手推/打印
+TEST(MpcQpReference, DynamicsRowsStructureMatchesKinematics) {
+  const int N = 3; // 小规模便于手推/打印
   auto mpc = makeMpc(N);
   mpc.setGlobalPlan(straightPath(30.0, 0.05));
   // 给它一个非平凡的参考（v ≠ 0、yaw ≠ 0）：全零参考下很多项会退化成 0，
@@ -120,7 +119,9 @@ TEST(MpcQpReference, DynamicsRowsStructureMatchesKinematics)
   ASSERT_EQ(n, kStateDim * (N + 1) + kControlDim * N);
   ASSERT_EQ(snap.m, 4 * (N + 1) + N + 2 * N + 2 * (N - 1) + 2 * N + N);
 
-  auto A = [&](int row, int col) { return snap.A[static_cast<std::size_t>(row) * n + col]; };
+  auto A = [&](int row, int col) {
+    return snap.A[static_cast<std::size_t>(row) * n + col];
+  };
 
   // ---- 初始状态等式：e_0 = e_init ----
   for (int i = 0; i < kStateDim; ++i) {
@@ -150,9 +151,11 @@ TEST(MpcQpReference, DynamicsRowsStructureMatchesKinematics)
     const int row0 = kStateDim + kStateDim * k;
     // 第 0 行（x）：唯一非零是 e_{k+1}(0)=+1、e_k(0)=-1、e_k(2)、e_k(3)
     EXPECT_DOUBLE_EQ(A(row0 + 0, kStateDim * (k + 1) + 0), 1.0);
-    EXPECT_DOUBLE_EQ(A(row0 + 0, kStateDim * k + 0), -1.0) << "★ A 的单位阵项不能漏";
+    EXPECT_DOUBLE_EQ(A(row0 + 0, kStateDim * k + 0), -1.0)
+        << "★ A 的单位阵项不能漏";
     EXPECT_DOUBLE_EQ(A(row0 + 1, kStateDim * (k + 1) + 1), 1.0);
-    EXPECT_DOUBLE_EQ(A(row0 + 1, kStateDim * k + 1), -1.0) << "★ A 的单位阵项不能漏";
+    EXPECT_DOUBLE_EQ(A(row0 + 1, kStateDim * k + 1), -1.0)
+        << "★ A 的单位阵项不能漏";
     // θ/v 两行同样各有单位阵项
     EXPECT_DOUBLE_EQ(A(row0 + 2, kStateDim * (k + 1) + 2), 1.0);
     EXPECT_DOUBLE_EQ(A(row0 + 2, kStateDim * k + 2), -1.0);
@@ -173,15 +176,16 @@ TEST(MpcQpReference, DynamicsRowsStructureMatchesKinematics)
   }
 }
 
-TEST(MpcQpReference, ObjectiveWeightsLandOnTheRightSlots)
-{
+TEST(MpcQpReference, ObjectiveWeightsLandOnTheRightSlots) {
   const int N = 2;
   auto mpc = makeMpc(N);
   mpc.setGlobalPlan(straightPath(30.0, 0.05));
   const auto snap = solveAndSnapshot(mpc, Pose2D{1.0, 0.0, 0.0}, 0.5);
   const auto &P = mpc.params();
   const int n = snap.n;
-  auto Pv = [&](int r, int c) { return snap.P[static_cast<std::size_t>(r) * n + c]; };
+  auto Pv = [&](int r, int c) {
+    return snap.P[static_cast<std::size_t>(r) * n + c];
+  };
 
   // P = 2·(权重矩阵)（OSQP 目标 0.5 z'Pz + q'z）。状态权重 q_*、控制权重 r_*。
   EXPECT_DOUBLE_EQ(Pv(0, 0), 2.0 * P.q_x);
@@ -189,23 +193,24 @@ TEST(MpcQpReference, ObjectiveWeightsLandOnTheRightSlots)
   EXPECT_DOUBLE_EQ(Pv(2, 2), 2.0 * P.q_yaw);
   EXPECT_DOUBLE_EQ(Pv(3, 3), 2.0 * P.q_v);
   // 终端步加权 terminal_weight_scale
-  const int t = kStateDim * N;  // 最后一个状态的 x
+  const int t = kStateDim * N; // 最后一个状态的 x
   EXPECT_DOUBLE_EQ(Pv(t, t), 2.0 * P.q_x * P.terminal_weight_scale);
   // 控制对角
   const int c0 = kStateDim * (N + 1);
   EXPECT_DOUBLE_EQ(Pv(c0 + 0, c0 + 0), 2.0 * P.r_a + 2.0 * P.rd_a);
   EXPECT_DOUBLE_EQ(Pv(c0 + 1, c0 + 1), 2.0 * P.r_w + 2.0 * P.rd_w);
-  // 变化率耦合：w·(u_{k+1}-u_k)² 展开 ⇒ 相邻两个控制的对角各 +2w、上三角交叉 -2w。
-  // 控制块里 k=0 占 c0+0 (a)、c0+1 (w)，k=1 占 c0+2 (a)、c0+3 (w)。
+  // 变化率耦合：w·(u_{k+1}-u_k)² 展开 ⇒ 相邻两个控制的对角各 +2w、上三角交叉
+  // -2w。 控制块里 k=0 占 c0+0 (a)、c0+1 (w)，k=1 占 c0+2 (a)、c0+3 (w)。
   EXPECT_DOUBLE_EQ(Pv(c0 + 2, c0 + 2), 2.0 * P.r_a + 2.0 * P.rd_a);
   EXPECT_DOUBLE_EQ(Pv(c0 + 2, c0 + 0), -2.0 * P.rd_a);
-  EXPECT_DOUBLE_EQ(Pv(c0 + 0, c0 + 2), -2.0 * P.rd_a) << "P 必须对称（快照会对称化）";
+  EXPECT_DOUBLE_EQ(Pv(c0 + 0, c0 + 2), -2.0 * P.rd_a)
+      << "P 必须对称（快照会对称化）";
   // 无障碍时 q 全零（代价是纯二次型，前馈隐含在"e 是绝对误差"里）
-  for (double v : snap.q) EXPECT_DOUBLE_EQ(v, 0.0);
+  for (double v : snap.q)
+    EXPECT_DOUBLE_EQ(v, 0.0);
 }
 
-TEST(MpcQpReference, CorridorRowsAreLateralConstraints)
-{
+TEST(MpcQpReference, CorridorRowsAreLateralConstraints) {
   const int N = 2;
   auto mpc = makeMpc(N);
   RouteCorridor c;
@@ -214,7 +219,9 @@ TEST(MpcQpReference, CorridorRowsAreLateralConstraints)
   mpc.setCorridor(&c);
   const auto snap = solveAndSnapshot(mpc, Pose2D{1.0, 0.2, 0.0}, 0.5);
   const int n = snap.n;
-  auto A = [&](int row, int col) { return snap.A[static_cast<std::size_t>(row) * n + col]; };
+  auto A = [&](int row, int col) {
+    return snap.A[static_cast<std::size_t>(row) * n + col];
+  };
 
   // 行布局：4(N+1) 等式 → N 速度 → 2N 控制 → 2(N-1) 变化率 → 2N 走廊 → N 障碍
   const int base_corr = 4 * (N + 1) + N + 2 * N + 2 * (N - 1);
@@ -234,11 +241,10 @@ TEST(MpcQpReference, CorridorRowsAreLateralConstraints)
   }
 }
 
-TEST(MpcQpReference, FreeModeLeavesCorridorRowsInactive)
-{
+TEST(MpcQpReference, FreeModeLeavesCorridorRowsInactive) {
   const int N = 2;
   auto mpc = makeMpc(N);
-  mpc.setGlobalPlan(straightPath(30.0, 0.05));  // 无走廊 ⇒ free
+  mpc.setGlobalPlan(straightPath(30.0, 0.05)); // 无走廊 ⇒ free
   ASSERT_EQ(mpc.mode(), LocalPlanner::Mode::kFree);
   const auto snap = solveAndSnapshot(mpc, Pose2D{1.0, 0.2, 0.0}, 0.5);
   const int base_corr = 4 * (N + 1) + N + 2 * N + 2 * (N - 1);
@@ -256,14 +262,15 @@ TEST(MpcQpReference, FreeModeLeavesCorridorRowsInactive)
 // ② 与参考实现（SLAM-PNC MpcController）的公式对拍
 // ============================================================================
 
-TEST(MpcQpReference, PositionRowsMatchSlamPncFormulas)
-{
+TEST(MpcQpReference, PositionRowsMatchSlamPncFormulas) {
   const int N = 1;
   auto mpc = makeMpc(N);
   mpc.setGlobalPlan(straightPath(30.0, 0.05));
   const auto snap = solveAndSnapshot(mpc, Pose2D{2.0, 0.05, 0.15}, 0.7);
   const int n = snap.n;
-  auto A = [&](int row, int col) { return snap.A[static_cast<std::size_t>(row) * n + col]; };
+  auto A = [&](int row, int col) {
+    return snap.A[static_cast<std::size_t>(row) * n + col];
+  };
 
   // 参考实现的 A 公式：用**参考点** ref[0]（不是预测轨迹首点）作为线性化点。
   // e_0 的两个分量在初始状态等式的 u[] 里 ⇒ 反推 ref[0]；
@@ -277,10 +284,10 @@ TEST(MpcQpReference, PositionRowsMatchSlamPncFormulas)
   const auto ref = slam_pnc_reference::referenceA(r0, dt, 1.0);
 
   // 位置两行：我们与参考实现**应当逐项相同**（同一套运动学线性化）
-  const int row0 = kStateDim;  // k=0 的动力学行块
+  const int row0 = kStateDim; // k=0 的动力学行块
   for (int i = 0; i <= 1; ++i) {
     for (int c = 0; c < kStateDim; ++c) {
-      const double ours = -A(row0 + i, kStateDim * 0 + c);  // 约束里是 -A(i,c)
+      const double ours = -A(row0 + i, kStateDim * 0 + c); // 约束里是 -A(i,c)
       EXPECT_NEAR(ours, ref[static_cast<std::size_t>(i) * kStateDim + c], 1e-12)
           << "i=" << i << " c=" << c;
     }
@@ -291,8 +298,7 @@ TEST(MpcQpReference, PositionRowsMatchSlamPncFormulas)
   EXPECT_DOUBLE_EQ(A(row0 + 2, kStateDim * (0 + 1) + 2), 1.0);
 }
 
-TEST(MpcQpReference, VariableLayoutMatchesSlamPnc)
-{
+TEST(MpcQpReference, VariableLayoutMatchesSlamPnc) {
   // 参考实现的布局：状态块在前（4(N+1)），控制块在后（2N），步内连续。
   const int N = 4;
   auto mpc = makeMpc(N);
@@ -305,8 +311,10 @@ TEST(MpcQpReference, VariableLayoutMatchesSlamPnc)
   // 控制块起点 = 4(N+1)：用"控制常数行"验证（下界/上界由限幅 + 参考决定）
   const int base_ctrl = 4 * (N + 1) + N;
   const int c0 = kStateDim * (N + 1);
-  EXPECT_DOUBLE_EQ(snap.A[static_cast<std::size_t>(base_ctrl) * snap.n + c0 + 0], 1.0);
-  EXPECT_DOUBLE_EQ(snap.A[static_cast<std::size_t>(base_ctrl + 1) * snap.n + c0 + 1], 1.0);
+  EXPECT_DOUBLE_EQ(
+      snap.A[static_cast<std::size_t>(base_ctrl) * snap.n + c0 + 0], 1.0);
+  EXPECT_DOUBLE_EQ(
+      snap.A[static_cast<std::size_t>(base_ctrl + 1) * snap.n + c0 + 1], 1.0);
 }
 
 // ============================================================================
@@ -322,11 +330,9 @@ struct KktReport {
 };
 
 /// 用**快照出来的稠密矩阵**独立检查 OSQP 给的解。
-/// 注意：这检验的是"OSQP 解对了我们交给它的 QP"，不是"我们交的 QP 就是想要的" ——
-/// 后者由上面的结构对拍负责。两者互补。
-template <typename SnapT>
-KktReport checkKkt(const SnapT &s)
-{
+/// 注意：这检验的是"OSQP 解对了我们交给它的 QP"，不是"我们交的 QP 就是想要的"
+/// —— 后者由上面的结构对拍负责。两者互补。
+template <typename SnapT> KktReport checkKkt(const SnapT &s) {
   KktReport rep;
   if (s.x.empty())
     return rep;
@@ -358,20 +364,22 @@ KktReport checkKkt(const SnapT &s)
       if (y == 0.0)
         continue;
       for (int r = 0; r < n; ++r)
-        grad[static_cast<std::size_t>(r)] += s.A[static_cast<std::size_t>(c) * n + r] * y;
+        grad[static_cast<std::size_t>(r)] +=
+            s.A[static_cast<std::size_t>(c) * n + r] * y;
     }
-    for (double v : grad) rep.dual_residual = std::max(rep.dual_residual, std::fabs(v));
+    for (double v : grad)
+      rep.dual_residual = std::max(rep.dual_residual, std::fabs(v));
   }
   return rep;
 }
 
-}  // namespace
+} // namespace
 
-TEST(MpcQpReference, SolutionSatisfiesKktConditions)
-{
+TEST(MpcQpReference, SolutionSatisfiesKktConditions) {
   // 三组典型场景（自由空间跟踪 / 走廊内 / 贴着障碍）都要满足 KKT。
   auto run = [&](const char *tag, bool corridor, double obstacle_weight,
-                 const Pose2D &start, double v_now, double expect_violation_below) {
+                 const Pose2D &start, double v_now,
+                 double expect_violation_below) {
     MpcLocalPlanner mpc;
     MemoryParamReader p;
     p.setDouble("local_mpc.v_max", 1.0);
@@ -386,7 +394,8 @@ TEST(MpcQpReference, SolutionSatisfiesKktConditions)
     }
     mpc.setCurrentVelocity(v_now, 0.0);
     const auto r = mpc.computeCommand(start, mpc.params().dt);
-    ASSERT_TRUE(r.ok()) << tag << "：" << toString(r.status) << " " << r.message;
+    ASSERT_TRUE(r.ok()) << tag << "：" << toString(r.status) << " "
+                        << r.message;
 
     Snap s;
     mpc.snapshotQp(s);
@@ -405,8 +414,7 @@ TEST(MpcQpReference, SolutionSatisfiesKktConditions)
   run("obstacle", false, 400.0, Pose2D{2.0, 0.05, 0.0}, 0.8, 1e-6);
 }
 
-TEST(MpcQpReference, SolutionIsStationaryWhenNoConstraintActive)
-{
+TEST(MpcQpReference, SolutionIsStationaryWhenNoConstraintActive) {
   // 关掉所有会激活的约束（大限幅、无走廊、无障碍、v_now = v_ref、e 需很小），
   // 此时 QP 是纯二次型且只受初始状态等式约束 → 解应让"控制偏差尽量小"，
   // 且对偶残差应接近机器精度（无激活不等式 ⇒ 无对偶变量）。
@@ -420,11 +428,11 @@ TEST(MpcQpReference, SolutionIsStationaryWhenNoConstraintActive)
 
   const auto snap = solveAndSnapshot(mpc, Pose2D{5.0, 0.0, 0.0}, 1.0);
   const auto rep = checkKkt(snap);
-  std::printf("  [KKT 无约束] 可行性违反 %.3e | 对偶残差 %.3e\n", rep.max_violation,
-              rep.dual_residual);
+  std::printf("  [KKT 无约束] 可行性违反 %.3e | 对偶残差 %.3e\n",
+              rep.max_violation, rep.dual_residual);
   EXPECT_LT(rep.max_violation, 1e-6);
-  EXPECT_LT(rep.dual_residual, 1e-6 * 1e3);  // 权重 ~1e3，按比例给容差
+  EXPECT_LT(rep.dual_residual, 1e-6 * 1e3); // 权重 ~1e3，按比例给容差
 }
 
-}  // namespace
-}  // namespace pnc_2d
+} // namespace
+} // namespace pnc_2d

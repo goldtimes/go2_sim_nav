@@ -59,6 +59,15 @@ struct RouteEdge {
   double yawAt(double s) const;
 };
 
+/// 点到折线（**开放折线**，首尾不闭合）的最近距离 [m]
+///
+/// 用途：判断"路径上的某个点是不是真的落在通道上"（走廊只对落在通道上的点生效，
+/// 见 PlanResult::corridor_width_per_point）。
+/// 注意与 `distanceToPolygon`（区域多边形，内部返回 0）的区别：这里量的是到
+/// **中心线**的距离，偏出 0.2 m 就返回 0.2。
+double distanceToPolyline(double x, double y,
+                          const std::vector<Pose2D> &polyline);
+
 /// 投影结果：世界点落在哪条边、弧长参数、垂足、垂距
 struct RouteProjection {
   bool valid{false};

@@ -4,8 +4,8 @@
 //   1. 库 **ROS-free**：只依赖 ParamReader / CostMap2D / 距离场 / 走廊数据，
 //      单测不必起 ROS；
 //   2. **一套算法覆盖两种模式**：模式不是参数，而是"有没有走廊"这个数据事实 ——
-//      setCorridor() 非空 ⇒ route profile（贴线 + 走廊硬约束），否则 free profile
-//      （跟踪全局路径 + 距离场避障）。见 mode()；
+//      setCorridor() 非空 ⇒ route profile（贴线 + 走廊硬约束），否则 free
+//      profile （跟踪全局路径 + 距离场避障）。见 mode()；
 //   3. 输入分四类：路径 / 走廊 / 地图与距离场 / 动态障碍；输出只有一个：
 //      computeCommand() 给出 (v, ω) 与本周期状态；
 //   4. 谁产生 cmd_vel 由 producesCmdVel() 声明：NullLocalPlanner 返回 false
@@ -29,30 +29,30 @@ class LocalDistanceField;
 
 /// 速度指令（底盘接口是差速：(v, ω)）
 struct Twist2D {
-  double v{0.0};  ///< 前向速度 [m/s]，v ≥ 0（不倒车）
-  double w{0.0};  ///< 角速度 [rad/s]
+  double v{0.0}; ///< 前向速度 [m/s]，v ≥ 0（不倒车）
+  double w{0.0}; ///< 角速度 [rad/s]
 };
 
 /// 局部规划的诊断信息（进 `/pnc_2d/local_status`，也用于日志/调参）
 struct LocalStats {
-  double solve_ms{0.0};      ///< 本周期的求解耗时 [ms]
-  int solver_iter{0};        ///< 求解器迭代数（OSQP 的 iter）
-  double cross_track{0.0};   ///< 当前横向偏差 [m]
-  double progress{0.0};      ///< 路径进度 0~1
-  double time_to_goal{0.0};  ///< 预估剩余时间 [s]
-  int corridor_violations{0};///< 本周期被硬约束修正的次数（>0 说明贴线吃紧）
+  double solve_ms{0.0};       ///< 本周期的求解耗时 [ms]
+  int solver_iter{0};         ///< 求解器迭代数（OSQP 的 iter）
+  double cross_track{0.0};    ///< 当前横向偏差 [m]
+  double progress{0.0};       ///< 路径进度 0~1
+  double time_to_goal{0.0};   ///< 预估剩余时间 [s]
+  int corridor_violations{0}; ///< 本周期被硬约束修正的次数（>0 说明贴线吃紧）
 };
 
 /// 一个控制周期的结果
 struct LocalPlanResult {
   LocalStatus status{LocalStatus::kIdle};
-  std::string message;  ///< 失败/降级时说明原因，不允许空着
+  std::string message; ///< 失败/降级时说明原因，不允许空着
   Twist2D cmd;
   LocalStats stats;
 
-  bool ok() const
-  {
-    // kDegraded 也算"有可用结果"：它意味着**仍在跟踪**，只是缺距离场而保守限速。
+  bool ok() const {
+    // kDegraded
+    // 也算"有可用结果"：它意味着**仍在跟踪**，只是缺距离场而保守限速。
     // 把它排除在外会让调用方把"降级但正常"当成失败（P5.2 的测试就踩过这个）。
     return status == LocalStatus::kFollowing ||
            status == LocalStatus::kGoalReached ||
@@ -80,6 +80,18 @@ public:
   /// 限速（来自路网 speed_limit / 限速区）；<=0 表示不限制
   virtual void setSpeedLimit(double v_limit) = 0;
 
+  /// **限速区的动态速度帽** [m/s]（每周期更新；<=0 = 不限）。
+  ///
+  /// 为什么与 setSpeedLimit 分开：后者是**任务级**的（这条路径上限多少，来自
+  /// 路网/管理器的 min(...)），只在接题/换路径时变；而限速区是**位置相关**的，
+  /// 沿参考前瞻看“前方有没有限速区、最严多少”，每个控制周期都可能变。
+  /// 混成一个接口就会把“任务限速”覆写成“当前区限速”，出了区也回不去。
+  /// 实现约定：算速度上限时取 `min(v_max, setSpeedLimit, 本帽)`。
+  virtual void setZoneSpeedLimit(double v_limit) {
+    zone_speed_limit_ = v_limit;
+  }
+  double zoneSpeedLimit() const { return zone_speed_limit_; }
+
   /// 局部膨胀图（硬碰撞判定用；可能为空 = 还没收到）
   virtual void setCostMap(std::shared_ptr<const CostMap2D> local_inflated) = 0;
   /// 距离场（软代价/引导用；可能为空 = 降级运行）
@@ -95,22 +107,63 @@ public:
   /// 算法特有的**诊断字符串**（可选，默认空）。
   ///
   /// 为什么放在接口上：调参时要看的是算法内部量（参考速度、限速上界、曲率、
-  /// 生效的约束行数……），但节点**不该认识具体算法**（不该 include / dynamic_cast
-  /// 到 MpcLocalPlanner —— 那样每加一个算法就要改节点，也把算法与节点绑死了）。
+  /// 生效的约束行数……），但节点**不该认识具体算法**（不该 include /
+  /// dynamic_cast 到 MpcLocalPlanner ——
+  /// 那样每加一个算法就要改节点，也把算法与节点绑死了）。
   /// 于是让算法自己把想被看到的东西格式化成一行，节点只负责打。
   virtual std::string diagString() const { return {}; }
 
   /// **停车惯性距离** [m]：从"指令变 0"到"车真的停住"，底盘还会自己走多远。
   ///
-  /// 节点用它做"到点判定"的提前量：判定要比的是 `剩余距离 − stopCoast()` 与容差，
-  /// 否则 ① 判定点就等于车的停点，到点误差 = 整车停车惯性（实测 Go2 仿真 ≈4 cm，
-  /// 而用户要求 ≤ 3 cm）；② 提前量写错会反过来：车已停在惯性段内、剩余距离
-  /// 永远大于容差 ⇒ 任务卡死等超时。
+  /// 节点用它做"到点判定"的提前量：判定要比的是 `剩余距离 − stopCoast()`
+  /// 与容差， 否则 ① 判定点就等于车的停点，到点误差 = 整车停车惯性（实测 Go2
+  /// 仿真 ≈4 cm， 而用户要求 ≤ 3 cm）；②
+  /// 提前量写错会反过来：车已停在惯性段内、剩余距离 永远大于容差 ⇒
+  /// 任务卡死等超时。
   ///
   /// 放在接口上而不是节点参数里：它是**算法的终点剖面**用的量（见
   /// `MpcParams::stop_coast`），节点再配一遍就会两边不一致。
   /// 默认 0 = 底盘无惯性（速度可瞬时归零的模型）。
   virtual double stopCoast() const { return 0.0; }
+
+  /// **严格走廊的有效容差** [m]：半宽 0（严格贴线）时的数值下限。
+  ///
+  /// 节点用它判断"车是不是已经在走廊里"——因为走廊**只在车已经在里面时才启用**
+  /// （从车道外用硬约束收敛实测不可行：求解器不收敛、车一步不动）。
+  /// 放在接口上而不是节点参数里：它就是 `MpcParams::corridor_min_tolerance`，
+  /// 两边各配一份一定会不一致（同一个教训见 stopCoast()）。
+  virtual double corridorTolerance() const { return 0.0; }
+
+  /// **本算法允许的最大速度** [m/s]（0 = 未定义 / 不知道）。
+  ///
+  /// 节点用它算"限速区前瞻距离"（`speedLookahead()`）：前瞻必须用**可能达到的**
+  /// 速度，而不是当前速度 —— 否则车越慢前瞻越短、越晚减速，形成自锁。
+  /// 实测（2026-09-23 test_zones 段 3）：车以 0.26 m/s 爬向 0.7 m 外的 0.15
+  /// 限速区， 前瞻 = 0.26²/(2·0.15)+0.3 = 0.53 m < 0.7 m ⇒ 从不触发，最后以
+  /// 0.30 m/s 穿区。
+  virtual double maxSpeed() const { return 0.0; }
+
+  /// **减速能力** [m/s²]（0 = 未定义 / 不知道）。
+  ///
+  /// 节点用它算限速区前瞻距离（`speedLookahead()`）：前瞻必须覆盖"从可能达到的
+  /// 速度减到限速"所需的距离。
+  ///
+  /// ★ 为什么必须在接口上、而不是只放节点参数：它就是 `MpcParams::brake_acc`
+  ///   （终点制动剖面用的**同一个**量）。两边各配一份一定会不一致 —— 实测踩过：
+  ///   节点用代码里的默认 0.15（四足仿真标定值），而 `config/local_mpc.yaml` 里
+  ///   算法是 1.0 ⇒ 前瞻距离相差 6.7 倍，同一个限速区在仿真/实车/E2E 里触发的
+  ///   时机完全不同，而日志上看不出来（两处都"配置了"）。
+  ///   同一个教训见 `stopCoast()` / `corridorTolerance()`。
+  virtual double brakeAcc() const { return 0.0; }
+
+  /// **目标朝向（终点 yaw）容差** [rad]（0 = 不判定朝向）。
+  ///
+  /// 节点用它做**任务级**到点判定：位置进了容差、朝向也进了容差，才叫"到达"。
+  /// 为什么必须在接口上：算法自己就在做"到点后原地对正"（`align_gain` /
+  /// `align_min_clearance` 都是它的参数），两边各配一份容差一定会不一致 ——
+  /// 典型的坏结果：节点按 2° 判、算法按 5° 对正 ⇒ 到点判定永远不满足、
+  /// 任务卡死到超时。同一个教训见 `stopCoast()` / `corridorTolerance()`。
+  virtual double goalYawTolerance() const { return 0.0; }
 
   virtual bool producesCmdVel() const = 0;
 
@@ -120,8 +173,7 @@ public:
   /// 它的状态量是 s = [x, y, θ, v]，缺了 v 就只能假设"车当前静止"，
   /// 于是每周期都从 0 开始加速（实测会表现为走走停停）。
   /// 不放进 computeCommand() 的参数里，是因为那会污染所有算法的签名。
-  virtual void setCurrentVelocity(double v, double w)
-  {
+  virtual void setCurrentVelocity(double v, double w) {
     v_now_ = v;
     w_now_ = w;
   }
@@ -129,8 +181,7 @@ public:
   double currentW() const { return w_now_; }
 
   // ---------------- 基类提供（公共状态与只读查询）----------------
-  Mode mode() const
-  {
+  Mode mode() const {
     return (corridor_ != nullptr && corridor_->valid()) ? Mode::kRoute
                                                         : Mode::kFree;
   }
@@ -140,8 +191,7 @@ public:
   double speedLimit() const { return speed_limit_; }
   const CostMap2D *localCostMap() const { return local_map_.get(); }
   const LocalDistanceField *distanceField() const { return dist_field_; }
-  const std::vector<DynamicObstacle> &dynamicObstacles() const
-  {
+  const std::vector<DynamicObstacle> &dynamicObstacles() const {
     return dynamic_obs_;
   }
   /// 是否处于降级（缺距离场 / 距离场超时）—— 子类可覆盖补充自己的判据
@@ -149,13 +199,14 @@ public:
 
 protected:
   std::vector<Pose2D> plan_;
-  const RouteCorridor *corridor_{nullptr};  ///< 非拥有
+  const RouteCorridor *corridor_{nullptr}; ///< 非拥有
   double speed_limit_{0.0};
+  double zone_speed_limit_{0.0}; ///< 限速区的动态帽（见 setZoneSpeedLimit）
   std::shared_ptr<const CostMap2D> local_map_;
-  const LocalDistanceField *dist_field_{nullptr};  ///< 非拥有
+  const LocalDistanceField *dist_field_{nullptr}; ///< 非拥有
   std::vector<DynamicObstacle> dynamic_obs_;
-  double v_now_{0.0};  ///< 见 setCurrentVelocity()
+  double v_now_{0.0}; ///< 见 setCurrentVelocity()
   double w_now_{0.0};
 };
 
-}  // namespace pnc_2d
+} // namespace pnc_2d

@@ -156,6 +156,50 @@ bool pathFreeBruteForce(const CostMap2D &map, const FootprintParams &fp,
 }
 
 // ==========================================================================
+// 0) 碰撞检查器的分级判据：含余量 / 真实轮廓 / 真实轮廓再让 tol
+//
+// 现实场景：全局图是**被膨胀过**的（真障碍 + map_server.inflate 0.05 +
+// 禁行区按 zones.inflate 0.05 烧入），且障碍边界被量化到 ±半格。
+// 于是"离真障碍 0.28 m"在全局图里量到 0.224 m（最近占据格中心），
+// 而含余量需求是 0.25 m —— 只差 1 mm。这三档判据就是用来分辨
+// "擦一点" / "差一格" / "真撞"的。
+// ==========================================================================
+TEST(FootprintCollisionCheckerTest, StagedMarginsDistinguishGrazeFromHit) {
+  // 真墙在 x = 3.00，但**发布出来的图已被膨胀 0.05**（模拟 map_server.inflate）
+  MapBuilder mb(240, 240);
+  mb.rect(2.95, 0.0, 3.40, 12.0);
+  auto map = mb.build();
+  FootprintParams fp;
+  fp.length = 0.70;
+  fp.width = 0.40;
+  fp.safe_margin = 0.05;
+  FootprintCollisionChecker c;
+  c.configure(fp, kHard, false);
+  c.setMap(map.get());
+  const double side_on = M_PI / 2;   // 侧面对着墙 ⇒ 需求 = 半宽 (+margin)
+
+  // 离真墙 0.285 m（图上占据格从 2.95 起 ⇒ 图里量到 ~0.225）
+  const double x = 3.00 - 0.285;
+  std::printf("  [分级判据] x=%.3f 含余量=%d 真实轮廓=%d 让1格=%d 让2格=%d\n", x,
+              c.poseInCollision(x, 3.0, side_on),
+              c.poseInCollisionAtMargin(x, 3.0, side_on, 0.0),
+              c.poseInCollisionAtMargin(x, 3.0, side_on, -0.05),
+              c.poseInCollisionAtMargin(x, 3.0, side_on, -0.10));
+  EXPECT_TRUE(c.poseInCollision(x, 3.0, side_on)) << "含余量判据应该拦下来";
+  EXPECT_FALSE(c.poseInCollisionAtMargin(x, 3.0, side_on, -0.05))
+      << "穿透 ≤1 格 ⇒ 允许规划（这就是现场卡死的情形）";
+
+  // 离真墙 0.20 m：真实轮廓（半宽 0.20）刚好压上 ⇒ 让一格还能过、让两格过不去
+  const double x2 = 3.00 - 0.20;
+  EXPECT_TRUE(c.poseInCollisionAtMargin(x2, 3.0, side_on, 0.0));
+  EXPECT_FALSE(c.poseInCollisionAtMargin(x2, 3.0, side_on, -0.05));
+
+  // 离真墙 0.06 m：真压进去了 ⇒ 让一格也过不去（应人工处理）
+  const double x3 = 3.00 - 0.06;
+  EXPECT_TRUE(c.poseInCollisionAtMargin(x3, 3.0, side_on, -0.05));
+}
+
+// ==========================================================================
 // 1) 空地直线
 // ==========================================================================
 TEST(AStarPlanner, FreeSpaceStraightLine) {
@@ -300,6 +344,165 @@ TEST(AStarPlanner, StartAndGoalOccupied) {
   auto r2 = planner->plan(
       PlanRequest{mkPose(5.0, 5.0, 0.0), mkPose(11.0, 11.0, 0.0)});
   EXPECT_EQ(r2.status, PlannerStatus::kGoalOccupied);
+}
+
+// ==========================================================================
+// 5b) 起点"撞到安全余量"vs"真的压上障碍"（2026-09-23 实测的任务死锁）
+//
+// 为什么必须分清（现场链条）：全局图是 map_server 发的（真障碍已膨胀、
+// 禁行区已按 zones.inflate 烧入），局部用的是感知图 + 自己的距离场。
+// 两边判据名义上一样但**图不同源** + 栅格有 ±半格离散化 ⇒ "全局刚判过、
+// 另一侧差 1~2 cm" 是常态。若起点一律判死：局部先 BLOCKED → 恢复行为
+// 重规划 → 这里又失败 ⇒ 任务永久 FAILED（车既不动也不结束）。
+// 实测数字：车离禁行区 Z1 边界 0.283 m，含余量需求 0.30 m，差 1.7 cm。
+// ==========================================================================
+TEST(AStarPlanner, StartTouchingMarginStillPlansButRealCollisionFails) {
+  // 真实墙在 x = 3.00，但**发布出来的图已被膨胀 0.05**（map_server.inflate）——
+  // 这就是现场：车离禁行区多边形 0.28 m，而全局图里最近占据格中心只有 0.224 m。
+  // 墙**有尽头**（y∈[6,11]），否则车侧行出不去（需要原地转向，栅格 A* 不建模）。
+  const double wall = 3.00;
+  MapBuilder mb(240, 240);
+  mb.rect(wall - 0.05, 6.0, wall + 0.4, 11.0);
+  MemoryParamReader p;
+  auto planner = makePlanner(p);
+  planner->setCostMap(mb.build());
+
+  // ① 离真墙 0.285 m（侧面对着，落在余量带里：图上需求 0.30）⇒ 虚拟起点 + 首段交给局部
+  const double x_margin = wall - 0.285;
+  auto r1 = planner->plan(PlanRequest{mkPose(x_margin, 7.5, 90.0),
+                                      mkPose(1.0, 10.0, 90.0)});
+  std::printf("  [起点擦边 0.285] %s：%s\n", toString(r1.status), r1.message.c_str());
+  EXPECT_EQ(r1.status, PlannerStatus::kSuccess)
+      << "只差一格（1 mm 量级）不该把任务判死";
+  EXPECT_NE(r1.message.find("可通行位姿"), std::string::npos)
+      << "让步必须**点名说明**，否则现场看不出来";
+  EXPECT_FALSE(r1.path.empty());
+  EXPECT_LT(std::hypot(r1.path.front().x - x_margin, r1.path.front().y - 7.5),
+            0.05) << "首点必须是车自己（后续由局部擦出来）";
+  // ★★ 关键回归：除了首段（车→虚拟起点），**其余路径必须回到完整余量**。
+  //    （第一版把整条路都放宽 ⇒ 一路贴墙走，用户实测“没按全局走、也没避开障碍”）
+  {
+    double worst_far = 1e9;
+    for (std::size_t i = 0; i < r1.path.size(); ++i) {
+      const double dx = r1.path[i].x - x_margin;
+      const double dy = r1.path[i].y - 7.5;
+      if (std::hypot(dx, dy) < 1.5) continue;   // 起点让步圈（1.0 m）内不看
+      worst_far = std::min(worst_far, r1.path[i].x - (wall - 0.05));
+    }
+    std::printf("      圈外最小净距 %.3f m（含图膨胀 0.05 ⇒ 需求 0.30）\n",
+                worst_far + 0.05);
+    EXPECT_GT(worst_far + 0.05, 0.29)
+        << "圈外必须保持完整余量（否则整条路都贴墙走）";
+  }
+
+  // ② 离真墙 0.225 m（真实轮廓需求 0.25 也放不下 ⇒ 车已经贴在余量里）
+  //    ⇒ **不救**，如实报错（规划一条“从贴着的位姿开出去”的路只会擦得更厉害）。
+  const double x_graze = wall - 0.225;
+  auto r2 = planner->plan(PlanRequest{mkPose(x_graze, 7.5, 90.0),
+                                      mkPose(1.0, 10.0, 90.0)});
+  std::printf("  [起点贴到 0.225] %s：%s\n", toString(r2.status), r2.message.c_str());
+  EXPECT_EQ(r2.status, PlannerStatus::kStartFootprintCollision)
+      << "真实轮廓都放不下就该停下报错，不许“贴着墙开出去”";
+
+  // ③ 离真墙 0.06 m（穿透 ≥ 1 格）⇒ 必须报错，交人工
+  const double x_hit = wall - 0.06;
+  auto r3 = planner->plan(PlanRequest{mkPose(x_hit, 7.5, 90.0),
+                                      mkPose(1.0, 10.0, 90.0)});
+  std::printf("  [起点穿透>1格] %s：%s\n", toString(r3.status), r3.message.c_str());
+  EXPECT_EQ(r3.status, PlannerStatus::kStartFootprintCollision)
+      << "穿透超过 1 格时爬着走更危险，必须如实报错";
+  EXPECT_NE(r3.message.find("穿透已超过"), std::string::npos);
+
+  // ③ 关掉让步（半径 0）⇒ 回到严格判据（1 mm 也不算）
+  MemoryParamReader strict;
+  strict.setDouble("astar.start_escape_radius", 0.0);
+  auto sp = makePlanner(strict);
+  sp->setCostMap(mb.build());
+  auto r4 = sp->plan(PlanRequest{mkPose(x_margin, 7.5, 90.0),
+                                 mkPose(1.0, 10.0, 90.0)});
+  EXPECT_EQ(r4.status, PlannerStatus::kStartFootprintCollision);
+}
+
+// ==========================================================================
+// 5c) 全局层的“净距偏好”（2026-09-23 用户要求：让局部远离障碍/禁行区）
+//
+// 为什么用“偏好”而不是把膨胀调大：用户定的规则是“机体 0.40 + 左右各 10 cm =
+// 最窄可通 0.60 m”⇒ 硬判据只能停在 0.30 m（半宽 0.20 + margin 0.05 + 图膨胀 0.05）。
+// 硬层再加就会把 0.60 m 的通道直接判死；而偏好（软代价）只是“同样可达时走远一点”，
+// 窄通道照样过得去 —— 这两条一起钉住。
+// ==========================================================================
+TEST(AStarPlanner, ClearancePreferencePrefersMiddleAndKeepsNarrowPassage) {
+  // ---- ① 绕过柱子：最短的路贴着柱角过（~0.30 m），开偏好后走远一点 ----
+  //
+  // ⚠ 几何要选对：**窄而浅的走廊测不出偏好** —— 车长 0.70（半长 0.40），
+  //   离墙 0.30 时它根本转不了身（任何朝向变化都让 y 向尺度涨到 0.46），
+  //   栅格 A* 的节点朝向 = 运动方向 ⇒ 只能直着走，偏好无处可去（实测踩过）。
+  //   所以要给"能绕"的空间：中间一根 0.4×0.4 的柱子。
+  MapBuilder mb(240, 240);                     // 12×12 m
+  const double bx0 = 5.0, bx1 = 5.4, by0 = 2.0, by1 = 2.4;
+  mb.rect(bx0, by0, bx1, by1);
+  const double y_lane = 2.2;                   // 正对柱子走 ⇒ 必须绕
+  auto map = mb.build();
+  auto clearanceToBlock = [&](const PlanResult &r) {
+    double worst = 1e9;
+    for (std::size_t i = 1; i + 1 < r.path.size(); ++i) {
+      const double dx = std::max({bx0 - r.path[i].x, 0.0, r.path[i].x - bx1});
+      const double dy = std::max({by0 - r.path[i].y, 0.0, r.path[i].y - by1});
+      worst = std::min(worst, std::hypot(dx, dy));
+    }
+    return worst;
+  };
+  double d_off = 0.0, d_on = 0.0, len_on = 0.0;
+  {
+    MemoryParamReader p;                       // 默认：偏好关
+    auto planner = makePlanner(p);
+    planner->setCostMap(map);
+    const auto r = planner->plan(
+        PlanRequest{mkPose(1.0, y_lane, 0.0), mkPose(10.0, y_lane, 0.0)});
+    ASSERT_EQ(r.status, PlannerStatus::kSuccess) << r.message;
+    d_off = clearanceToBlock(r);
+    std::printf("  [净距偏好] 关：绕柱最小净距 %.3f m | %zu 点 %.2f m\n", d_off,
+                r.path.size(), r.stats.path_length);
+    EXPECT_LT(d_off, 0.45) << "关掉偏好时应该贴着柱角过";
+  }
+  {
+    MemoryParamReader p;
+    p.setDouble("planner.clearance_prefer_dist", 0.60);
+    p.setDouble("planner.clearance_cost_weight", 2.0);
+    auto planner = makePlanner(p);
+    planner->setCostMap(map);
+    const auto r = planner->plan(
+        PlanRequest{mkPose(1.0, y_lane, 0.0), mkPose(10.0, y_lane, 0.0)});
+    ASSERT_EQ(r.status, PlannerStatus::kSuccess) << r.message;
+    d_on = clearanceToBlock(r);
+    len_on = r.stats.path_length;
+    std::printf("  [净距偏好] 开：绕柱最小净距 %.3f m | %.2f m\n", d_on, len_on);
+    EXPECT_GT(d_on, 0.50) << "开了偏好应该离柱子更远";
+    EXPECT_GT(d_on, d_off + 0.10) << "而且要比关掉时明显更远";
+    EXPECT_LT(len_on, 12.0) << "只是让开一点，不该绕远";
+  }
+
+  // ---- ② 0.60 m 窄通道（= 用户规则“机体 0.40 + 左右各 10 cm”）：偏好是软的，
+  //      不能把这种通道判死 ----
+  MapBuilder mb2(240, 240);
+  mb2.rect(3.0, 0.0, 8.0, 3.00);               // 下墙，留出 y∈[3.00,3.60]
+  mb2.rect(3.0, 3.60, 8.0, 12.0);              // 上墙
+  MemoryParamReader p2;
+  p2.setDouble("planner.clearance_prefer_dist", 0.60);
+  p2.setDouble("planner.clearance_cost_weight", 2.0);
+  auto planner2 = makePlanner(p2);
+  planner2->setCostMap(mb2.build());
+  const auto r2 = planner2->plan(
+      PlanRequest{mkPose(1.0, 3.30, 0.0), mkPose(10.0, 3.30, 0.0)});
+  std::printf("  [净距偏好] 0.60 m 通道：%s\n", toString(r2.status));
+  ASSERT_EQ(r2.status, PlannerStatus::kSuccess)
+      << "偏好是软的，0.60 m（左右各 10 cm）必须仍然可通：" << r2.message;
+  for (const auto &p : r2.path) {
+    if (p.x > 3.2 && p.x < 7.8) {
+      ASSERT_GT(p.y, 3.24) << "通道里不该压墙";
+      ASSERT_LT(p.y, 3.36) << "通道里不该压墙";
+    }
+  }
 }
 
 // ==========================================================================

@@ -2,9 +2,13 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <utility>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -317,6 +321,58 @@ bool loadPcd(const std::string &pcd_path, PointCloud3D &out, std::string &err) {
         std::to_string(points) + " 点 | FIELDS =" + fields +
         " | DATA =" + data_fmt;
   return false;
+}
+
+std::size_t dilateOccupied(std::vector<int8_t> &data, int width, int height,
+                           double resolution, double radius, int threshold,
+                           int8_t occupied_value) {
+  if (radius <= 0.0 || resolution <= 0.0 || width <= 0 || height <= 0)
+    return 0;
+  const std::size_t n = static_cast<std::size_t>(width) * height;
+  if (data.size() != n)
+    return 0;
+
+  // 膨胀半径换成**格数**（向上取整）：保证实际余量 ≥ 请求值，误差不超过一格。
+  const int cells =
+      std::max(1, static_cast<int>(std::ceil(radius / resolution - 1e-9)));
+
+  // 圆盘偏移表：dx²+dy² ≤ cells²（用圆而不是方阵，见头文件第 2 点）
+  std::vector<std::pair<int, int>> offsets;
+  for (int dy = -cells; dy <= cells; ++dy)
+    for (int dx = -cells; dx <= cells; ++dx)
+      if (dx * dx + dy * dy <= cells * cells)
+        offsets.emplace_back(dx, dy);
+
+  // ★ 先把**原始**占据格收集起来，再统一盖章：边收集边写的话，本轮新写的格会在
+  //   下一轮再被当成"原始占据"继续往外扩，膨胀量变成 k·radius（k = 邻域轮数）。
+  std::vector<int> src;
+  src.reserve(1024);
+  for (int y = 0; y < height; ++y) {
+    const int8_t *row = &data[static_cast<std::size_t>(y) * width];
+    for (int x = 0; x < width; ++x)
+      if (row[x] >= threshold)
+        src.push_back(y * width + x);
+  }
+  if (src.empty())
+    return 0;
+
+  std::size_t changed = 0;
+  for (const int idx : src) {
+    const int cx = idx % width;
+    const int cy = idx / width;
+    for (const auto &[dx, dy] : offsets) {
+      const int nx = cx + dx;
+      const int ny = cy + dy;
+      if (nx < 0 || nx >= width || ny < 0 || ny >= height)
+        continue;
+      int8_t &cell = data[static_cast<std::size_t>(ny) * width + nx];
+      if (cell >= threshold)
+        continue; // 已经是占据（含原始障碍自己）
+      cell = occupied_value;
+      ++changed;
+    }
+  }
+  return changed;
 }
 
 } // namespace map_server

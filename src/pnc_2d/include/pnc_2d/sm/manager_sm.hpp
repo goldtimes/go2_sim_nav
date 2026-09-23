@@ -3,7 +3,8 @@
 // 用法（节点的视角）：
 //   ManagerSm sm(params);
 //   auto tr = sm.handle(Event::kGoalReceived);   // 问："该干什么？"
-//   if (tr.accepted) { 按 tr.effect 去调 ROS; }   // 做完把结果变成下一个事件喂回来
+//   if (tr.accepted) { 按 tr.effect 去调 ROS; }   //
+//   做完把结果变成下一个事件喂回来
 //
 // 关键设计：**handle() 不阻塞、不做副作用**。它只回答两件事：
 //   1. 这个事件在当前状态下收不收（不收就保持原状态，并给出原因）；
@@ -21,16 +22,16 @@
 //   Planning    Cancel         Idle          StopRobot
 //   Planning    GoalReceived   Planning      PlanPath（顶掉旧目标）
 //   Following   Reached        GoalReached   StopRobot
-//   Following   Blocked        Recovering    StopRobot      ← 计数+1
-//   Following   Stuck          Recovering    StopRobot      ← 计数+1
+//   Following   Blocked        Recovering    RunRecovery    ← 计数+1
+//   Following   Stuck          Recovering    RunRecovery    ← 计数+1
 //   Following   FollowFail     Failed        StopRobot
 //   Following   OdomJump       Planning      PlanPath（旧路径基于旧位姿）
 //   Following   GoalReceived   Planning      PlanPath（新目标打断旧任务）
 //   Following   Cancel         Idle          StopRobot
-//   Recovering  RecoveryDone   Following     StartFollow    ← "成功回 Following"（doc §6 P4）
-//   Recovering  RecoveryFail   超限?Failed:Recovering  StopRobot / RunRecovery
-//   Recovering  Blocked/Stuck  Recovering    StopRobot      ← 恢复期间又被挡：不叠加计数
-//   Recovering  Cancel         Idle          StopRobot
+//   Recovering  RecoveryDone   Planning      PlanPath       ← ★
+//   恢复后先重规划再跟随 Recovering  RecoveryFail   超限?Failed:Recovering
+//   StopRobot / RunRecovery Recovering  Blocked/Stuck  Recovering    StopRobot
+//   ← 恢复期间又被挡：不叠加计数 Recovering  Cancel         Idle StopRobot
 //   GoalReached GoalReceived   Planning      PlanPath
 //   GoalReached Cancel         Idle          StopRobot
 //   Failed      GoalReceived   Planning      PlanPath
@@ -51,14 +52,16 @@ namespace pnc_2d {
 
 /// 进入新状态时该执行的动作（节点的薄壳负责翻译成 ROS 调用）
 enum class SideEffect : uint8_t {
-  kNone = 0,     ///< 什么都不用做（只是记录状态变化）
-  kPlanPath,     ///< 调 global 的 PlanPath 服务；完成 → kPlanOk / kPlanFail
-  kStartFollow,  ///< 把路径交给 local 的 FollowPath action；结果 → kReached/kBlocked/…
-  kStopRobot,    ///< 停车：取消跟随 action + 发零速（P4 的 Null 不发速度，但语义要保留）
-  kRunRecovery,  ///< 执行一次恢复行为；完成 → kRecoveryDone / kRecoveryFail
+  kNone = 0,    ///< 什么都不用做（只是记录状态变化）
+  kPlanPath,    ///< 调 global 的 PlanPath 服务；完成 → kPlanOk / kPlanFail
+  kStartFollow, ///< 把路径交给 local 的 FollowPath action；结果 →
+                ///< kReached/kBlocked/…
+  kStopRobot,   ///< 停车：取消跟随 action + 发零速（P4 的 Null
+                ///< 不发速度，但语义要保留）
+  kRunRecovery, ///< 执行一次恢复行为；完成 → kRecoveryDone / kRecoveryFail
 };
 
-const char * toString(SideEffect e);
+const char *toString(SideEffect e);
 
 /// 可调参数（从 `sm.*` 读）
 struct SmParams {
@@ -72,20 +75,20 @@ struct SmParams {
 
 /// 一次转移的答案
 struct Transition {
-  bool accepted{false};          ///< 事件是否被接受（false = 保持原状态）
+  bool accepted{false}; ///< 事件是否被接受（false = 保持原状态）
   State from{State::kIdle};
   State to{State::kIdle};
   SideEffect effect{SideEffect::kNone};
-  std::string reason;            ///< 接受=转移说明；拒绝=为什么拒绝
+  std::string reason; ///< 接受=转移说明；拒绝=为什么拒绝
 
   bool changed() const { return accepted && from != to; }
 };
 
 /// 运行统计（进 /pnc_2d/state，用来回答"到底重规划了几次"）
 struct SmStats {
-  int plan_requests{0};   ///< 已发出的全局规划请求次数（含失败重试）
-  int plan_failures{0};   ///< 其中失败次数
-  int recoveries{0};      ///< 已触发的恢复行为次数
+  int plan_requests{0}; ///< 已发出的全局规划请求次数（含失败重试）
+  int plan_failures{0}; ///< 其中失败次数
+  int recoveries{0};    ///< 已触发的恢复行为次数
 };
 
 class ManagerSm {
@@ -122,4 +125,4 @@ private:
   Transition last_;
 };
 
-}  // namespace pnc_2d
+} // namespace pnc_2d

@@ -26,6 +26,7 @@ namespace pnc_2d {
 /// 距离场（ESDF）查询接口：P5 实现（`core/local_distance_field.hpp`）。
 /// 这里只前向声明，避免 P3 就引入实现细节。
 class LocalDistanceField;
+class ReferenceProfile;
 
 /// 速度指令（底盘接口是差速：(v, ω)）
 struct Twist2D {
@@ -41,6 +42,21 @@ struct LocalStats {
   double progress{0.0};       ///< 路径进度 0~1
   double time_to_goal{0.0};   ///< 预估剩余时间 [s]
   int corridor_violations{0}; ///< 本周期被硬约束修正的次数（>0 说明贴线吃紧）
+  // ---- 上游剖面一致性（M4.4 / R9）----
+  /// ① **参考口径**：`|v_ref − v_剖面(s)| / max(v_剖面(s), 0.1)`
+  ///    回答"剖面被采纳了吗 / 被谁的限速盖住了"（底盘、任务、区域、终点爬行）。
+  ///    `0` = 剖面就是本周期生效的上限；**`< 0` = 本周期无剖面（不适用）**。
+  /// ② **跟踪口径**：`|v_实测 − v_ref| / max(v_ref, 0.1)`，回答"控制器跟不跟得上
+  ///    它自己的参考"。
+  ///
+  /// ★ 为什么必须拆成两个（2026-09-24 实测踩过）：最初只算了"v_实测 vs v_剖面"
+  ///   一个数，于是在任何**起步/原地对正之后**都是 70%~100%（对正 3.5 s 里弧长
+  ///   不前进、车从 0 加速，而剖面还在说 0.1 m/s）—— 假警报工厂，而且会把"剖面
+  ///   工作正常"读成"剖面没生效"。两个问题要用两个数回答，混在一起两边都答错。
+  double profile_dev{-1.0};
+  double profile_v{0.0};      ///< 上游 v_剖面(s) [m/s]
+  double profile_v_ref{0.0};  ///< MPC 采纳的参考速度 v_ref [m/s]
+  double profile_track_dev{-1.0};
 };
 
 /// 一个控制周期的结果
@@ -96,6 +112,11 @@ public:
   virtual void setCostMap(std::shared_ptr<const CostMap2D> local_inflated) = 0;
   /// 距离场（软代价/引导用；可能为空 = 降级运行）
   virtual void setDistanceField(const LocalDistanceField *field) = 0;
+  /// 参考速度剖面（M4.3）：上游（全局规划器 / MINCO）算好的"弧长 → v/ω"表。
+  /// `nullptr` = 没有剖面 ⇒ **完全走本地既有逻辑**（自己按曲率与制动限速）。
+  /// 生命周期由调用方保证（与 setDistanceField 同款约定：节点拥有、算法借用）。
+  /// 默认空实现：非 MPC 算法（如 NullLocalPlanner）不需要关心它。
+  virtual void setReferenceProfile(const ReferenceProfile * /*profile*/) {}
   /// 动态障碍（v1 反应式：只收不用；接口先留好，见 §7）
   virtual void setDynamicObstacles(const std::vector<DynamicObstacle> &obs) = 0;
 

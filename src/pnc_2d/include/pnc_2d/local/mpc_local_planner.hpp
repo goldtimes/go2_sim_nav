@@ -56,6 +56,8 @@
 
 namespace pnc_2d {
 
+class ReferenceProfile; ///< M4.3：上游速度剖面（此处只用指针）
+
 /// 参考轨迹上的一点：位置 + 朝向 + 参考速度/加速度/角速度
 /// （对应 SLAM-PNC 的 MpcReferencePoint，去掉了阿克曼的 steering_angle）
 struct MpcReferencePoint {
@@ -105,8 +107,17 @@ struct MpcParams {
 
   // ---------------- 参考轨迹 ----------------
   double reference_speed{0.0}; ///< >0 时覆盖"默认巡航速度"（0 = 用 v_max/限速）
+  /// ★★ A/B 开关（M4.3）：是否用**上游剖面**（`setReferenceProfile()` 给的那一份）
+  ///   作为速度上限。
+  ///   true （默认）：有剖面时**换掉**本地的曲率限速，并用剖面的 ω 顶替 κ·v；
+  ///   false：完全忽略剖面（= M4.2 之前的现网行为，做对照用）。
+  bool use_upstream_profile{true};
   double lat_acc_max{1.5};     ///< 曲率限速用：允许的最大向心加速度 [m/s²]
-  double brake_acc{1.0};       ///< 终点制动剖面用的减速度 [m/s²]
+  /// 终点制动剖面用的减速度 [m/s²]。
+  /// ★ 有上游剖面时它**仍然是兜底**（不是冗余）：上游剖面可能只覆盖前 N 米，
+  ///   尾部需要它接手；而且 `brake_acc` 比 `traj.a_max` 大时上游总是更紧，
+  ///   两者不会打架（详见 `speedLimitAt()` 的注释）。
+  double brake_acc{1.0};
   double curvature_lookahead{2.0}; ///< 曲率前瞻距离 [m]（提前减速）
   double back_window{1.0}; ///< 投影允许向后回退的最大弧长 [m]（防进度抖）
 
@@ -270,6 +281,14 @@ struct MpcSolveInfo {
 
   // ---- 调参诊断（"为什么只发这么慢/为什么在扭"只能靠这些量说清）----
   double ref_v{0.0};   ///< 参考窗口第一步的速度 ref[0].v（= 本周期限速）
+  /// 参考窗口第一步的角速度 ref[0].w（M4.3：有上游剖面时它**来自剖面**，
+  /// 否则来自本地 κ·v）。A/B 表里"ω 反向次数/RMS|ω|"就看它。
+  double ref_w{0.0};
+  /// 上游剖面一致性（M4.4 / R9）：`prof_dev < 0` = 本周期没有剖面。
+  /// 口径同 `LocalStats::profile_dev`：分"参考偏差"与"跟踪偏差"两个数。
+  double prof_v{0.0};
+  double prof_dev{-1.0};
+  double prof_track_dev{-1.0};
   double v_now{0.0};   ///< 反馈进来的实际速度
   double ev0{0.0};     ///< 初始速度误差 e_v(0) = v_now - ref[0].v
   double curv{0.0};    ///< 前瞻段内最大 |κ|
@@ -313,6 +332,7 @@ public:
   void setSpeedLimit(double v_limit) override;
   void setCostMap(std::shared_ptr<const CostMap2D> local_inflated) override;
   void setDistanceField(const LocalDistanceField *field) override;
+  void setReferenceProfile(const ReferenceProfile *profile) override;
   void setDynamicObstacles(const std::vector<DynamicObstacle> &obs) override;
 
   LocalPlanResult computeCommand(const Pose2D &pose, double dt) override;
@@ -402,6 +422,10 @@ private:
   MpcReferencePoint sampleAt(double s, double lookahead) const;
   /// 参考速度剖面：v_max/限速 ∩ 曲率限速 ∩ 终点制动
   double speedLimitAt(double s) const;
+
+  /// 是否有一份**可用**的上游剖面（A/B 开关 ⊕ 非空 ⊕ 有效）。
+  /// 定义在 .cpp：这里只需要指针，但 `valid()` 需要完整类型。
+  bool hasUpstreamProfile() const;
   /// 构造 N+1 点参考窗口（从弧长 s0 起，按 v_ref 积分推进）
   bool buildReferenceWindow(double s0,
                             std::vector<MpcReferencePoint> &window) const;
@@ -440,6 +464,10 @@ private:
   std::vector<double> ref_curv_; ///< |κ|（1/m）
   std::vector<double> ref_yaw_;  ///< 切线朝向（离散点处的朝向更平滑）
   double ref_length_{0.0};
+
+  /// 上游速度剖面（M4.3）。**非拥有**：节点拥有（`local_planner_node::ref_profile_`），
+  /// 算法只是每周期借用 —— 与 `dist_field_` 同款约定。nullptr = 没有剖面。
+  const ReferenceProfile *profile_{nullptr};
 
   /// 当前进度（弧长），用于防倒退与"卡住"诊断
   double progress_s_{0.0};

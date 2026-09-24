@@ -59,6 +59,18 @@ geometry_msgs::msg::Quaternion quaternionFromYaw(double yaw) {
   return q;
 }
 
+/// 允许的"起点机头 vs 路径方向"最大差角 [rad]（超过就不做时间参数化，见
+/// applyTrajectory 里的说明）。45° = 明显不是"顺着路开"的场景，交给局部原地对正。
+constexpr double kMaxHeadingDiff = 45.0 * M_PI / 180.0;
+
+/// 折线长度 [m]（M4：轨迹到路径的截断点/接点算弧长用，口径与局部侧一致）
+double polylineLength(const std::vector<Pose2D> &pts) {
+  double len = 0.0;
+  for (std::size_t i = 1; i < pts.size(); ++i)
+    len += std::hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+  return len;
+}
+
 } // namespace
 
 class GlobalPlannerNode : public rclcpp::Node {
@@ -81,6 +93,13 @@ public:
     // 规划器不该替它做决定；需要这个便利行为时把它打开即可。
     clear_on_reach_ = paramBool("clear.auto_on_goal_reached", false);
     reach_tol_ = paramDouble("clear.goal_tolerance", 0.30);
+
+    // 轨迹优化后端（M4.2）：`traj.type` = none | minco。
+    // ★ 默认 **none**：这条链路刚接通，先用 A/B 开关拿数据（同一张图、同一个
+    //   目标各跑一遍），确认无回归再改默认值 —— 与 P5/P6 两期的做法一致。
+    traj_type_ = paramString("traj.type", "none");
+    traj_spacing_ = paramDouble("traj.publish_spacing", 0.05);
+    buildTrajectoryOptimizer();
 
     // 创建 + 配置（启动、热切换、热重载共用同一段逻辑）
     {
@@ -201,7 +220,6 @@ public:
           }
         });
 
-    const FootprintParams &fp = planner_->footprintParams();
     RCLCPP_INFO(get_logger(),
                 "[planner] type=%s frame=%s | 地图 %s | 位姿 %s | 目标 %s | "
                 "路径 %s | 状态 %s",
@@ -306,6 +324,10 @@ private:
     }
     planner_->setCostMap(map);
     map_ = map; // 热切换/热重载时要把同一张图交给新规划器
+    // ★ 必须在这里重新接线：`setCostMap()` → `rebuildCollisionServices()` 会
+    //   重建 `ClearanceField` ⇒ 优化器手里那个指针已经悬空（见
+    //   wireTrajectoryOptimizer 的说明）。
+    wireTrajectoryOptimizer();
     has_map_ = true;
     has_map_meta_ = true;
     map_load_time_ = msg->info.map_load_time;
@@ -408,6 +430,7 @@ private:
       next->setCostMap(map_); // 路网模式在这里做可行性校验
     planner_ = std::move(next);
     planner_type_ = type;
+    wireTrajectoryOptimizer();
     clearPlan("切换算法");
     logFootprintInfo();
     logRoutesInfo();
@@ -424,6 +447,7 @@ private:
     if (map_)
       next->setCostMap(map_);
     planner_ = std::move(next);
+    wireTrajectoryOptimizer();
     clearPlan("热重载参数");
     logFootprintInfo();
     logRoutesInfo();
@@ -439,6 +463,38 @@ private:
     start_.has_yaw = true;
     odom_frame_ = msg->header.frame_id;
     has_odom_ = true;
+
+    // 上行速度（M4.2）：MINCO 要知道"车现在多快"才能把剖面接上。
+    // ★ 两个来源，优先级不同，**不能只信一个**：
+    //   ① odom 的 twist：最准，但很多定位源只填 pose（字段恒为 0）；
+    //   ② 位姿差分：0.25 s 窗口 + 一阶低通，抖动小时直接归零。
+    //   若只取 ①，在"定位不填 twist"的现场会永远当静止起步（剖面首速 0）；
+    //   若只取 ②，在 10 Hz 定位下用单帧差分噪声极大（÷0.1 s 会放大 10 倍）。
+    if (std::isfinite(msg->twist.twist.linear.x)) {
+      odom_v_ = msg->twist.twist.linear.x;
+      odom_w_ = msg->twist.twist.angular.z;
+      odom_twist_ok_ = true;
+    }
+    const rclcpp::Time t = now();
+    if (has_prev_pose_) {
+      const double dt = (t - prev_stamp_).seconds();
+      const double d = std::hypot(start_.x - prev_pose_.x,
+                                  start_.y - prev_pose_.y);
+      if (dt > 0.0 && dt < 1.0) {
+        pose_acc_d_ += d;
+        pose_acc_t_ += dt;
+        if (pose_acc_t_ >= 0.25) {
+          const double v = pose_acc_d_ / pose_acc_t_;
+          // 抖动（< 2 cm/s 平均）直接归零，不要把噪声低通成"假装在动"
+          pose_speed_ = (v > 0.02) ? 0.4 * pose_speed_ + 0.6 * v : 0.0;
+          pose_acc_d_ = 0.0;
+          pose_acc_t_ = 0.0;
+        }
+      }
+    }
+    prev_pose_ = start_;
+    prev_stamp_ = t;
+    has_prev_pose_ = true;
 
     // 到达目标就收掉路径：路径是事件驱动产物，任务完成了就不该再挂在
     // latched 话题上（RViz 会一直显示）。
@@ -504,6 +560,7 @@ private:
     // 区域层信息（限速 + 起终点在禁行区内的点名）要在发布前用上
     PlanResult result = planner_->plan(req);
     applyZoneInfo(result, req);
+    applyTrajectory(result, req);
     publishResult(result, req);
   }
 
@@ -593,6 +650,9 @@ private:
 
     PlanResult result = planner_->plan(pr);
     applyZoneInfo(result, pr);
+    // 轨迹优化（M4.2）：**必须在 applyZoneInfo 之后**（它可能把结果改成失败，
+    // 那就没必要优化了），且在 publishResult / 填响应**之前**（它可能换掉路径）。
+    applyTrajectory(result, pr);
     if (req->publish_result)
       publishResult(result, pr);
 
@@ -631,6 +691,21 @@ private:
       if (result.strictCorridor())
         std::fill(res->corridor_width.begin(), res->corridor_width.end(), 0.0);
     }
+    // 参考速度剖面（M4.2）：与走廊同一口径 —— 只透传，不在这里取 min/截断。
+    // ★ 契约：`traj_s/traj_v/traj_w` **等长**且 `s` 严格递增；不满足时宁可
+    //   置 `traj_valid=false` 让调用方回退旧行为，也不要发半张表出去
+    //   （`pnc_manager_node` 也会再校一道，两边口径一致）。
+    res->traj_valid = traj_valid_ && traj_s_.size() >= 2 &&
+                      traj_s_.size() == traj_v_.size() &&
+                      traj_s_.size() == traj_w_.size();
+    res->traj_note = traj_note_;
+    if (res->traj_valid) {
+      res->traj_s = traj_s_;
+      res->traj_v = traj_v_;
+      res->traj_w = traj_w_;
+    } else if (!traj_note_.empty()) {
+      RCLCPP_INFO(get_logger(), "[traj] 本次无剖面：%s", traj_note_.c_str());
+    }
     res->path.header.stamp = now();
     res->path.header.frame_id = frame_id_;
     for (const auto &p : result.path) {
@@ -642,6 +717,268 @@ private:
       ps.pose.orientation = quaternionFromYaw(p.has_yaw ? p.yaw : 0.0);
       res->path.poses.push_back(ps);
     }
+  }
+
+  /// 按 `traj.type` 建轨迹优化后端，并把**同一份**地图/距离场/轮廓判定器接上。
+  void buildTrajectoryOptimizer() {
+    traj_opt_ = createTrajectoryOptimizer(traj_type_);
+    if (!traj_opt_) {
+      if (!traj_type_.empty() && traj_type_ != "none" && traj_type_ != "null") {
+        std::string names;
+        for (const auto &n : availableTrajectoryOptimizers())
+          names += (names.empty() ? "" : ", ") + n;
+        RCLCPP_ERROR(
+            get_logger(),
+            "[traj] 未知 traj.type='%s'（可用：%s）→ 本次不启用轨迹优化",
+            traj_type_.c_str(), names.c_str());
+      }
+      return;
+    }
+    RosParamReader reader(*this);
+    if (!traj_opt_->configure(reader)) {
+      RCLCPP_ERROR(get_logger(), "[traj] traj.type='%s' 参数装载失败 → 不启用",
+                   traj_type_.c_str());
+      traj_opt_.reset();
+      return;
+    }
+    wireTrajectoryOptimizer();
+    RCLCPP_INFO(get_logger(),
+                "[traj] 已启用轨迹优化后端 %s（free 模式生效；路径发布间距 "
+                "%.3f m）",
+                traj_opt_->type().c_str(), std::max(0.05, traj_spacing_));
+  }
+
+  /// 把当前的地图/距离场/轮廓判定器交给优化器。
+  /// ★ **换图、换算法、热重载之后都必须再调一次**：基类的
+  ///   `rebuildCollisionServices()` 会重建 `ClearanceField`（指针会变），
+  ///   而 `switchPlanner()` / `reloadParams()` 更是把整个 `planner_` 换掉 ⇒
+  ///   旧指针立刻悬空（用悬空指针跑优化 = 段错误或静默算错净距）。
+  ///   这就是"借出去的那一份"的代价：借用方必须跟着重取。
+  void wireTrajectoryOptimizer() {
+    if (!traj_opt_)
+      return;
+    traj_opt_->setMap(map_);
+    traj_opt_->setClearanceField(planner_ ? planner_->clearanceField()
+                                          : nullptr);
+    traj_opt_->setCollisionChecker(planner_ ? &planner_->collisionChecker()
+                                            : nullptr);
+    traj_opt_->reset();
+  }
+
+  /// 上行线速度 [m/s]（MINCO 的 `start_v`）
+  double startSpeed() {
+    if (odom_twist_ok_ && std::fabs(odom_v_) > 1e-3)
+      return std::fabs(odom_v_);
+    return pose_speed_;
+  }
+
+  /// 上行角速度 [rad/s]（MINCO 的 `start_omega`）。
+  /// 位姿差分估角速度噪声太大 ⇒ 拿不到 twist 时**宁可给 0**（按"不转"起步，
+  /// 偏保守，但不给优化器喂假数据）。
+  double startOmega() {
+    if (odom_twist_ok_ && std::fabs(odom_w_) > 1e-3)
+      return odom_w_;
+    return 0.0;
+  }
+
+  /// 参考速度剖面（M4.2）：free 模式下对全局折线跑一次 MINCO 时间参数化。
+  ///
+  /// 三条语义（都必须守住）：
+  ///   ① **只做 free 模式**（`!result.has_corridor`）：走廊是拍过板的硬约束
+  ///      （贴线走、遇障只能停），在这里把中心线挪开执行，等于把那个决定
+  ///      悄悄改掉；
+  ///   ② **失败 = 降级，不是失败**：任何一步不通过都保持 A* 原路径 +
+  ///      `traj_valid=false` + 点名原因，**绝不让任务因为优化失败而失败**；
+  ///   ③ **通过也要过两道门**（`check_ok` 净距终检 + `kin_ok` 运动学终验），
+  ///      两道门互相独立（终检只管碰不碰，kin 只管跟不跟得上）。
+  void applyTrajectory(PlanResult &result, const PlanRequest &req) {
+    traj_valid_ = false;
+    traj_note_.clear();
+    traj_s_.clear();
+    traj_v_.clear();
+    traj_w_.clear();
+    if (!traj_opt_)
+      return; // traj.type=none / 装载失败 → 完全旧行为
+    if (!result.ok()) {
+      traj_note_ = "全局规划未成功，不做轨迹优化";
+      return;
+    }
+    if (result.has_corridor) {
+      traj_note_ = "走廊模式（贴线硬约束），不做时间参数化";
+      return;
+    }
+    if (result.path.size() < 2) {
+      traj_note_ = "路径点数不足";
+      return;
+    }
+
+    const std::size_t in_pts = result.path.size();
+    const double in_len = polylineLength(result.path);
+
+    // ★★ 机头差门槛（M4.4 实测补）：时间参数化的前提是"车已经在路径方向上"。
+    //    起点机头与路径初始方向差得大时，MINCO 会把那个大转向**摊进整条轨迹**：
+    //    实测折返场景（差 ~185°）产出 `轨迹 4.97 m / **285.42 s** / max|v| 0.07 m/s
+    //    / 缩放 ×11.7` —— 一条完全无意义的怪物轨迹，而且花了 440 ms 才算出来。
+    //    而这段转向**本来就该由局部层"原地对正"做**（日志里就有
+    //    `原地对正机头（偏差 70° > 15°）`）：那是底盘能力，全局层无从表达。
+    //    ⇒ 直接跳过（不是失败），并说明原因；等局部对正完、下次重规划再优化。
+    if (result.path.size() >= 2) {
+      const double path_dir = std::atan2(
+          result.path[1].y - result.path[0].y,
+          result.path[1].x - result.path[0].x);
+      const double head_diff =
+          std::fabs(std::remainder(req.start.yaw - path_dir, 2.0 * M_PI));
+      if (head_diff > kMaxHeadingDiff) {
+        traj_note_ = "起点机头与路径方向差 " +
+                     std::to_string(static_cast<int>(head_diff * 180.0 / M_PI)) +
+                     "° > " +
+                     std::to_string(static_cast<int>(kMaxHeadingDiff * 180.0 /
+                                                      M_PI)) +
+                     "°（应由局部层原地对正，全局层摊不进一条轨迹）";
+        RCLCPP_INFO(get_logger(), "[traj] 本次不优化：%s", traj_note_.c_str());
+        return;
+      }
+    }
+
+    TrajOptRequest treq;
+    treq.path = result.path;
+    treq.start = req.start;
+    treq.start_v = startSpeed();
+    treq.start_omega = startOmega();
+    treq.goal = req.goal;
+    treq.use_goal_yaw = req.goal.has_yaw;
+    treq.goal_v = 0.0;
+
+    const TrajOptResult tr = traj_opt_->optimize(treq);
+    const TrajOptStats &st = tr.stats;
+    RCLCPP_INFO(
+        get_logger(),
+        "[traj] %s：折线 %zu 点 / %.2f m → 轨迹 %.2f m / %.2f s | 求解 %.1f ms"
+        "（平滑 %.1f + MINCO %.1f + 统计 %.1f）| max|v| %.2f |ω| %.2f |a| %.2f "
+        "|κ| %.2f | 缩放 ×%.3f（收敛 %s）| 终点误差 %.3f m / %.3f rad | 净距 "
+        "%.3f m @s=%.2f | 终检 %s（%d/%d 点不过）| 运动学 %s",
+        toString(tr.status), in_pts, in_len, st.path_length, st.duration,
+        st.solve_ms, st.smooth_ms, st.minco_ms, st.stats_ms, st.max_v,
+        st.max_omega, st.max_a, st.max_curvature, st.time_scale,
+        st.kin_ok ? "是" : "否", st.terminal_error, st.terminal_error_yaw,
+        st.min_clearance, st.min_clearance_s, st.check_ok ? "过" : "不过",
+        st.check_violations, st.check_points, st.kin_ok ? "过" : "不过");
+
+    if (tr.status != TrajStatus::kSuccess || tr.samples.size() < 2) {
+      traj_note_ = std::string("MINCO ") + toString(tr.status) + "：" +
+                   (tr.message.empty() ? std::string("（无详情）") : tr.message);
+      if (!st.check_note.empty())
+        traj_note_ += "；" + st.check_note;
+      RCLCPP_WARN(get_logger(),
+                  "[traj] **不采用** ← %s（保持 A* 原路径 %zu 点，任务照走）",
+                  traj_note_.c_str(), result.path.size());
+      return;
+    }
+
+    // ★★ 契约检查（M4.2，2026-09-24 补）：**剖面是按弧长索引的** ⇒ 轨迹样本的
+    //    `s` 必须单调不减。实测踩到：MINCO 在"起点机头与目标差 ~180°"这类输入上
+    //    会产出一条**倒退/折返**的轨迹（样本 s 从 4.92 **回到** 3.94 m）。这种轨迹
+    //    在弧长参数化下**结构上无法表达**，而当时的 applyTrajectory 照样把它封成
+    //    剖面发下去 ⇒ 局部只能以"剖面弧长非严格递增"整份丢弃；现象是全局说
+    //    "**采用** MINCO" 而局部说"无参考剖面"，A/B 表 剖面点数=0。
+    //    ⇒ 必须在源头拦下并一句话点名。
+    //
+    //    ★ 容差用**毫米**而不是 1e-9（2026-09-24 第二个坑）：轨迹起点若是"原地
+    //      大转向"，前几个样本的弧长几乎不前进（实测 0.003 m），数值积分噪声就能
+    //      让相邻两个 s 差 ~1e-7 ⇒ 用 1e-9 会把**正常轨迹**判死（日志里打出来是
+    //      "s 回退 0.003092 → 0.003092"，同一个数）。真正的倒退是 **1 m** 量级。
+    constexpr double kSRewindTol = 1.0e-3;   // [m] 1 mm 以下的回退算噪声
+    for (std::size_t i = 1; i < tr.samples.size(); ++i) {
+      if (tr.samples[i].s < tr.samples[i - 1].s - kSRewindTol) {
+        traj_note_ =
+            "MINCO 轨迹弧长非单调（s 回退 " +
+            std::to_string(tr.samples[i - 1].s) + " → " +
+            std::to_string(tr.samples[i].s) +
+            " m ⋯ 轨迹自身在倒退/折返）⇒ 剖面按弧长索引，无法表达这条轨迹";
+        RCLCPP_WARN(get_logger(),
+                    "[traj] **不采用** ← %s（峰值 %.2f m/s / 弧长 %.2f m vs 输入 "
+                    "%.2f m）；保持 A* 原路径 %zu 点",
+                    traj_note_.c_str(), st.max_v, st.path_length, in_len,
+                    result.path.size());
+        return;
+      }
+    }
+
+    // ---- 稠密轨迹 → 路径 + 剖面 ----
+    // ★ 间距**不能**小于 5 cm：MPC 用相邻路径点算切向，点太密时切向被积分/
+    //   栅格噪声主导（与全局路径的下采样口径一致）。
+    const double spacing = std::max(0.05, traj_spacing_);
+    const double s0 = tr.samples.front().s;
+    std::vector<Pose2D> dense;
+    double last_s = -1.0e9;
+    for (std::size_t i = 0; i < tr.samples.size(); ++i) {
+      const TrajSample &sm = tr.samples[i];
+      const bool is_last = (i + 1 == tr.samples.size());
+      if (!is_last && !dense.empty() && sm.s - last_s < spacing)
+        continue;
+      Pose2D p;
+      p.x = sm.x;
+      p.y = sm.y;
+      p.yaw = sm.yaw;
+      p.has_yaw = true;
+      dense.push_back(p);
+      traj_s_.push_back(sm.s - s0);
+      traj_v_.push_back(sm.v);
+      traj_w_.push_back(sm.omega);
+      last_s = sm.s;
+    }
+    if (dense.size() < 2 || traj_s_.size() < 2) {
+      traj_s_.clear();
+      traj_v_.clear();
+      traj_w_.clear();
+      traj_note_ = "轨迹采样点不足";
+      RCLCPP_WARN(get_logger(), "[traj] **不采用** ← %s", traj_note_.c_str());
+      return;
+    }
+
+    // 截断（`traj.max_length_m`，默认 40 m）：轨迹只覆盖前 N 米 ⇒ 把 A* 的
+    // **剩余段接在后面**。
+    // 为什么不是"干脆不换路径"：剖面是**按弧长**索引的，而平滑会把弧长改掉
+    // 几个百分点 ⇒ 局部拿原 A* 路径的弧长去查表会系统性错位。轨迹段的几何
+    // 与路径段必须同源。
+    const double covered = tr.samples.back().s - s0;
+    if (covered < in_len - 0.05) {
+      double acc = 0.0;
+      std::size_t i = 0;
+      for (; i + 1 < result.path.size(); ++i) {
+        const double seg = std::hypot(result.path[i + 1].x - result.path[i].x,
+                                      result.path[i + 1].y - result.path[i].y);
+        if (acc + seg >= covered)
+          break;
+        acc += seg;
+      }
+      const Pose2D junction = dense.back();
+      std::size_t appended = 0;
+      double gap = 0.0;
+      for (std::size_t k = i + 1; k < result.path.size(); ++k) {
+        const Pose2D &p = result.path[k];
+        if (appended == 0) {
+          // 接点**无条件**接上：哪怕离轨迹末端很近，也不能让路径断开
+          gap = std::hypot(p.x - junction.x, p.y - junction.y);
+          dense.push_back(p);
+        } else {
+          if (std::hypot(p.x - dense.back().x, p.y - dense.back().y) < spacing)
+            continue;
+          dense.push_back(p);
+        }
+        ++appended;
+      }
+      RCLCPP_INFO(get_logger(),
+                  "[traj] 轨迹只覆盖前 %.2f m（路径共 %.2f m）⇒ 接上 A* 剩余 "
+                  "%zu 点（接点间隙 %.3f m）",
+                  covered, in_len, appended, gap);
+    }
+    result.path = std::move(dense);
+    traj_valid_ = true;
+    RCLCPP_INFO(get_logger(),
+                "[traj] **采用** MINCO 轨迹：路径 %zu 点 → 下发 %zu 点"
+                "（间距 %.3f m）/ 剖面 %zu 点",
+                in_pts, result.path.size(), spacing, traj_s_.size());
   }
 
   void publishResult(const PlanResult &result, const PlanRequest &req) {
@@ -1168,6 +1505,28 @@ private:
   std::string odom_frame_;
   bool has_map_{false};
   bool has_odom_{false};
+
+  // ---- 轨迹优化后端（M4.2）----
+  /// `traj.type`（none | minco）；默认 none（A/B 开关）
+  std::string traj_type_;
+  /// 换掉路径时下发的点间距 [m]（**下限 5 cm**：MPC 用相邻点算切向）
+  double traj_spacing_{0.05};
+  std::unique_ptr<TrajectoryOptimizer> traj_opt_;
+  /// 本次规划产出的剖面（`traj_valid_=false` 时三个数组为空）
+  bool traj_valid_{false};
+  std::string traj_note_;
+  std::vector<double> traj_s_, traj_v_, traj_w_;
+
+  // ---- 上行速度（M4.2：MINCO 的 start_v/start_omega）----
+  bool odom_twist_ok_{false};
+  double odom_v_{0.0};
+  double odom_w_{0.0};
+  Pose2D prev_pose_;
+  bool has_prev_pose_{false};
+  double pose_acc_d_{0.0};   // 位姿差分窗口内累计位移 [m]
+  double pose_acc_t_{0.0};   // 位姿差分窗口内累计时间 [s]
+  double pose_speed_{0.0};   // 低通后的位姿差分速度 [m/s]
+  rclcpp::Time prev_stamp_{0, 0, RCL_ROS_TIME};
   // 已接受地图的元信息（用于识别 map_server 的周期性重发）
   bool has_map_meta_{false};
   int active_marker_count_{0}; ///< 上次发布的通路高亮个数（用于发 DELETE）

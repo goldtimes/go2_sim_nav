@@ -43,6 +43,7 @@
 #include "pnc_2d/core/local_distance_field.hpp"
 #include "pnc_2d/core/local_planner.hpp"
 #include "pnc_2d/core/map_zones.hpp" // 区域层（禁行区/限速区）
+#include "pnc_2d/core/reference_profile.hpp" // 参考速度剖面（M4）
 #include "pnc_2d/core/route_graph.hpp" // distanceToPolyline（点到折线中心线的距离）
 #include "pnc_2d/msg/local_status.hpp"
 #include "pnc_2d/msg/zone_array.hpp" // map_server 发布的区域层（latched）
@@ -119,6 +120,13 @@ public:
 
     control_rate_ = paramDouble("local.control_rate", 20.0);
     goal_tolerance_ = paramDouble("local.goal_tolerance", 0.30);
+    // ★ 到点的**横向**容差（2026-09-24）：与"沿向残余"正交的第二个到点条件。
+    //   为什么单独一条：原来"到点"只比一个**欧氏距离** ⇒ 横向残差与"没走完"
+    //   混在一起，报出来的"到点误差 10 cm"分不清该修哪个（实测那 10 cm 全是
+    //   横向：车其实走到了、只是没贴线）。拆开后两个数各自可归因。
+    //   0.10 是**当前控制器实测能到的水平**，不是目标值；M5 的"到点/对正"要把
+    //   它收到 ~0.03。现在必须先能通过，否则任务在终点必然失败。
+    lateral_tolerance_ = paramDouble("local.lateral_tolerance", 0.10);
     // BLOCKED 要连续持续这么久才结束 action（把决定权交回状态机）：
     // 瞬时遮挡（有人走过、点云抖一帧）不该让任务失败。
     blocked_abort_s_ = paramDouble("local.blocked_abort_s", 1.0);
@@ -665,10 +673,11 @@ private:
     }
     RCLCPP_INFO(
         get_logger(),
-        "[local] 接受目标：%zu 点 / %.2f m | 走廊 %s | 限速 %.2f | 严格贴线 %s",
+        "[local] 接受目标：%zu 点 / %.2f m | 走廊 %s | 限速 %.2f | 严格贴线 %s | 剖面 %s",
         path.size(), polylineLength(path),
         goal->corridor_width.empty() ? "无（自由空间模式）" : "有",
-        goal->speed_limit, goal->strict_corridor ? "是" : "否");
+        goal->speed_limit, goal->strict_corridor ? "是" : "否",
+        (goal->traj_valid && goal->traj_s.size() >= 2) ? "有" : "无（自查限速）");
     return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
   }
 
@@ -772,6 +781,9 @@ private:
     speed_limit_ = goal->speed_limit;
     pass_index_ = 0;
     traveled_ = 0.0;
+    profile_dev_max_ = 0.0;
+    profile_track_max_ = 0.0;
+    profile_dev_over_ = 0;
     blocked_since_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
     start_time_ = now();
     last_pose_ = pose_;
@@ -781,6 +793,37 @@ private:
     planner_->reset();
     planner_->setGlobalPlan(plan_);
     planner_->setSpeedLimit(speed_limit_);
+    // 参考速度剖面（M4）：上游（全局规划器）给的"弧长 → 速度/转向速率"表。
+    // ★ 本期（M4.1）只**接收 + 校验 + 存储**，不参与限速：数组为空时行为与
+    //   接通前完全一致。真正用作速度上限（并删掉 MPC 自己那套曲率/制动限速）
+    //   是 M4.3。
+    {
+      std::string perr;
+      if (goal->traj_valid &&
+          ref_profile_.set(goal->traj_s, goal->traj_v, goal->traj_w, perr)) {
+        // ★ 交给 MPC 用它当速度上限（真正生效与否由 `local_mpc.use_upstream_profile`
+        //   决定）。指针是非拥有的：`ref_profile_` 是节点成员，生命周期足够。
+        planner_->setReferenceProfile(&ref_profile_);
+        // ★ 峰值用 `peakSpeed()`，**不要**自己写 max_element —— 详见
+        //   reference_profile.hpp 里那段“死成员”的教训。
+        RCLCPP_INFO(get_logger(),
+                    "[local] 参考剖面已接收：%zu 点 / 弧长 %.2f m / 峰值 %.2f "
+                    "m/s（已交给 MPC；是否参与限速看 "
+                    "local_mpc.use_upstream_profile）",
+                    ref_profile_.size(), ref_profile_.length(),
+                    ref_profile_.peakSpeed());
+      } else {
+        ref_profile_.clear();
+        // ★ 没剖面就必须显式清掉指针，否则会**拿上一条任务的剖面**去限速
+        //   （“新旧参考混用”是最难查的一类：现象是刚起步就莫名减速/超速）。
+        planner_->setReferenceProfile(nullptr);
+        RCLCPP_INFO(get_logger(), "[local] 无参考剖面：%s",
+                    goal->traj_valid ? perr.c_str()
+                                     : (goal->traj_note.empty()
+                                            ? "上游未提供"
+                                            : goal->traj_note.c_str()));
+      }
+    }
     // 走廊：逐点半宽 → 切出**真正受约束的那一段**（通常是路网段；hybrid
     // 的自由入口/ 出口段填 -1）。是否**启用**由 updateCorridorMode()
     // 每周期决定，因为走廊只在
@@ -930,8 +973,43 @@ private:
       const std::string diag = planner_->diagString();
       if (!diag.empty())
         RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
-                             "[local] cmd v=%.3f w=%.3f | %s", r.cmd.v, r.cmd.w,
-                             diag.c_str());
+                             "[local] cmd v=%.3f w=%.3f | %s%s", r.cmd.v, r.cmd.w,
+                             diag.c_str(), profileSummary().c_str());
+    }
+
+    // ★ M4.4（R9）：**剖面一致性** —— 两个数分开报（只算一个会造出假警报）。
+    //
+    // 为什么要看这两个数：剖面"接通了但没生效"（`use_upstream_profile` 被关、
+    //   `q_v` 权重为 0、底盘/任务/区域限速把它盖住……）**没有任何别的症状**，
+    //   只表现为"车忽快忽慢"。原版 DDR-opt 在 `matrix_q` 里 v 权重为 0 这个坑
+    //   就是因为没这条指标，一直没被发现。
+    //
+    // ① `profile_dev`（参考口径，M4 验收）：>0 说明**有别的东西比剖面更低**
+    //    （底盘 v_max / 任务限速 / 区域限速 / 终点爬行）—— 这些"本来就该优先"，
+    //    所以它不是错误，而是"这条轨迹的速度其实由谁决定"的答案。
+    // ② `profile_track_dev`（跟踪口径）：控制器跟不上自己的参考。
+    //    ⚠ **起步/原地对正之后必然很大**（车从 0 加速，参考已经是 0.1 m/s），
+    //      所以只在**已经稳定跟踪**时才值得报警 —— 这里用"已跑过 1 m"当条件，
+    //      不看前 1 m 的加速段（那不是剖面问题）。
+    if (r.stats.profile_dev >= 0.0) {
+      if (r.stats.profile_dev > profile_dev_max_)
+        profile_dev_max_ = r.stats.profile_dev;
+      if (r.stats.profile_dev > 0.10)
+        ++profile_dev_over_;
+    }
+    if (r.stats.profile_track_dev >= 0.0) {
+      if (r.stats.profile_track_dev > profile_track_max_)
+        profile_track_max_ = r.stats.profile_track_dev;
+    }
+    if (r.stats.profile_dev > 0.10) {
+      RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "[local] 剖面被盖住：剖面 v(s)=%.3f，本周期生效参考 v_ref=%.3f"
+          "（偏高 %.0f%%）—— 逐项查：local_mpc.v_max / 任务限速 / 区域限速 /"
+          "终点段 approach·crawl 是否比剖面更低（它们**本来就该优先**，"
+          "这条日志是在告诉你：这条轨迹的速度到底由谁决定）",
+          r.stats.profile_v, r.stats.profile_v_ref,
+          r.stats.profile_dev * 100.0);
     }
 
     // 路程统计（用于 result.traveled_m）
@@ -948,19 +1026,20 @@ private:
       geometry_msgs::msg::Twist tw;
       tw.linear.x = r.cmd.v;
       tw.angular.z = r.cmd.w;
-      pub_cmd_vel_->publish(tw);
+      safePublish([&] { pub_cmd_vel_->publish(tw); });
     }
 
     switch (r.status) {
     case LocalStatus::kGoalReached: {
-      const double remain = remaining();
-      if (finishReached(remain)) {
-        finish(LocalStatus::kGoalReached, true, false, false, r, "到达目标");
+      const EndResidual e = endResidual();
+      if (finishReached(e)) {
+        finish(LocalStatus::kGoalReached, true, false, false, r,
+               "到达目标（沿向残差 " + std::to_string(e.along) +
+                   " m / 横向残差 " + std::to_string(e.lateral) + " m）");
       } else {
-        // 局部说"到终点了"但离用户目标还远（路径终点 ≠ 用户目标）→ 不擅自算成功
+        // 局部说"到终点了"但残差超容差 → 不擅自算成功，并把**是哪一个**说清
         finish(LocalStatus::kFailed, false, false, true, r,
-               "局部到达路径终点，但离用户目标还有 " + std::to_string(remain) +
-                   " m");
+               "局部到达路径终点，但残差超容差：" + describeResidual(e));
       }
       return;
     }
@@ -994,11 +1073,11 @@ private:
       //      状态机会一直停在 FOLLOWING。这类"链条末端没人收尾"的问题最隐蔽。
       //   代价：算法报"到了"但车其实没到（会被 kGoalReached 分支当成失败）时，
       //   这里仍以位置为准；两者冲突在下面的分支里显式报出来。
-      if (finishReached(remaining()))
+      const EndResidual e = endResidual();
+      if (finishReached(e))
         finish(LocalStatus::kGoalReached, true, false, false, r,
-               "距目标 ≤ " + std::to_string(goal_tolerance_) +
-                   " m（已扣除停车惯性 " +
-                   std::to_string(planner_->stopCoast()) + " m；节点层判定）");
+               "节点层判定到点：沿向残差 " + std::to_string(e.along) +
+                   " m / 横向残差 " + std::to_string(e.lateral) + " m");
       return;
     }
   }
@@ -1020,12 +1099,83 @@ private:
       pass_index_ = best;
   }
 
-  double remaining() const {
-    double rem = std::hypot(plan_.back().x - pose_.x, plan_.back().y - pose_.y);
-    for (std::size_t i = pass_index_ + 1; i < plan_.size(); ++i)
-      rem +=
-          std::hypot(plan_[i].x - plan_[i - 1].x, plan_[i].y - plan_[i - 1].y);
-    return rem;
+  /// 终点残差的**两个正交分量**（2026-09-24 新增，见 endResidual 的说明）
+  struct EndResidual {
+    double along{0.0};   ///< **沿路径**残余 [m]：还没走完的那部分
+    double lateral{0.0}; ///< **横向**残差 [m]：到末段线段的垂距
+    double euclid{0.0};  ///< 原来的"欧氏距离 + 剩余折线"（只作对照/上报）
+  };
+
+  /// 把原来混在一个欧氏距离里的两个量拆开。
+  ///
+  /// ★★ 为什么必须拆（2026-09-24 实测根因：A1"到点误差 ≤ 3 cm"一直失败）：
+  ///   · 局部**算法**的"到达"判据是**弧长投影**（`s ≥ ref_length − 1e-3`）——
+  ///     车停在终点旁边 10 cm，投到终点就是 `s = ref_length_`，算法照样报"已到"；
+  ///   · 节点层的兜底判据原来是**欧氏距离**（`remaining() ≤ tol + stop_coast`）
+  ///     —— 横向残差**全部**记进去。
+  ///   ⇒ 同一个瞬间两边结论相反，任务被判 `FollowFail`。
+  ///   实测数字：路径是 `x = -6.50` 的直线，车停在 `x = -6.40`
+  ///   ⇒ `remaining() = 0.100473 m`，其中**横向 10 cm、沿向 2 cm**。
+  ///   也就是说：**车其实"走到了"，只是"没贴线"**。
+  ///   加剧因素：`local.goal_tolerance`(0.01) 比栅格(0.05) 还小 ⇒ 只要终点有
+  ///   横向残差，这个判据**必然**不过（与控制器好坏无关）。
+  ///   ⇒ 拆开、各自判、各自报数，"到点 ≤ 3 cm" 才有明确含义。
+  EndResidual endResidual() const {
+    EndResidual e;
+    const std::size_t n = plan_.size();
+    if (n < 2)
+      return e;
+    const double ax = plan_[n - 2].x;
+    const double ay = plan_[n - 2].y;
+    const double bx = plan_[n - 1].x;
+    const double by = plan_[n - 1].y;
+    const double dx = bx - ax;
+    const double dy = by - ay;
+    const double L2 = dx * dx + dy * dy;
+    const double d_end = std::hypot(bx - pose_.x, by - pose_.y);
+    double lat = 0.0;
+    double along_end = d_end;
+    if (L2 > 1e-12) {
+      // 末端那一段（倒数第二点 → 末点）：横向残差对它算（投影参数夹到 [0,1]）
+      const double t = std::min(
+          1.0, std::max(0.0, ((pose_.x - ax) * dx + (pose_.y - ay) * dy) /
+                                 L2));
+      lat = std::hypot(pose_.x - (ax + dx * t), pose_.y - (ay + dy * t));
+      // 沿向 = √(斜边² − 垂距²)：末段是直线时**精确**，一般情况也是很好的
+      // 近似，且**永不为负**
+      along_end = std::sqrt(std::max(0.0, d_end * d_end - lat * lat));
+    }
+    // 还没走完的折线段（**不含末段本身**，末段已由 along_end 表达）
+    double extra = 0.0;
+    for (std::size_t i = pass_index_ + 1; i + 1 < n; ++i)
+      extra += std::hypot(plan_[i + 1].x - plan_[i].x,
+                          plan_[i + 1].y - plan_[i].y);
+    e.along = along_end + extra;
+    e.lateral = lat;
+    e.euclid = d_end + extra;
+    return e;
+  }
+
+  /// 原来的"欧氏剩余"（保留：反馈/上报仍在用；语义 = `endResidual().euclid`）
+  double remaining() const { return endResidual().euclid; }
+
+  /// 把"哪一个残差不过"说清楚（沿向 / 横向 / 两者）—— 原来只能报一个欧氏数，
+  /// 分不清该修哪个（实测为此查了好几轮）
+  std::string describeResidual(const EndResidual &e) const {
+    const double along_tol = goal_tolerance_ + planner_->stopCoast();
+    const bool along_bad = e.along - planner_->stopCoast() > goal_tolerance_;
+    const bool lat_bad = e.lateral > lateral_tolerance_;
+    std::string s = "沿向残差 " + std::to_string(e.along) + " m（容差 " +
+                    std::to_string(along_tol) + "，含停车惯性 " +
+                    std::to_string(planner_->stopCoast()) + "）";
+    s += " / 横向残差 " + std::to_string(e.lateral) + " m（容差 " +
+         std::to_string(lateral_tolerance_) + "）";
+    s += "（欧氏合计 " + std::to_string(e.euclid) + " m）";
+    s += along_bad && lat_bad
+             ? " —— **两个都超**"
+             : (along_bad ? " —— **沿向超**（没走到）"
+                          : " —— **横向超**（没贴线）");
+    return s;
   }
 
   /// 到点判定：比的是"**预判停点**到目标的距离"，不是当前距离。
@@ -1042,8 +1192,14 @@ private:
   ///   "算法在 5° 对正、节点按 2° 判" ⇒ 永远不满足 ⇒ 任务卡到超时。
   ///   朝向还没对好时**不判到达**，只打一行日志（算法正在原地转），
   ///   任务自然多走几个周期。
-  bool finishReached(double remain) {
-    if (remain - planner_->stopCoast() > goal_tolerance_)
+  bool finishReached(const EndResidual &res) {
+    // ① **沿向**：有没有走完（扣掉停车惯性，口径同原来）
+    if (res.along - planner_->stopCoast() > goal_tolerance_)
+      return false;
+    // ② **横向**：有没有贴到线上（与沿向**正交**，口径完全不同）
+    //    ★ 单独一条：横向残差不是"没走到"，但"停在离目标 10 cm 的侧面"同样不是
+    //      到点。拆开之后报数才说得清是哪一个不满足。
+    if (res.lateral > lateral_tolerance_)
       return false;
     const double tol = planner_->goalYawTolerance(); // [rad]，0 = 不判朝向
     if (tol <= 0.0)
@@ -1078,8 +1234,25 @@ private:
       return;
     geometry_msgs::msg::Twist zero;
     for (int i = 0; i < 3; ++i) {
-      pub_cmd_vel_->publish(zero);
+      safePublish([&] { pub_cmd_vel_->publish(zero); });
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+  }
+
+  /// 关停竞态防护：包住一切「发布」并吞掉关停期的 RCLError。
+  ///
+  /// ★★ 为什么必须有（2026-09-24 实测 SIGABRT，exit -6）：
+  ///   Ctrl-C 之后 `rclcpp` 会先失效上下文、再调 `on_shutdown` 钩子，而**定时器
+  ///   回调可能还排在队列里** ⇒ 此时 `rcl_action` 的 feedback publisher 已经是
+  ///   invalid，`publish_feedback()` 抛 `RCLError`，没人接 ⇒ `std::terminate`
+  ///   ⇒ 进程 abort。现象是「按 Ctrl-C 退出时节点报 terminate」，而且 exit code
+  ///   是 -6 而不是 0，脚本里会误判成“节点崩了”。
+  ///   只检查 `rclcpp::ok()` 不够：检查与调用之间那条缝就是竞态本身。
+  template <typename F> void safePublish(F && f) {
+    try {
+      f();
+    } catch (const std::exception &) {
+      // 关停期的发布失败**不需要**打扰任何人：该发的停止指令已经在别处发过了
     }
   }
 
@@ -1164,6 +1337,19 @@ private:
   }
 
   // ------------------------------------------------------------ 输出
+  /// 剖面一致性的一句话小结（进 1 Hz 诊断行，也是 M4.5 的 A/B 表要的那个数）。
+  /// ★ 为什么要"本轮小结"而不只看瞬时 WARN：偏差可能是**偶发**的（进弯那一拍
+  ///   追不上）；只报瞬时会让"偶尔一次"和"全程都在偏差"看起来一模一样。
+  std::string profileSummary() const {
+    if (!ref_profile_.valid())
+      return {};
+    return " | 剖面偏差 max " +
+           std::to_string(static_cast<int>(profile_dev_max_ * 100.0 + 0.5)) +
+           "% / 跟踪 max " +
+           std::to_string(static_cast<int>(profile_track_max_ * 100.0 + 0.5)) +
+           "% / 超限 " + std::to_string(profile_dev_over_) + " 拍";
+  }
+
   void publishStatus(LocalStatus st, const std::string &msg,
                      const LocalPlanResult &r) {
     if (!pub_status_)
@@ -1184,7 +1370,12 @@ private:
     m.time_to_goal_s = r.stats.time_to_goal;
     m.path_points = static_cast<uint32_t>(plan_.size());
     m.route_mode = planner_ && planner_->mode() == LocalPlanner::Mode::kRoute;
-    pub_status_->publish(m);
+    // M4.4：剖面一致性（`< 0` = 本周期没有剖面）
+    m.profile_dev = r.stats.profile_dev;
+    m.profile_v = r.stats.profile_v;
+    m.profile_v_ref = r.stats.profile_v_ref;
+    m.profile_track_dev = r.stats.profile_track_dev;
+    safePublish([&] { pub_status_->publish(m); });
   }
 
   void publishFeedback(const LocalPlanResult &r, const std::string &msg) {
@@ -1208,7 +1399,7 @@ private:
                             ? 0.0
                             : (now() - blocked_since_).seconds();
     fb->solve_time_ms = r.stats.solve_ms;
-    goal_handle_->publish_feedback(fb);
+    safePublish([&] { goal_handle_->publish_feedback(fb); });
   }
 
   // ------------------------------------------------------------ 参数读取
@@ -1249,6 +1440,8 @@ private:
 
   double control_rate_{20.0};
   double goal_tolerance_{0.30};
+  /// 到点的**横向**容差 [m]（与沿向容差正交；见 endResidual / finishReached）
+  double lateral_tolerance_{0.10};
   double blocked_abort_s_{1.0};
   double pass_distance_{0.50};
   double odom_timeout_{1.0};
@@ -1322,6 +1515,12 @@ private:
   bool corridor_attached_{false};
   double plan_length_{0.0};
   double speed_limit_{0.0};
+  /// 参考速度剖面（M4）：上游给的弧长→速度表；valid()==false 时忽略。
+  pnc_2d::ReferenceProfile ref_profile_;
+  /// 剖面一致性统计（M4.4）：本任务内的最大相对偏差与超限拍数
+  double profile_dev_max_{0.0};
+  double profile_track_max_{0.0};
+  int profile_dev_over_{0};
   std::size_t pass_index_{0};
   double traveled_{0.0};
   Pose2D last_pose_;

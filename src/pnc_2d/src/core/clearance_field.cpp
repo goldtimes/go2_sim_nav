@@ -6,6 +6,7 @@
 
 #include "pnc_2d/core/clearance_field.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 
@@ -61,6 +62,11 @@ bool ClearanceField::build(const CostMap2D & map, int hard_threshold,
   height_ = map.height();
   resolution_ = map.resolution();
   margin_ = 0.70710678118 * resolution_;
+  origin_x_ = map.originX();
+  origin_y_ = map.originY();
+  origin_yaw_ = map.originYaw();
+  cos_yaw_ = std::cos(origin_yaw_);
+  sin_yaw_ = std::sin(origin_yaw_);
 
   const std::size_t n = distSz();
   dist_.assign(n, kInf);
@@ -98,6 +104,93 @@ bool ClearanceField::build(const CostMap2D & map, int hard_threshold,
 
   // 平方距离 → 距离（单位：格）
   for (auto & value : dist_) value = std::sqrt(value);
+  return true;
+}
+
+bool ClearanceField::insideWorld(double wx, double wy) const
+{
+  if (!valid()) return false;
+  double gx = 0.0;
+  double gy = 0.0;
+  worldToGridContinuous(wx, wy, gx, gy);
+  const int x = static_cast<int>(std::floor(gx));
+  const int y = static_cast<int>(std::floor(gy));
+  return inside(x, y);
+}
+
+namespace {
+
+/// 提取"双线性插值所需的四个角值 + 权重"，避免两种查询各写一遍
+struct BilinearSample {
+  double d00{0.0};
+  double d10{0.0};
+  double d01{0.0};
+  double d11{0.0};
+  double fu{0.0};
+  double fv{0.0};
+  double center{0.0};   // 最近格中心的值（= 四角加权后仍是有限的）
+};
+
+BilinearSample sampleBilinear(const std::vector<float> & dist, int width, int height,
+                              double gx, double gy)
+{
+  // 以格子下标为单位的连续坐标（格中心 = 整数）；夹到 [0, n-1] 避免越界
+  const double u = gx - 0.5;
+  const double v = gy - 0.5;
+  const int x0 = static_cast<int>(std::floor(u));
+  const int y0 = static_cast<int>(std::floor(v));
+  auto at = [&](int x, int y) -> double {
+    const int xi = std::clamp(x, 0, width - 1);
+    const int yi = std::clamp(y, 0, height - 1);
+    return static_cast<double>(dist[static_cast<std::size_t>(yi) * width + xi]);
+  };
+  BilinearSample s;
+  s.fu = u - static_cast<double>(x0);
+  s.fv = v - static_cast<double>(y0);
+  s.d00 = at(x0, y0);
+  s.d10 = at(x0 + 1, y0);
+  s.d01 = at(x0, y0 + 1);
+  s.d11 = at(x0 + 1, y0 + 1);
+  s.center = (1.0 - s.fu) * (1.0 - s.fv) * s.d00 + s.fu * (1.0 - s.fv) * s.d10 +
+             (1.0 - s.fu) * s.fv * s.d01 + s.fu * s.fv * s.d11;
+  return s;
+}
+
+}  // namespace
+
+double ClearanceField::distanceAtWorld(double wx, double wy, double max_m) const
+{
+  if (!valid()) return max_m;
+  if (!insideWorld(wx, wy)) return max_m;   // 越界："不算障碍"
+  double gx = 0.0;
+  double gy = 0.0;
+  worldToGridContinuous(wx, wy, gx, gy);
+  const BilinearSample s = sampleBilinear(dist_, width_, height_, gx, gy);
+  const double meters = s.center * resolution_;
+  if (!std::isfinite(meters)) return max_m;   // 全图无致命格（EDT 初值）
+  return std::min(max_m, meters);
+}
+
+bool ClearanceField::gradientAtWorld(double wx, double wy, double g[2]) const
+{
+  if (g != nullptr) {
+    g[0] = 0.0;
+    g[1] = 0.0;
+  }
+  if (g == nullptr || !valid() || !insideWorld(wx, wy)) return false;
+  double gx = 0.0;
+  double gy = 0.0;
+  worldToGridContinuous(wx, wy, gx, gy);
+  const BilinearSample s = sampleBilinear(dist_, width_, height_, gx, gy);
+
+  // 插值式对"格子下标"的偏导（单位：格/格）
+  const double du = (1.0 - s.fv) * (s.d10 - s.d00) + s.fv * (s.d11 - s.d01);
+  const double dv = (1.0 - s.fu) * (s.d01 - s.d00) + s.fu * (s.d11 - s.d10);
+
+  // 换算到世界系：d(米)/d(世界) = R(yaw)·(∂D/∂u, ∂D/∂v)
+  // （索引↔世界的 1/res 与 格↔米的 res 恰好抵消，所以这里不再除 res）
+  g[0] = cos_yaw_ * du - sin_yaw_ * dv;
+  g[1] = sin_yaw_ * du + cos_yaw_ * dv;
   return true;
 }
 

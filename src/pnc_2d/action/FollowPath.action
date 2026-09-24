@@ -32,6 +32,17 @@ float64[] corridor_width
 float64 speed_limit        # 限速 [m/s]，<=0 表示不限（用算法上限 / 限速区）
 bool strict_corridor       # true = 严格贴线，遇障即停（BLOCKED）
                            # false = 允许在走廊内避障
+
+# ---- 参考速度剖面（M4：MINCO 时间参数化的下行管道）----
+# traj_valid=true 时 traj_s/traj_v/traj_w 等长且逐点对齐，s 严格递增。
+# 局部规划器把它当"速度上限来源"，不再自己用曲率/制动重算（两边各算一遍
+# 必然不自洽：实测轨迹比预期慢 1.8x）。
+# traj_valid=false / 数组为空 → 完全回退旧行为（局部自行限速）。
+bool traj_valid
+string traj_note
+float64[] traj_s
+float64[] traj_v
+float64[] traj_w
 ---
 # 结束原因：四选一，状态机按它决定下一步
 bool goal_reached          # 正常到达

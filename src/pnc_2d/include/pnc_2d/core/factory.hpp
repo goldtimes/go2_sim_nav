@@ -11,6 +11,7 @@
 #include "pnc_2d/core/global_planner.hpp"
 #include "pnc_2d/core/local_planner.hpp"
 #include "pnc_2d/core/recovery_behavior.hpp"
+#include "pnc_2d/core/trajectory_optimizer.hpp"
 
 namespace pnc_2d {
 
@@ -33,5 +34,15 @@ createRecoveryBehavior(const std::string &type);
 
 /// 已注册的恢复行为名（本期为空）
 std::vector<std::string> availableRecoveries();
+
+/// 创建轨迹优化（后端）实例（`traj.type`）。
+/// ★ `"none"` 返回 **nullptr** ——这不是错误，而是"不启用轨迹优化"的合法配置，
+///   调用方据此完全跳过（= 旧行为）。与另外三个工厂"未注册返回 nullptr"
+///   的语义重叠，所以调用方要**先看 type 是否注册**再判空。
+std::unique_ptr<TrajectoryOptimizer>
+createTrajectoryOptimizer(const std::string &type);
+
+/// 已注册的轨迹优化类型名
+std::vector<std::string> availableTrajectoryOptimizers();
 
 } // namespace pnc_2d

@@ -62,11 +62,26 @@ public:
   const FootprintParams & footprint() const { return fp_; }
   bool enabled() const { return fp_.enable; }
 
+  /// 是否已绑定**有效**地图。用途：终检等地方要判断"到底有没有判据"——
+  /// 不要用别的返回值当哨兵（`poseInCollision*` 在无图时返回 true = 碰，
+  /// 那是"保守"语义，不是"没查"）。
+  bool hasMap() const;
+
   /// 单格是否致命（含未知策略；图外一律视为致命）
   bool cellLethal(int x, int y) const;
   bool pointLethal(double wx, double wy) const;
 
   /// 位姿处车体是否与致命格相交（enable=false 时退化为"中心格是否致命"）
+  ///
+  /// ★★ 已知局限（实测取证，2026-09）：判定把位姿**吸附到格心**再算 ——
+  ///   `rectOffsets` 只用机体系 offset 建矩形（相对"当前格中心"），**丢掉了
+  ///   (wx, wy) 在格内的亚格偏移**。于是含余量判定的实际误差可达 **±半格**
+  ///   （res = 0.10 ⇒ ±5 cm），实测同一格内 y 从 2.61 扫到 2.70，净距恒为
+  ///   0.0499（= 格心 2.65 处的值），而不是连续变化的 0.01→0.10。
+  ///   后果：**`safe_margin` 必须大于一格才有意义** —— 取 0.05（= 半格）时
+  ///   "余量带"在格心模型下是空集，"起点在余量带里"这类场景根本构造不出来。
+  ///   （真要修需要给 `rectOffsets` 加亚格偏移，而 8 方向的预计算表用不上
+  ///   逐位姿偏移 ⇒ 要么放弃表、要么改判据。属于跨模块改动，尚未做。）
   bool poseInCollision(double wx, double wy, double yaw) const;
 
   /// 参考点到**最近致命格**的距离 [m]（需要距离场；拿不到时返回 NaN）。
@@ -87,6 +102,23 @@ public:
   ///   margin = -0.05 → 真实轮廓再往里让 5 cm 还撞吗（= 穿透是否 ≤ 5 cm）
   bool poseInCollisionAtMargin(double wx, double wy, double yaw,
                                double margin) const;
+
+  /// 轮廓净距（**带符号**，单位 m）：轨迹终检用（要"轮廓到障碍的连续净距"）。
+  ///   > 0 = 真实轮廓（safe_margin = 0）还能均匀外扩这么多米才碰到致命格；
+  ///   < 0 = 需要把轮廓均匀内缩这么多米才不碰（= 穿透深度）；
+  ///   0   = 刚好贴着。
+  ///
+  /// ★ 不变式（与 poseInCollisionAtMargin **同一判据**，m 可为负）：
+  ///      signedClearanceAt(..., m) >= m   ⇔   !poseInCollisionAtMargin(..., m)
+  ///   否则两套判据会在"恰好擦到"时打架（我们已经在跳层物理量上栽过多次）。
+  ///
+  /// 实现：在 [−max_search, +max_search] 上二分（free(m) 对 m 单调）。
+  ///   开阔处（最近致命格足够远）走快路径直接饱和 ⇒ 一次查表；
+  ///   返回值饱和于 ±max_search（即"≥ max_search" / "穿透 ≥ max_search"）。
+  ///   分辨率 ≈ 2·max_search / 2^14 ≈ 0.12 mm（max_search = 1.0）。
+  /// ⚠ fp.enable = false 时 margin 不参与判定，二分无意义 ⇒ 退化为点判定。
+  double signedClearanceAt(double wx, double wy, double yaw,
+                           double max_search = 1.0) const;
 
   /// 临时改用另一个 safe_margin（**可以是负数** = 把轮廓缩小）。
   /// 用途：起点已经擦进/压进障碍时，用更松的轮廓再试一次规划

@@ -3,6 +3,8 @@
 
 #include "pnc_2d/local/mpc_local_planner.hpp"
 
+#include "pnc_2d/core/reference_profile.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -165,6 +167,8 @@ bool MpcLocalPlanner::configure(const ParamReader &params) {
   p_.constrain_control_rate =
       b("constrain_control_rate", p_.constrain_control_rate);
   p_.reference_speed = d("reference_speed", p_.reference_speed);
+  p_.use_upstream_profile =
+      b("use_upstream_profile", p_.use_upstream_profile);
   p_.lat_acc_max = d("lat_acc_max", p_.lat_acc_max);
   p_.brake_acc = d("brake_acc", p_.brake_acc);
   p_.approach_dist = d("approach_dist", p_.approach_dist);
@@ -423,6 +427,14 @@ void MpcLocalPlanner::setDistanceField(const LocalDistanceField *field) {
   dist_field_ = field;
 }
 
+void MpcLocalPlanner::setReferenceProfile(const ReferenceProfile *profile) {
+  profile_ = profile;
+}
+
+bool MpcLocalPlanner::hasUpstreamProfile() const {
+  return p_.use_upstream_profile && profile_ != nullptr && profile_->valid();
+}
+
 void MpcLocalPlanner::setDynamicObstacles(
     const std::vector<DynamicObstacle> &obs) {
   // v1 只做反应式（决策 D6）：动态障碍的**预测**留到 §7 的未来优化点。
@@ -587,23 +599,50 @@ double MpcLocalPlanner::speedLimitAt(double s) const {
   if (p_.reference_speed > 0.0)
     v = std::min(v, p_.reference_speed);
 
-  // 曲率限速：向心加速度 a_lat = v²·κ ≤ a_lat_max ⇒ v ≤ sqrt(a_lat_max / κ)
-  // 用**前瞻段内最大曲率**：只在弯道入口才开始减速就来不及了。
-  double curv = 0.0;
-  const double s_look = s + p_.curvature_lookahead;
-  for (std::size_t i = 0; i < ref_s_.size(); ++i) {
-    if (ref_s_[i] < s)
-      continue;
-    if (ref_s_[i] > s_look)
-      break;
-    curv = std::max(curv, std::fabs(ref_curv_[i]));
+  // ---- 速度上限的**唯一**来源：上游剖面 or 本地曲率限速（M4.3）----
+  //
+  // ★ 为什么是"二选一"而不是"取 min"（R8/R9）：两者都是**曲率驱动的减速**，
+  //   但减速点的位置各算各的。取 min 的实际效果是"谁更保守听谁的" ⇒ 上游那份
+  //   算得再准，只要本地在某个弯道更低，上游剖面在那一段就**完全失效**（等于
+  //   白接）；而两者加减速段错开时，参考速度会出现"先按上游减、再按本地减"的
+  //   台阶。所以有剖面时**换掉**本地的曲率限速，不是叠加。
+  if (hasUpstreamProfile()) {
+    // 上游给的是"弧长 → 速度"的**上限**；与底盘/任务/区域限速取 min 是对的
+    // （那几个是"绝对不许超"的硬约束，不是在重复计算同一件事）。
+    v = std::min(v, profile_->speedAt(s));
+  } else {
+    // 曲率限速：向心加速度 a_lat = v²·κ ≤ a_lat_max ⇒ v ≤ sqrt(a_lat_max / κ)
+    // 用**前瞻段内最大曲率**：只在弯道入口才开始减速就来不及了。
+    double curv = 0.0;
+    const double s_look = s + p_.curvature_lookahead;
+    for (std::size_t i = 0; i < ref_s_.size(); ++i) {
+      if (ref_s_[i] < s)
+        continue;
+      if (ref_s_[i] > s_look)
+        break;
+      curv = std::max(curv, std::fabs(ref_curv_[i]));
+    }
+    if (curv > 1e-6)
+      v = std::min(v, std::sqrt(p_.lat_acc_max / curv));
   }
-  if (curv > 1e-6)
-    v = std::min(v, std::sqrt(p_.lat_acc_max / curv));
 
   // 终点制动剖面：v ≤ sqrt(2·a_brake·剩余弧长)。远距离时它大于
   // v_max，自然不生效； 越接近终点越收紧，到终点正好为 0 ——
   // 这样"到点停车"不靠硬刹，而是参考本身就减速。
+  //
+  // ★ 有上游剖面时**依然保留**这一项（不是"忘删"）：
+  //   ① 上游剖面可能只覆盖**前 N 米**（`traj.max_length_m`，默认 40 m），其后
+  //      `speedAt()` 按端点夹取 ⇒ 会一直吐巡航速度，**没有终点减速**；
+  //   ② `stop_coast`/`approach_dist`/`approach_speed`/`crawl_speed` 全是**底盘
+  //      标定**量，上游结构上不可能知道；
+  //   ③ 它是取 min，**会不会打架取决于两个数的相对大小**（这里曾经写错过）：
+  //      · 本地 `brake_acc` > `traj.a_max` ⇒ 上游总是更紧，本地只在截断/降级时接手；
+  //      · **当前配置恰好相反**：`go2_run.yaml` 的 `local_mpc.brake_acc: 0.15`
+  //        远小于 `traj.a_max: 0.50` ⇒ 靠近目标那一段**本地制动比上游紧**，
+  //        于是它会盖住上游剖面（M4.4 的"参考偏差"在终点段必然 >0）。
+  //        那是**有意的**：0.15 是底盘实测的贴拢减速度，上游结构上不知道它。
+  //      ⇒ 想判断"剖面的终点减速有没有被用上"，看 `参考偏差` 是**全程都大**
+  //        还是**只有终点段大**：全程大 = 别的地方在压速度；只有终点段大 = 正常。
   //
   // ★ 剩余弧长要扣掉 stop_coast：那是"指令归零后底盘还会自己走的距离"，让惯性替
   //   我们把最后几厘米走完，指令就能提前归零（否则一定冲过目标）。
@@ -653,9 +692,16 @@ MpcReferencePoint MpcLocalPlanner::sampleAt(double s,
   r.yaw = wrapAngle(ref_yaw_[i] + t * wrapAngle(ref_yaw_[i + 1] - ref_yaw_[i]));
   r.s = s;
   r.v = speedLimitAt(s);
-  // κ 取该点处（线性插值）的曲率 → ω_ref = κ·v
-  const double kappa = ref_curv_[i] + t * (ref_curv_[i + 1] - ref_curv_[i]);
-  r.w = clampValue(kappa * r.v, -p_.w_max, p_.w_max);
+  if (hasUpstreamProfile()) {
+    // ω 直接取上游剖面：那是 (θ,s) 参数化里**原生**的通道（θ̇），比本地 κ·v
+    // 数值上稳得多 —— κ 是二阶差分出来的，本项目已经两次在 κ 的尖峰上吃过
+    // 亏（`atan2(0,0)` 伪造出 κ=14.0；毫米级相邻点算出 κ=0.546 1/m）。
+    r.w = clampValue(profile_->omegaAt(s), -p_.w_max, p_.w_max);
+  } else {
+    // κ 取该点处（线性插值）的曲率 → ω_ref = κ·v
+    const double kappa = ref_curv_[i] + t * (ref_curv_[i + 1] - ref_curv_[i]);
+    r.w = clampValue(kappa * r.v, -p_.w_max, p_.w_max);
+  }
   return r;
 }
 
@@ -991,6 +1037,7 @@ bool MpcLocalPlanner::buildQp(const std::vector<MpcReferencePoint> &ref,
   info_.active_obstacle_rows = active_obs;
   // 调参诊断：本周期参考速度/限速上界/曲率（看"为什么这么慢"就看这几个数）
   info_.ref_v = ref.empty() ? 0.0 : ref[0].v;
+  info_.ref_w = ref.empty() ? 0.0 : ref[0].w;
   info_.v_now = current_v;
   info_.ev0 = ref.empty() ? 0.0 : (current_v - ref[0].v);
   info_.upper_v = v_upper;
@@ -1013,6 +1060,27 @@ bool MpcLocalPlanner::buildQp(const std::vector<MpcReferencePoint> &ref,
     curv_max = std::max(curv_max, std::fabs(ref_curv_[i]));
   }
   info_.curv = curv_max;
+
+  // ★ M4.4（R9）：**剖面一致性** —— 分两个数，**不要合成一个**（2026-09-24 实测踩过）。
+  //   ① `prof_dev`       = |v_ref − v_剖面(s)| / max(v_剖面, 0.1)
+  //         "剖面被采纳了吗 / 被谁的限速盖住了"。这是 M4 的验收口径。
+  //   ② `prof_track_dev` = |v_实测 − v_ref| / max(v_ref, 0.1)
+  //         "控制器跟不跟得上自己的参考"。这是**控制器**指标，不是剖面的。
+  //   ✗ 最初只算"v_实测 vs v_剖面"：在任何起步/原地对正之后都是 70%~100%
+  //     （对正 3.5 s 里 s 不前进、车从 0 加速，剖面还在说 0.1 m/s）
+  //     ⇒ 假警报工厂，还会把"剖面工作正常"读成"剖面没生效"。
+  //   分母的 0.10 地板：低速段（终点贴拢 1~5 cm/s）的正常抖动就有这个量级。
+  if (hasUpstreamProfile()) {
+    info_.prof_v = profile_->speedAt(s0);
+    info_.prof_dev = std::fabs(info_.ref_v - info_.prof_v) /
+                     std::max(info_.prof_v, 0.10);
+    info_.prof_track_dev = std::fabs(info_.v_now - info_.ref_v) /
+                           std::max(info_.ref_v, 0.10);
+  } else {
+    info_.prof_v = 0.0;
+    info_.prof_dev = -1.0; // 不适用（不是"偏差 0"）
+    info_.prof_track_dev = -1.0;
+  }
   return true;
 }
 
@@ -1247,17 +1315,24 @@ std::string MpcLocalPlanner::diagString() const {
                   info_.min_predicted_distance);
   // 限速区帽单独打出来：现场"为什么这里只跑 0.2 m/s"十有八九就是它
   // （v_up 已经是含帽后的生效上界，但看不出是任务限速还是区域限速）。
+  char prof[80];
+  if (info_.prof_dev < 0.0)
+    std::snprintf(prof, sizeof(prof), "剖面 n/a");
+  else
+    std::snprintf(prof, sizeof(prof), "剖面 v=%.3f 参考偏差%+.0f%% 跟踪%+.0f%%",
+                  info_.prof_v, info_.prof_dev * 100.0,
+                  info_.prof_track_dev * 100.0);
   std::snprintf(
       buf, sizeof(buf),
       "mpc v_ref=%.3f v_now=%.3f e_v0=%+.3f v_up=%.3f"
       "（任务限速%.2f 区域限速%.2f）curv=%.3f | "
       "e_yaw0=%+.1f° lat0=%.2f | "
-      "cross=%+.3f prog=%.2f | 走廊行%d 障碍行%d 最小距%s | %s %d迭代 "
+      "cross=%+.3f prog=%.2f | 走廊行%d 障碍行%d 最小距%s | %s | %s %d迭代 "
       "%.1fms",
       info_.ref_v, info_.v_now, info_.ev0, info_.upper_v, speed_limit_,
       zone_speed_limit_, info_.curv, info_.e_yaw0 * 180.0 / M_PI, info_.lat0,
       info_.cross_track, info_.progress, info_.active_corridor_rows,
-      info_.active_obstacle_rows, clearance, info_.solver_status.c_str(),
+      info_.active_obstacle_rows, clearance, prof, info_.solver_status.c_str(),
       info_.solver_iterations, info_.solve_ms);
   return std::string(buf);
 }
@@ -1634,6 +1709,13 @@ LocalPlanResult MpcLocalPlanner::computeCommand(const Pose2D &pose, double dt) {
   out.stats.progress = info_.progress;
   out.stats.corridor_violations = info_.corridor_violations;
   out.stats.time_to_goal = v_cmd > 0.05 ? remaining / v_cmd : 0.0;
+  // M4.4（R9）：剖面一致性（分"参考偏差"与"跟踪偏差"，`info_` 在 buildQp 里填好）。
+  // ★ 只在**真正执行了跟踪**的路径上回填：原地对正 / 到点停车那些分支里
+  //   v 本来就是 0，拿它去比剖面会得到 100% 的**假偏差**。
+  out.stats.profile_dev = info_.prof_dev;
+  out.stats.profile_v = info_.prof_v;
+  out.stats.profile_v_ref = info_.ref_v;
+  out.stats.profile_track_dev = info_.prof_track_dev;
   return out;
 }
 

@@ -62,6 +62,8 @@ add_library(pnc_2d_planner
   src/core/cost_map_2d.cpp
   src/core/clearance_field.cpp
   src/core/footprint_collision.cpp
+  src/core/trajectory_check.cpp
+  src/core/reference_profile.cpp
   src/core/route_graph.cpp
   src/core/map_zones.cpp
   src/core/local_distance_field.cpp
@@ -72,11 +74,16 @@ add_library(pnc_2d_planner
   src/global/route_network_planner.cpp
   src/local/null_local_planner.cpp
   src/local/mpc_local_planner.cpp
+  src/traj/minco_optimizer.cpp
   src/sm/manager_sm.cpp
 )
 target_include_directories(pnc_2d_planner PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
+  # traj/gcopter 是 vendor 的第三方代码，其内部 include 写的是 "gcopter/xxx.hpp"
+  # ⇒ 必须把 include/pnc_2d/traj 也放进搜索路径（这样 vendor 文件零改动，重 vendor 直接覆盖）
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/pnc_2d/traj>
+  $<INSTALL_INTERFACE:include/pnc_2d/traj>
   ${YAML_CPP_INCLUDE_DIR}
 )
 target_link_libraries(pnc_2d_planner PUBLIC ${YAML_CPP_LIBRARIES})
@@ -98,6 +105,20 @@ endif()
 message(STATUS "OSQP: ${OSQP_LIBRARY} | include ${OSQP_INCLUDE_DIR}")
 target_include_directories(pnc_2d_planner PUBLIC ${OSQP_INCLUDE_DIR})
 target_link_libraries(pnc_2d_planner PUBLIC ${OSQP_LIBRARY})
+
+# Eigen：M2 起 traj/ 要用（vendor 的 gcopter 头文件写的是 `#include <Eigen/Eigen>`）。
+# 与 OSQP 同样的策略：**只信 find_path 的结果**，不用 imported target ——
+# 系统 Eigen 装在 /usr/include/eigen3（不在默认搜索路径里），而 ROS 侧的
+# Eigen3Config 在不同发行版里位置/变量名都不同。
+# 注意：导出时会把绝对路径写进 install 接口，这与 OSQP_INCLUDE_DIR 的做法一致。
+find_path(EIGEN3_INCLUDE_DIR Eigen/Eigen
+  PATHS /usr/include/eigen3 /usr/local/include/eigen3
+        /opt/ros/${ROS_DISTRO}/include/eigen3)
+if(NOT EIGEN3_INCLUDE_DIR)
+  message(FATAL_ERROR "找不到 Eigen（Eigen/Eigen）：请先 sudo apt install libeigen3-dev")
+endif()
+message(STATUS "Eigen: ${EIGEN3_INCLUDE_DIR}")
+target_include_directories(pnc_2d_planner PUBLIC ${EIGEN3_INCLUDE_DIR})
 
 # ---------------------------------------------------------------- 规划节点
 # nodes/ = ROS 薄壳：只做 IO / 参数 / frame 校验，不写算法
@@ -124,6 +145,14 @@ ament_target_dependencies(local_planner_node
 add_executable(pnc_manager_node src/nodes/pnc_manager_node.cpp)
 target_include_directories(pnc_manager_node PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/nodes)
 target_link_libraries(pnc_manager_node pnc_2d_planner "${cpp_typesupport_target}")
+
+# P6/M2 阶段性验证：A* 全局路径 → MINCO 轨迹 → RViz（独立节点，不动主链路）
+add_executable(traj_viz_node src/nodes/traj_viz_node.cpp)
+target_include_directories(traj_viz_node PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/nodes)
+target_link_libraries(traj_viz_node pnc_2d_planner "${cpp_typesupport_target}")
+ament_target_dependencies(traj_viz_node
+  rclcpp std_msgs nav_msgs geometry_msgs
+)
 ament_target_dependencies(pnc_manager_node
   rclcpp rclcpp_action std_msgs std_srvs nav_msgs geometry_msgs
 )
@@ -134,7 +163,7 @@ install(TARGETS pnc_2d_planner
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
-install(TARGETS global_planner_node local_planner_node pnc_manager_node
+install(TARGETS global_planner_node local_planner_node pnc_manager_node traj_viz_node
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}
@@ -147,6 +176,9 @@ ament_export_targets(export_pnc_2d_planner HAS_LIBRARY_TARGET)
 ament_export_include_directories(include)
 ament_export_dependencies(rclcpp std_msgs std_srvs nav_msgs geometry_msgs visualization_msgs yaml-cpp)
 ament_export_dependencies(rosidl_default_runtime)
+# 注：traj/gcopter 是 header-only（MIT/GPL-3 混源，见 include/pnc_2d/traj/gcopter/README.md），
+# 不产生额外链接依赖；但它需要 Eigen ⇒ 导出时把 Eigen 的 include 路径带给下游。
+ament_export_include_directories(${EIGEN3_INCLUDE_DIR})
 
 # ---------------------------------------------------------------- 测试
 if(BUILD_TESTING)
@@ -169,6 +201,14 @@ if(BUILD_TESTING)
   target_link_libraries(test_mpc_local_planner pnc_2d_planner)
   ament_add_gtest(test_mpc_qp_reference test/test_mpc_qp_reference.cpp)
   target_link_libraries(test_mpc_qp_reference pnc_2d_planner)
+  ament_add_gtest(test_clearance_gradient test/test_clearance_gradient.cpp)
+  target_link_libraries(test_clearance_gradient pnc_2d_planner)
+  ament_add_gtest(test_minco_optimizer test/test_minco_optimizer.cpp)
+  target_link_libraries(test_minco_optimizer pnc_2d_planner)
+  ament_add_gtest(test_reference_profile test/test_reference_profile.cpp)
+  target_link_libraries(test_reference_profile pnc_2d_planner)
+  ament_add_gtest(test_upstream_profile test/test_upstream_profile.cpp)
+  target_link_libraries(test_upstream_profile pnc_2d_planner)
 endif()
 
 ament_package()

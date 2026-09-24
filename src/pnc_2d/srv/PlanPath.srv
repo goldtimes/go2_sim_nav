@@ -55,3 +55,17 @@ int32[] route_edges               # 用到的通道下标（诊断/可视化）
 #   走廊**只对路网段有意义**。若把入口段也当成"严格贴线的中心线"，车在车道外
 #   几厘米处就被硬约束判死（实测横向偏差 ≥0.055 m ⇒ 求解器不收敛、车一步不动）。
 float64[] corridor_width
+
+# ---- 参考速度剖面（M4：MINCO 时间参数化的下行管道）----
+# 语义：traj_valid=true 时，traj_s/traj_v/traj_w **等长**且逐点对齐，
+#   s 严格递增（从 0 到 traj_s.back() = 轨迹弧长），
+#   v [m/s] / w [rad/s] 是上游（全局规划器）算好的速度剖面。
+#   局部规划器应把它当作"速度上限来源"，而不是自己再用曲率/制动重算一遍
+#   （两边各算一遍必然不自洽，实测过：轨迹比预期慢 1.8x）。
+# ★ traj_valid=false 或数组为空 → **完全回退旧行为**（局部自行限速），
+#   因此未接通的上游不会让车变差。
+bool traj_valid
+string traj_note            # 失败原因 / 诊断串（traj_valid=false 时非空）
+float64[] traj_s            # 弧长 [m]，严格递增
+float64[] traj_v            # 速度 [m/s]
+float64[] traj_w            # 转向速率 [rad/s]

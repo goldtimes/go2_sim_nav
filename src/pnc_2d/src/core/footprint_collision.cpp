@@ -195,6 +195,11 @@ bool FootprintCollisionChecker::fullCheckAtCell(int cx, int cy, double yaw,
   return false;
 }
 
+bool FootprintCollisionChecker::hasMap() const
+{
+  return map_ != nullptr && map_->valid();
+}
+
 bool FootprintCollisionChecker::poseInCollision(double wx, double wy, double yaw) const
 {
   if (!map_ || !map_->valid()) return true;
@@ -238,6 +243,44 @@ bool FootprintCollisionChecker::poseInCollisionAtMargin(double wx, double wy,
   f0.safe_margin = margin;   // 0 = 真实轮廓；负 = 把轮廓缩小（问“穿透多深”）
   f0.fast_path = false;      // 快路径表是按含余量的 footprint 建的
   return fullCheckAtCell(cx, cy, yaw, &f0);
+}
+
+double FootprintCollisionChecker::signedClearanceAt(double wx, double wy, double yaw,
+                                                    double max_search) const
+{
+  if (max_search <= 0.0) return 0.0;
+  if (!map_ || !map_->valid()) return -max_search;
+
+  // 轮廓判定被关掉时，margin 不参与判定 ⇒ 二分没有意义（退化点判定）
+  if (!fp_.enable) return pointLethal(wx, wy) ? -max_search : max_search;
+
+  // ---- 快路径：最近致命格中心距离 d ≥ reach0 + e + max_search ⇒ 任何朝向都够开阔
+  if (cf_ != nullptr && cf_->valid() && cf_->width() == map_->width() &&
+      cf_->height() == map_->height())
+  {
+    const double d = distanceToLethal(wx, wy);          // NaN = 拿不到距离场
+    if (!std::isnan(d)) {
+      const double reach0 = std::hypot(0.5 * fp_.length, 0.5 * fp_.width) +
+                            std::hypot(fp_.offset_x, fp_.offset_y);
+      if (d - reach0 - cf_->marginM() >= max_search) return max_search;
+    }
+  }
+
+  // ---- 二分：free(m) = !poseInCollisionAtMargin(m) 对 m 单调递减（m↑ ⇒ 轮廓↑ ⇒ 更易碰）
+  if (!poseInCollisionAtMargin(wx, wy, yaw, max_search)) return max_search;   // 开阔、饱和
+  if (poseInCollisionAtMargin(wx, wy, yaw, -max_search)) return -max_search;  // 穿透很深、饱和
+
+  double lo = -max_search;   // free(lo) = true
+  double hi = max_search;    // free(hi) = false
+  for (int i = 0; i < 14; ++i) {
+    const double mid = 0.5 * (lo + hi);
+    if (poseInCollisionAtMargin(wx, wy, yaw, mid)) {
+      hi = mid;
+    } else {
+      lo = mid;
+    }
+  }
+  return lo;
 }
 
 void FootprintCollisionChecker::cornerWorld(double x, double y, double yaw, int i,

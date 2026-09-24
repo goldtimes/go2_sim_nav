@@ -56,6 +56,12 @@ public:
   const FootprintCollisionChecker &collisionChecker() const {
     return collision_;
   }
+  /// 距离场（**值与梯度**）：轨迹优化器（MINCO）的平滑段要用。
+  /// ★ 与 `collisionChecker()` 一样是"借出去的那一份"：节点不自己再建一份
+  ///   （"同一判据配两遍"已经裁过多次），而且这里返回的指针在
+  ///   `setCostMap()` 重建时**会变** ⇒ 调用方必须在地图更新后重新取一次。
+  ///   地图无效时为 nullptr。
+  const ClearanceField *clearanceField() const { return clearance_.get(); }
 
   // ---- 可选能力：只有"路网类"算法才有内容，供节点做可视化/诊断 ----
   /// 路网（没有则返回 nullptr）

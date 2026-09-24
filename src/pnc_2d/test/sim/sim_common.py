@@ -50,10 +50,71 @@ GO2_CFG = os.environ.get(
 
 
 # ------------------------------------------------------------------ 起停
+PNC_NODES = ("pnc_manager", "global_planner", "local_planner")
+
+
+def running_pnc_nodes(timeout=6.0):
+    """当前域里跑着的 pnc_2d 三节点（用 rclpy，不开子进程）。
+
+    ★★ 每个 E2E 脚本在起栈之前都必须查一遍（2026-09-24 实测，代价很大）：
+      测试脚本会**自己起一套** pnc_2d，若外面还有一套在跑，`ros2 node list`
+      对**重名节点只列一次**，从列表上根本看不出来（唯一的线索是那行
+      `WARNING: ... nodes in the graph that share an exact name`）。
+      后果是所有指标变成两套的混合，而且每一条单独看都像真 bug：
+        · 探针收到一半来自旧栈的 `LocalStatus`；
+        · `FOLLOWING → IDLE`（两套 manager 互相顶目标，`endAsCanceled` 发的就是 IDLE）；
+        · 横向偏差量出一个**恒定 10 cm** 的偏置（量的是另一套的路径）；
+        · 测试自己那套的日志里**一个目标都没收到**，与探针收到的数据互相矛盾。
+      实测为此排查了一整轮（gdb、单测、改了三个"真 bug"），根因只是这个。
+    """
+    if not rclpy.ok():
+        rclpy.init()
+    try:
+        n = rclpy.create_node("pnc2d_stack_guard")
+        end = time.time() + timeout
+        names: set = set()
+        while time.time() < end:
+            rclpy.spin_once(n, timeout_sec=0.1)
+            names |= {x.lstrip("/").split("/")[-1] for x in n.get_node_names()}
+            if all(k in names for k in PNC_NODES):
+                break
+        n.destroy_node()
+        return [k for k in PNC_NODES if k in names]
+    finally:
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+KILL_HINT = ("pkill -f 'pnc_2d.launch.py'; "
+             "pkill -f 'pnc_2d/(pnc_manager|global_planner|local_planner)_node'")
+
+
 def launch(planner="astar", extra_cfg=None):
+    # ★ 起栈之前先确认没有残留的 pnc_2d（否则两套栈的数会混在一起，见上面的说明）
+    stray = running_pnc_nodes()
+    if stray and not os.environ.get("PNC2D_ALLOW_EXTRA_STACK"):
+        raise RuntimeError(
+            "已有 pnc_2d 节点在跑：%s\n"
+            "  两套栈会互相顶目标，探针收到的指标是两套混合的 ⇒ 每项都不可信。\n"
+            "  先停掉： %s\n"
+            "  （确实想同时跑两套就设 PNC2D_ALLOW_EXTRA_STACK=1）"
+            % (", ".join(stray), KILL_HINT))
+
     cmd = ("ros2 launch pnc_2d pnc_2d.launch.py "
            f"planner_type:={planner} local_type:=mpc use_sim_time:=true "
            f"extra_config:={extra_cfg or GO2_CFG}")
+    # 可选：给**单个**节点套一个前缀（例如 gdb），用来拿崩溃回溯。
+    #   export PNC2D_LAUNCH_PREFIX="gdb -batch -ex run -ex bt -ex quit --args"
+    #   export PNC2D_LAUNCH_PREFIX_FILTER="local_planner_node"
+    # ★ 这是本仓库唯一能对"节点崩了"取证的便宜手段：崩溃日志只有
+    #   `process has died, exit code -11`，别的什么都看不到。
+    prefix = os.environ.get("PNC2D_LAUNCH_PREFIX", "").strip()
+    if prefix:
+        cmd += f" --launch-prefix '{prefix}'"
+        filt = os.environ.get("PNC2D_LAUNCH_PREFIX_FILTER", "").strip()
+        if filt:
+            cmd += f" --launch-prefix-filter '{filt}'"
+    print(f"  launch: {cmd}")
     log = tempfile.NamedTemporaryFile(delete=False, suffix=".log")
     proc = subprocess.Popen(["bash", "-lc", cmd], stdout=log,
                             stderr=subprocess.STDOUT, start_new_session=True)
@@ -144,6 +205,10 @@ class Probe(Node):
         self.t0 = time.time()
         self.rows = []      # 局部状态 (t, x, y, yaw, v_twist, status, cmd_v,
                             #           cmd_w, cross_track, progress)
+        #                        + 11..14 = profile_dev / profile_v /
+        #                          profile_v_actual / solve_time_ms
+        #                          （M4.5 追加在**末尾**：既有脚本都按下标 0/6/7 取
+        #                           量，往后追加不会绕过它们）
         self.traj = []      # 高频位姿 (t, x, y, yaw) —— 指标主源
         self.local_msgs = 0
         self.state_seen = set()
@@ -187,7 +252,9 @@ class Probe(Node):
             #   贴线质量必须在 route_mode=true 的样本上量。
             self.rows.append((time.time() - self.t0, self.pose[0], self.pose[1],
                               0.0, self.pose_v, m.status_name, m.cmd_v, m.cmd_w,
-                              m.cross_track_m, m.progress, bool(m.route_mode)))
+                              m.cross_track_m, m.progress, bool(m.route_mode),
+                              m.profile_dev, m.profile_v, m.profile_v_ref,
+                              m.solve_time_ms, m.profile_track_dev))
 
     def on_state(self, m):
         self.state_seen.add(m.state_name)

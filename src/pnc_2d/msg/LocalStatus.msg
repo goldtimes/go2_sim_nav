@@ -35,3 +35,12 @@ float64 progress            # 路径进度 0~1
 float64 time_to_goal_s      # 预估剩余时间 [s]
 uint32 path_points          # 正在跟随的路径点数
 bool route_mode             # true = 有走廊约束（贴线走），false = 自由空间跟踪
+
+# ---- 上游剖面一致性（M4.4 / R9：剖面"接通了但没生效"的唯一看得见的证据）----
+# 局部每控制周期量"上游说该跑多快 vs 车实际多快"。
+# ★ 为什么要进话题：这类故障（use_upstream_profile 被关、q_v 权重为 0、
+#   底盘/限速区把它盖住）**没有任何报错**，只表现为"车忽快忽慢"。
+float64 profile_dev         # |v_ref − v剖面(s)| / max(v剖面(s), 0.1)；**< 0 = 本周期无剖面**
+float64 profile_v           # 上游 v剖面(s) [m/s]
+float64 profile_v_ref       # MPC 采纳的参考速度 v_ref [m/s]
+float64 profile_track_dev   # |v实测 − v_ref| / max(v_ref, 0.1)；< 0 = 无剖面

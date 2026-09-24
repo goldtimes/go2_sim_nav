@@ -353,6 +353,33 @@ private:
         corridor_width_per_point_.assign(
             path_.poses.size(), strict_corridor_ ? 0.0 : corridor_half_width_);
     }
+    // 参考速度剖面（M4）：全局规划器可能已经算好了剖面（MINCO 时间参数化）。
+    // ★ 只透传，不在这里取 min / 截断：局部规划器还要叠加底盘钳位、末段
+    //   approach/crawl 减速、降级限速等运行时约束，在这里动它只会让两边打架。
+    traj_valid_ = res->traj_valid;
+    traj_note_ = res->traj_note;
+    traj_s_.assign(res->traj_s.begin(), res->traj_s.end());
+    traj_v_.assign(res->traj_v.begin(), res->traj_v.end());
+    traj_w_.assign(res->traj_w.begin(), res->traj_w.end());
+    if (traj_valid_ &&
+        !(traj_s_.size() == traj_v_.size() && traj_s_.size() == traj_w_.size() &&
+          traj_s_.size() >= 2)) {
+      // 上游字段自相矛盾 ⇒ 宁可当"没有剖面"（回退旧行为），也不要拿半张表去限速
+      RCLCPP_WARN(get_logger(),
+                  "[sm] 参考剖面长度不自洽（s=%zu v=%zu w=%zu）⇒ 丢弃",
+                  traj_s_.size(), traj_v_.size(), traj_w_.size());
+      traj_valid_ = false;
+      traj_s_.clear();
+      traj_v_.clear();
+      traj_w_.clear();
+    }
+    if (traj_valid_)
+      RCLCPP_INFO(get_logger(), "[sm] 参考剖面：%zu 点 / 弧长 %.2f m / 峰值 %.2f m/s",
+                  traj_s_.size(), traj_s_.back(),
+                  traj_v_.empty() ? 0.0
+                                  : *std::max_element(traj_v_.begin(), traj_v_.end()));
+    else if (!traj_note_.empty())
+      RCLCPP_INFO(get_logger(), "[sm] 无参考剖面：%s", traj_note_.c_str());
     const std::size_t corr_pts = static_cast<std::size_t>(std::count_if(
         corridor_width_per_point_.begin(), corridor_width_per_point_.end(),
         [](double w) { return w > 0.0; }));
@@ -399,6 +426,13 @@ private:
     // ★ 没接通之前这里一直 clear()，导致 route 模式的走廊约束**从未生效**过：
     //   路径确实是沿通道算的，但局部只会"尽量跟"，可以自由绕障跑到通道外面。
     goal.corridor_width = corridor_width_per_point_;
+    // 参考速度剖面（M4）：与走廊同一条"全局 → 局部"通道，同样逐点透传。
+    // traj_valid=false 时局部会完全回退旧行为（自己按曲率/制动限速）。
+    goal.traj_valid = traj_valid_;
+    goal.traj_note = traj_note_;
+    goal.traj_s = traj_s_;
+    goal.traj_v = traj_v_;
+    goal.traj_w = traj_w_;
     goal.speed_limit = speed_limit_;
     if (has_corridor_ && corridor_speed_limit_ > 0.0) {
       // 通道限速与全局限速（限速区）取更保守的那个：谁小听谁的
@@ -637,6 +671,13 @@ private:
   /// 为什么逐点：hybrid 的路径含自由入口/出口段，那些段没有走廊；标量会把它们
   /// 也当成"严格贴线的中心线"，车在车道外几厘米就被判死（见 doPlan 的说明）。
   std::vector<double> corridor_width_per_point_;
+
+  /// ★ 参考速度剖面（M4）：全局规划器给的"弧长→速度/转向速率"表。
+  /// 这里只做**存储与透传**，不做任何解释/限幅（解释权在局部规划器，
+  /// 因为只有它知道底盘钳位、末段减速、降级限速等运行时约束）。
+  bool traj_valid_{false};
+  std::string traj_note_;
+  std::vector<double> traj_s_, traj_v_, traj_w_;
 
   ManagerSm sm_;
 

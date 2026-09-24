@@ -387,11 +387,12 @@ TEST(AStarPlanner, StartTouchingMarginStillPlansButRealCollisionFails) {
       const double dx = r1.path[i].x - x_margin;
       const double dy = r1.path[i].y - 7.5;
       if (std::hypot(dx, dy) < 1.5) continue;   // 起点让步圈（1.0 m）内不看
-      worst_far = std::min(worst_far, r1.path[i].x - (wall - 0.05));
+      // 到**图上膨胀后**墙面的净距（图上墙从 wall-0.05 起，取格中心）
+      worst_far = std::min(worst_far, (wall - 0.05) - r1.path[i].x);
     }
-    std::printf("      圈外最小净距 %.3f m（含图膨胀 0.05 ⇒ 需求 0.30）\n",
-                worst_far + 0.05);
-    EXPECT_GT(worst_far + 0.05, 0.29)
+    std::printf("      圈外到图上墙面最小净距 %.3f m（需求 ≥ 0.25）\n",
+                worst_far);
+    EXPECT_GT(worst_far, 0.24)
         << "圈外必须保持完整余量（否则整条路都贴墙走）";
   }
 
@@ -408,10 +409,10 @@ TEST(AStarPlanner, StartTouchingMarginStillPlansButRealCollisionFails) {
   const double x_hit = wall - 0.06;
   auto r3 = planner->plan(PlanRequest{mkPose(x_hit, 7.5, 90.0),
                                       mkPose(1.0, 10.0, 90.0)});
-  std::printf("  [起点穿透>1格] %s：%s\n", toString(r3.status), r3.message.c_str());
+  std::printf("  [起点真撞 0.06] %s：%s\n", toString(r3.status), r3.message.c_str());
   EXPECT_EQ(r3.status, PlannerStatus::kStartFootprintCollision)
-      << "穿透超过 1 格时爬着走更危险，必须如实报错";
-  EXPECT_NE(r3.message.find("穿透已超过"), std::string::npos);
+      << "真贴在墙上时爬着走更危险，必须如实报错";
+  EXPECT_NE(r3.message.find("没找到可通行"), std::string::npos);
 
   // ③ 关掉让步（半径 0）⇒ 回到严格判据（1 mm 也不算）
   MemoryParamReader strict;

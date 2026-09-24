@@ -141,6 +141,16 @@
     local.cmd_vel_topic: "pnc_2d/cmd_vel"
     local.control_rate: 20.0           # 控制周期 [Hz]
     local.goal_tolerance: 0.30         # 距路径终点 ≤ 该值算"到达" [m]
+    # ★ 到点判定的**第二个正交条件**（2026-09-24 新增）：横向残差。
+    #   为什么要单独一个：原来"到点"只比一个**欧氏距离** ⇒ 横向残差与"没走完"
+    #   混在一起，报出来的"到点误差 10 cm"分不清该修哪个。实测那 10 cm **全是横向**
+    #   （路径在 x=-6.50，车停在 x=-6.40，沿向只差 2 cm）—— 车其实走到了，只是
+    #   没贴线。拆开后两个数各自可归因（失败消息里会直接写"沿向超"还是"横向超"）。
+    #   ★ 0.10 是**当前控制器实测能到的水平**，不是目标值；M5 的"到点/对正"要把
+    #     它收到 ~0.03。现在必须先能通过，否则任务在终点必然失败。
+    #   ⚠ 只在这里配一处（平台片段可覆盖）；别再复制到别的文件 ——
+    #     `local.goal_tolerance` 就是因为两处都配（0.30 vs 0.01）而漂了 30 倍。
+    local.lateral_tolerance: 0.10      # 到点横向容差 [m]
     local.pass_distance: 0.50          # 距路径点 ≤ 该值算"经过"（用于算进度）[m]
     local.odom_timeout: 1.0            # 位姿超过该时长没更新 → 降级停发 [s]
     # ---- 距离场（P5.3 接线）----
@@ -224,3 +234,109 @@
     # 第二道闸只会把"规划后 0.3 s 才出现的动态障碍"这类**真可恢复**的情况直接判失败。
     replan.min_interval_s: 0.0
 
+
+    # ---------------------------------------------------------------- 轨迹优化（P6 后端 / MINCO）
+    # 语义：把 A* 折线变成"几何 + 运动学可行"的时间参数化轨迹（= 剖面），
+    #       MPC 只负责跟踪。参数与主链路**同源**：距离场/轮廓判定器都用上面
+    #       common.* 与 footprint.* 那几个键，不在这里另配一套（跨层配两遍必打架）。
+    # 阶段性验证：ros2 run pnc_2d traj_viz_node --ros-args \
+    #             --params-file <这个文件>，然后在 RViz 里加 Path 显示
+    #             /pnc_2d/global_path（A*）与 /pnc_2d/minco_traj（MINCO）对比。
+    # ★★ A/B 开关（M4.2 起它控制**主链路**了）：
+    #   traj.type: "none"  → 全局节点不跑轨迹优化，下发 A* 原路径 + 空剖面
+    #                         ⇒ **与接通前一字不差**（现网行为）；
+    #   traj.type: "minco" → free 模式（无走廊）下，A* 折线 → MINCO 时间参数化，
+    #                         通过两道门（净距终检 + 运动学终验）才替换路径，
+    #                         并把速度/转向速率剖面一起下给 MPC。
+    #   走廊模式（route）**永远不优化**（贴线是硬约束，挪线等于改需求）。
+    #   traj_viz_node（离线调试节点）不读这个键：它总是跑 MINCO。
+    traj.type: "none"                  # none | minco
+    # 换路径时下发的点间距 [m]。★ **不得小于 5 cm**：MPC 用相邻路径点算切向，
+    # 点太密时切向会被积分/栅格噪声主导（下面会 max(0.05, 该值) 兜一道）。
+    traj.publish_spacing: 0.05
+
+    # 路点取法：**时间等分**（步长 time_step），弧长按下面的加速受限剖面走。
+    # ★ 反过来（弧长等分 + 时间按剖面走）会让每段时间在 3~4 倍范围内变化而 s 增量均匀，
+    #   带状系统会解出剧烈摆动（实测中段 2.15 m/s、s 冲过终点 3 m 再回来）。
+    traj.time_step: 0.40               # [s] 段数 ≈ 轨迹时长/它，夹在 3~60
+    traj.resample_ds: 0.15             # [m] 平滑与弧长参考用的折线重采样间距
+    # 平滑（Stage A：几何避障）。净距目标 = 车体**外接圆半径** + smooth_margin，
+    # 实测默认 0.622 m（外接圆 0.472 + 0.15）。
+    traj.smooth_margin: 0.15           # [m] 在车体外接圆半径之上再留多少
+    traj.smooth_w_smooth: 1.0          # 二阶差分（平滑）权重
+    traj.smooth_w_sdf: 2.0             # 净距罚权重（**这才是"避障推多使劲"的杠杆**）
+    # ★ 实测（贴墙 10 m；用例 AvoidanceWeightVsAchievedClearanceIsMonotoneAndMeasured）：
+    #     w_sdf  2 → 达成 0.607 m / 路径偏移 0.036 m
+    #     w_sdf  4 → 达成 0.611 m / 路径偏移 0.037 m
+    #     w_sdf  8 → 达成 0.615 m / 路径偏移 0.038 m
+    #     w_sdf 16 → 达成 0.619 m / 路径偏移 0.039 m
+    #   收益**单调但饱和**、代价（偏移）几乎不变 ⇒ 真在地图上看到终检拦停时可调到 8；
+    #   先留在 2.0（项目纪律：量到收益才改）。
+    traj.smooth_w_anchor: 0.2          # 锚定权重（别离原计划太远）
+    # ★★ 机制 ①（端点自适应 `safeDis = min(ratio × 端点实测净距, 目标)`）**默认关闭**。
+    #   实测（用户 2026-09-24 批准的"做 A"）：贴着墙走时
+    #     开 0.85 → 端点下限 0.492 / **实际达成 0.578 m** / 缺口 0.007
+    #     关（默认）→ 端点下限 0.622 / **实际达成 0.607 m** / 缺口 0.015
+    #   ⇒ **降低目标 ⇒ 罚项提前归零 ⇒ 实际达成净距变低**（结构性单调关系），
+    #     而终检查的是**实际净距** ⇒ 开它只会让拦停**更频繁**。
+    #   原版用它是对付"起点在死角落里"（那里宁可少推也不要把路径挤歪），
+    #   与我们的判据方向相反 ⇒ 置 0 关闭（同 max_length_m: 0 = 不截断 的约定）。
+    traj.smooth_safe_ratio: 0.0        # [-] 0 = 关闭端点自适应
+    traj.smooth_ramp_len: 1.0          # [m] 端点自适应目标的过渡长度（ratio > 0 时才用）
+    traj.smooth_iters: 80              # L-BFGS 最大迭代
+    # 运动学硬上限（必须是底盘真值；与 local_mpc 同源，改要一起改）
+    #   ★★ 2026-09-24 实测：这组曾经漂了 2 倍（`traj.v_max` 0.90 vs
+    #      `local_mpc.v_max` 0.42；`traj.v_ref` 0.60 vs `reference_speed` 0.35）。
+    #      后果是**剖面的上半段每一拍都被下游裁掉** —— M4.4 的"参考偏差"
+    #      均值 32.7%、>10% 的拍数 254/317。它看起来像"剖面没生效"，实际是
+    #      上下游说的不是同一个上限（不是控制问题）。对齐后这个数才真正在回答
+    #      "剖面被采纳了吗"。⇒ 这就是本仓库那句"跳层配两遍必打架"。
+    #   ⚠ 下列三项**仍未同源**，有意留给标定决定（不要静默对齐）：
+    #      · traj.a_max 0.50 < local_mpc.a_max 0.60：上游更保守，不会下游裁掉；
+    #      · traj.alpha_max 2.50 > local_mpc.alpha_max 1.50：上游更松，ω 的
+    #        变化率会被 MPC 裁（ω 本身的上界已同源 0.65）；
+    #      · local_mpc.brake_acc 0.15 < traj.a_max 0.50 ⇒ **本地终点制动比上游紧**，
+    #        靠近目标那一段仍会盖住剖面 —— 那是有意的（0.15 是底盘实测贴拢值）。
+    traj.v_max: 0.42                   # [m/s] = local_mpc.v_max（实测饱和值 0.415）
+    traj.a_max: 0.50                   # [m/s^2] ≤ local_mpc.a_max(0.60)：宁可保守
+    traj.w_max: 0.65                   # [rad/s] = local_mpc.w_max
+    traj.alpha_max: 2.50               # [rad/s^2] > local_mpc.alpha_max(1.5)（见上）
+    traj.v_ref: 0.35                   # [m/s] = local_mpc.reference_speed（巡航参考）
+    traj.min_piece_time: 0.05          # [s]
+    # 采样与终点
+    traj.output_dt: 0.05               # [s] 输出采样步长（= 剖面的时间分辨率）
+    traj.integrate_dt: 0.01            # [s] 输出用的 Simpson 积分步长
+    traj.scan_dt: 0.05                 # [s] 终点修正/时间缩放用的粗积分步长
+    traj.terminal_tol: 0.01            # [m] 终点 XY 容差（XY 是 (θ,s) 的积分派生量）
+    traj.terminal_iters: 12
+    traj.max_solve_ms: 50.0            # [ms] 超预算只记一笔（不失败）
+    traj.clearance_exclude_s: 0.20     # [m] 净距统计排除首端这么长（首点=车自己）
+
+    # ---- M3 轨迹终检（逐位姿、含朝向的全机轮廓检查；这是**交付门**）
+    # 口径见 core/trajectory_optimizer.hpp 的 checkTrajectory：
+    #   硬门不过 ⇒ status=CHECK_FAILED，调用方**不得执行** samples（降级 A* 原路径）。
+    traj.check_ds: 0.02                # [m] 弧长采样间距（计划书定的 2 cm）
+    traj.check_dyaw: 0.10              # [rad] 朝向采样间距（≈5.7°）
+    # ★ 终检是**两遍**，判据不同、代价差一个数量级（见 core/trajectory_check.cpp）：
+    #   ① 硬门：按 (check_ds, check_dyaw) 细分，默认用**便宜的布尔判定**
+    #      （方向预计算表 ~3 µs）；`check_hard_margin > 0` 才退回净距二分。
+    #   ② 统计（最小净距）：按下面这两格走 `signedClearanceAt`。
+    #   ★ 为什么必须拆：`signedClearanceAt` 内部是 14 步二分、每步重建一次轮廓偏移表
+    #     （~20~40 µs）⇒ 用户现场（40 m 路径、1891 个输出点）一遍 2 cm 净距二分要
+    #     **122.7 ms**（超 50 ms 预算），实测绝大部分耗在这里。拆开约 **9× 提速**。
+    traj.check_stats_ds: 0.10          # [m] 统计网格（硬门已保证不碰，只需一个"数"）
+    traj.check_stats_dyaw: 0.20        # [rad]
+    # ★ 为什么 dyaw 不能省：轨迹会**原地转**（起点朝向与路径首段差很大时就是，
+    #   实测头 1 s 位移 0.001 m）。原地转几乎不产生弧长 ⇒ 只按 ds 采会**整段漏掉**
+    #   旋转扫掠的区域。判据取证：同一场景只按弧长采 = 2 个位姿、判"通过"；
+    #   带 dyaw = 33 个位姿、抓出 19 个不过、最差净距 -0.039 m。
+    traj.check_hard_margin: 0.0        # [m] 硬要求：真实轮廓净距不得低于它。0 = "不碰"
+    # ★ 为什么不取 footprint.safe_margin（0.05）：轮廓判定把位姿**吸附到格心**
+    #   （误差 ±半格 = ±5 cm，见 footprint_collision.hpp），半格量级的余量当硬门会
+    #   **随机失败** —— 那是判据噪声，不是性能问题。余量只作为 warn 报出来。
+    traj.check_warn_margin: 0.05       # [m] 低于它只记一笔（不改 status）
+
+    # 阶段性验证节点（traj_viz_node）的话题
+    traj.viz.input: "pnc_2d/global_path"
+    traj.viz.output: "pnc_2d/minco_traj"
+    traj.viz.status: "pnc_2d/minco_status"

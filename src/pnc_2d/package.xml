@@ -20,6 +20,9 @@
     <depend>visualization_msgs</depend>
     <depend>sensor_msgs</depend>
     <depend>yaml-cpp</depend>
+    <!-- M2 起：traj/（MINCO 后端）用 Eigen（vendor 的 gcopter 头文件）
+         rosdep key `eigen` → libeigen3-dev -->
+    <depend>eigen</depend>
 
     <exec_depend>rosidl_default_runtime</exec_depend>
     <member_of_group>rosidl_interface_packages</member_of_group>

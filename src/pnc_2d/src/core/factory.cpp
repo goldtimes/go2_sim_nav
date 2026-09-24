@@ -5,6 +5,7 @@
 #include "pnc_2d/global/route_network_planner.hpp"
 #include "pnc_2d/local/mpc_local_planner.hpp"
 #include "pnc_2d/local/null_local_planner.hpp"
+#include "pnc_2d/traj/minco_optimizer.hpp"
 
 namespace pnc_2d {
 
@@ -47,5 +48,19 @@ createRecoveryBehavior(const std::string &type) {
 }
 
 std::vector<std::string> availableRecoveries() { return {"replan"}; }
+
+std::unique_ptr<TrajectoryOptimizer>
+createTrajectoryOptimizer(const std::string &type) {
+  // "none"/"" → 不建（调用方据此完全跳过轨迹优化 = 旧行为）
+  if (type.empty() || type == "none" || type == "null")
+    return nullptr;
+  if (type == "minco")
+    return std::make_unique<MincoOptimizer>();
+  return nullptr;
+}
+
+std::vector<std::string> availableTrajectoryOptimizers() {
+  return {"none", "minco"};
+}
 
 } // namespace pnc_2d

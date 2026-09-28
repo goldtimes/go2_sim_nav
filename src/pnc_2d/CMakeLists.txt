@@ -64,6 +64,7 @@ add_library(pnc_2d_planner
   src/core/footprint_collision.cpp
   src/core/trajectory_check.cpp
   src/core/reference_profile.cpp
+  src/core/goal_checker.cpp
   src/core/route_graph.cpp
   src/core/map_zones.cpp
   src/core/local_distance_field.cpp
@@ -74,6 +75,7 @@ add_library(pnc_2d_planner
   src/global/route_network_planner.cpp
   src/local/null_local_planner.cpp
   src/local/mpc_local_planner.cpp
+  src/local/heading_shim_planner.cpp
   src/traj/minco_optimizer.cpp
   src/sm/manager_sm.cpp
 )
@@ -199,6 +201,9 @@ if(BUILD_TESTING)
   target_link_libraries(test_distance_field pnc_2d_planner)
   ament_add_gtest(test_mpc_local_planner test/test_mpc_local_planner.cpp)
   target_link_libraries(test_mpc_local_planner pnc_2d_planner)
+  ament_add_gtest(test_heading_shim_planner
+    test/test_heading_shim_planner.cpp)
+  target_link_libraries(test_heading_shim_planner pnc_2d_planner)
   ament_add_gtest(test_mpc_qp_reference test/test_mpc_qp_reference.cpp)
   target_link_libraries(test_mpc_qp_reference pnc_2d_planner)
   ament_add_gtest(test_clearance_gradient test/test_clearance_gradient.cpp)
@@ -207,6 +212,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_minco_optimizer pnc_2d_planner)
   ament_add_gtest(test_reference_profile test/test_reference_profile.cpp)
   target_link_libraries(test_reference_profile pnc_2d_planner)
+  ament_add_gtest(test_goal_checker test/test_goal_checker.cpp)
+  target_link_libraries(test_goal_checker pnc_2d_planner)
   ament_add_gtest(test_upstream_profile test/test_upstream_profile.cpp)
   target_link_libraries(test_upstream_profile pnc_2d_planner)
 endif()

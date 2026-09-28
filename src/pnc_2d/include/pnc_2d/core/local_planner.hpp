@@ -46,7 +46,8 @@ struct LocalStats {
   /// ① **参考口径**：`|v_ref − v_剖面(s)| / max(v_剖面(s), 0.1)`
   ///    回答"剖面被采纳了吗 / 被谁的限速盖住了"（底盘、任务、区域、终点爬行）。
   ///    `0` = 剖面就是本周期生效的上限；**`< 0` = 本周期无剖面（不适用）**。
-  /// ② **跟踪口径**：`|v_实测 − v_ref| / max(v_ref, 0.1)`，回答"控制器跟不跟得上
+  /// ② **跟踪口径**：`|v_实测 − v_ref| / max(v_ref,
+  /// 0.1)`，回答"控制器跟不跟得上
   ///    它自己的参考"。
   ///
   /// ★ 为什么必须拆成两个（2026-09-24 实测踩过）：最初只算了"v_实测 vs v_剖面"
@@ -54,8 +55,8 @@ struct LocalStats {
   ///   不前进、车从 0 加速，而剖面还在说 0.1 m/s）—— 假警报工厂，而且会把"剖面
   ///   工作正常"读成"剖面没生效"。两个问题要用两个数回答，混在一起两边都答错。
   double profile_dev{-1.0};
-  double profile_v{0.0};      ///< 上游 v_剖面(s) [m/s]
-  double profile_v_ref{0.0};  ///< MPC 采纳的参考速度 v_ref [m/s]
+  double profile_v{0.0};     ///< 上游 v_剖面(s) [m/s]
+  double profile_v_ref{0.0}; ///< MPC 采纳的参考速度 v_ref [m/s]
   double profile_track_dev{-1.0};
 };
 
@@ -164,6 +165,15 @@ public:
   /// 0.30 m/s 穿区。
   virtual double maxSpeed() const { return 0.0; }
 
+  /// **本算法能给出的最大角速度** [rad/s]（0 = 未定义 / 不知道）。
+  ///
+  /// 用途：装饰器类算法（`local/heading_shim_planner.hpp`）要检查**交棒动力学是否
+  /// 可行** —— 它在原地转完把手交回主控制器时，自己的角速度若大于主控制器能给的
+  /// 上限，交棒那一刻指令会被钳、动作打折（R10，见 doc §风险表）。
+  /// 与 `maxSpeed()`/`brakeAcc()` 同一个道理：这是**跳层物理量**，两边各配一份
+  /// 一定会不一致。
+  virtual double maxOmega() const { return 0.0; }
+
   /// **减速能力** [m/s²]（0 = 未定义 / 不知道）。
   ///
   /// 节点用它算限速区前瞻距离（`speedLookahead()`）：前瞻必须覆盖"从可能达到的
@@ -180,10 +190,12 @@ public:
   /// **目标朝向（终点 yaw）容差** [rad]（0 = 不判定朝向）。
   ///
   /// 节点用它做**任务级**到点判定：位置进了容差、朝向也进了容差，才叫"到达"。
-  /// 为什么必须在接口上：算法自己就在做"到点后原地对正"（`align_gain` /
-  /// `align_min_clearance` 都是它的参数），两边各配一份容差一定会不一致 ——
-  /// 典型的坏结果：节点按 2° 判、算法按 5° 对正 ⇒ 到点判定永远不满足、
-  /// 任务卡死到超时。同一个教训见 `stopCoast()` / `corridorTolerance()`。
+  /// 为什么必须在接口上：算法自己就在做"到点后对正"这件事（M5.2 之后由装饰器
+  /// `local/heading_shim_planner` 负责，它的 `shim.goal_yaw_tolerance_deg`
+  /// 就是这个 值），两边各配一份容差一定会不一致 —— 典型的坏结果：节点按 2°
+  /// 判、算法按 5° 对正 ⇒ 到点判定永远不满足、任务卡死到超时。同一个教训见
+  /// `stopCoast()` / `corridorTolerance()`。 ⚠
+  /// 装饰器必须转**自己的**这份（不能转发主控制器的）：主控制器不再管朝向。
   virtual double goalYawTolerance() const { return 0.0; }
 
   virtual bool producesCmdVel() const = 0;

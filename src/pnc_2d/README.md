@@ -144,9 +144,16 @@ ros2 launch pnc_2d pnc_2d.launch.py planner_type:=route_network local_type:=mpc
 1. **到点要保证朝向**。原来的到点判定只看位置（目标天生带 yaw：面向充电桩/通道口），
    现在：位置到了而朝向还差 > `goal_yaw_tolerance_deg` ⇒ 原地对正（v=0），进容差才算到达。
    - 容差经 `LocalPlanner::goalYawTolerance()` 给节点（**单一来源**，别在节点侧再配一份）。
-   - 对正要**打破底盘低速死区**：`ω = gain·e` 在 e 小时指令小到车不动 ⇒
-     永远收敛不了。所以有 `align_w_min` 下限（Go2 标定 0.20 rad/s，放在 `go2_run.yaml`）。
-   - `goal_yaw_align_timeout` 兜底：转不出来就报失败并说清还差几度、该查哪个参数。
+   - ★ **M5.2 起，转向（含起步"先转正再走"与到点对正）整块搬到了装饰器
+     `local.type: heading_shim`**（`local/heading_shim_planner.hpp`，参数 `shim.*`）。
+     MPC 变成**纯跟踪器**，不再有 `align_*` / `goal_yaw_*`。原因与量测见
+     `doc/minco_trajectory_plan.md §M5.2`：MPC 的目标函数只能给出"边转边走"，严格走廊
+     下航向差 ≥30° 时它宁可不动（实测 120/120 周期被挡）。
+   - 装饰器的旋转律是 `|ω| = min(ω_rot, √(2α|e|))` + 角加速度斜坡（**恒速段**），
+     所以不需要"ω 下限"这种补丁：需要动的地方给出的指令天然远大于底盘死区。
+   - 旋转前做 **footprint 扫掠检查**（转起来会扫到就不转，如实交回/报 BLOCKED）。
+   - `shim.rotation_timeout_s` 兜底：转不出来（**无进展**）就报失败并说清还差几度、
+     该查哪个参数。
    - 阿克曼底盘不能原地转 ⇒ 这种底盘把 `goal_yaw_tolerance_deg` 置 0。
 2. **自由模式顺滑优先**。自由段参考只是“大致往那儿走”的折线，不该像走廊那样严格贴线
    （否则几 cm/几度偏差就被当成大误差追，`ω` 顶满来回打 ⇒ 摇摇摆摆）。
@@ -219,10 +226,28 @@ ros2 launch pnc_2d pnc_2d.launch.py ns:=/e2e extra_config:=/tmp/isolate.yaml
 
 | 话题 | 类型 | 说明 |
 |---|---|---|
-| `/pnc_2d/global_path` | `nav_msgs/Path`（**latched**） | 当前路径。**没有有效路径时发空 Path**（见下"路径有效期"） |
-| `/pnc_2d/plan_markers` | `MarkerArray`（latched） | 起终点箭头 + 起点车体轮廓 + **当前通路高亮**（路网模式） |
+| `/pnc_2d/global_path` | `nav_msgs/Path`（**latched**） | 当前路径。**没有有效路径时发空 Path**（见下"路径有效期"）。★ `traj.type: minco` 时这里就是**优化后**的稠密轨迹（5 cm 间距），不再是 A* 折线 |
+| `/pnc_2d/plan_markers` | `MarkerArray`（latched） | 起终点箭头 + 起点车体轮廓 + **当前通路高亮**（路网模式）+ **MINCO 优化前后对比**（见下） |
 | `/pnc_2d/global_status` | `pnc_2d/PlannerStatus`（latched） | 每次规划的状态（`status`/`status_name`/`message` + 点数/长度/耗时/扩展节点）——**给状态机与上层错误上报用** |
 | `/global_planner/clear_path` | `std_srvs/Trigger` | 显式清空当前路径与规划标记 |
+
+**看 MINCO 到底做了什么（可视化）**
+
+`/pnc_2d/global_path` 在 `traj.type: minco` 时**已经是优化后的轨迹** ⇒ 只加一个 Path 显示
+是**看不出"优化前长什么样"**的。所以采纳优化轨迹时，规划器会在 `plan_markers` 里多画
+三个命名空间（RViz 里可以按 ns 单独开关/改色）：
+
+| ns | 内容 | 建议样式 |
+|---|---|---|
+| `traj_raw` | **优化前**的 A* 折线 | 灰、细（LINE_STRIP，线宽 0.02 m） |
+| `traj_opt` | **优化后**的轨迹（与 `global_path` 同一条） | 绿、粗（0.045 m） |
+| `traj_stats` | 指标文本：`MINCO 2点/2.50m → 48点/2.50m / 净距 … / max|κ| … / 时长 … / 求解 … ms` | 白字，跟在路径起点上方 0.8 m |
+
+⚠ 没采纳优化轨迹时**不画**（两条线重合，画出来只是重复）；清路径/换算法时这三个命名
+空间会一起 `DELETE`（latched 标记不会自己消失）。
+⚠ 另一种做法是自己跑 `ros2 run pnc_2d traj_viz_node` + 在 RViz 里对比
+`/pnc_2d/global_path` 与 `/pnc_2d/minco_traj` —— 但那个节点是**假设 `global_path` 还是
+A* 原路径**的，`traj.type: minco` 下它的"对比"会退化成两条几乎一样的优化线。
 
 **路径有效期（latched 话题的三条规则）**
 

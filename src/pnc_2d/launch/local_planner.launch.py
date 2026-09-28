@@ -36,10 +36,16 @@ from launch_ros.actions import Node
 # ⚠ 不要把类型名拼成文件名：`local.type: none` 对应的文件叫 local_null.yaml
 #   （yaml 里写 none 更自然，但实现类叫 NullLocalPlanner）。
 FRAGMENT_BY_TYPE = {
-    'none': 'local_null.yaml',
-    'null': 'local_null.yaml',
-    'mpc': 'local_mpc.yaml',
+    'none': ('local_null.yaml',),
+    'null': ('local_null.yaml',),
+    'mpc': ('local_mpc.yaml',),
+    # 装饰器 = 自己那段 + 主控制器那段（见 pnc_2d.launch.py 的说明）
+    'heading_shim': ('local_heading_shim.yaml', 'local_mpc.yaml'),
 }
+
+
+def _fragments(local_type):
+    return FRAGMENT_BY_TYPE.get(local_type, ('local_%s.yaml' % local_type,))
 
 
 def _make_node(context, *args, **kwargs):
@@ -48,7 +54,7 @@ def _make_node(context, *args, **kwargs):
 
     local_type = LaunchConfiguration('local_type').perform(context).strip()
     extra = LaunchConfiguration('extra_config').perform(context).strip()
-    fragment = FRAGMENT_BY_TYPE.get(local_type, 'local_%s.yaml' % local_type)
+    fragments = _fragments(local_type)
 
     def cfg_path(name):
         path = os.path.join(cfg_dir, name)
@@ -58,7 +64,7 @@ def _make_node(context, *args, **kwargs):
                 % (path, local_type, sorted(os.listdir(cfg_dir))))
         return path
 
-    files = [cfg_path('pnc_2d.yaml'), cfg_path(fragment)]
+    files = [cfg_path('pnc_2d.yaml')] + [cfg_path(f) for f in fragments]
     if extra:
         files.append(extra)
     files.append({'local.type': local_type})   # 最终强制覆盖

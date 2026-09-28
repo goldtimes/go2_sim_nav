@@ -754,32 +754,40 @@ TEST(MpcLocalPlanner, StrictCorridorWithHeadingOffsetStillDrives) {
 
   EXPECT_GE(v_small, 0.8 * v_step)
       << "小航向偏差下没用满加速能力 —— 检查 q_v 与 q_y 的相对大小";
-  // ⚠ 这里记录的是"**关掉原地对正**时"的原始行为（2026-09-22 实测）：严格走廊下
-  //    航向偏差大到 ~40° 以上时，MPC 会选择**不走**（也不原地转）—— 因为一加速
-  //    就会因航向差产生横向偏移、撞走廊硬界，代价上"不动"更便宜。
-  //    正确行为是"先原地转正再走"，已由 `local_mpc.align_in_place_deg` 实现
-  //    （见 HeadingOffsetIsFixedByAligningInPlaceFirst）。这条断言继续钉住
-  //    "默认关闭时不要偷偷改变行为"，避免这里的修法被误删。
+  // ⚠ 这里记录的是 MPC **作为纯跟踪器**时的行为（2026-09-22 实测，M5.2
+  // 后仍成立）：
+  //    严格走廊下航向偏差大到 ~40° 以上时，MPC 会选择**不走**（也不会原地转）——
+  //    因为一加速就会因航向差产生横向偏移、撞走廊硬界，代价上"不动"更便宜。
+  //    正确行为是"先原地转正再走"，但**那不再属于本算法**：已在
+  //    `local/heading_shim_planner`（装饰器，`local.type: heading_shim`）里。
+  //    ⚠ 所以这条断言是**故意**钉住这个弱点的：
+  //      ① 它证明"shim 不是多余的"（拿掉 shim 就会退化成拒动）；
+  //      ② 谁要是把"边转边走"在这里改好了，应当同时删掉这条 —— 但先想清楚
+  //        "谁负责转向"是否又变成两处。
   EXPECT_LT(v_large, 0.2 * v_step)
-      << "关掉原地对正时的大航向差行为变了，请复核";
+      << "MPC（纯跟踪器）在严格走廊+大航向差下的拒动行为变了："
+         "要么是好事（那请更新这条用例并复核 heading_shim 是否还必要），"
+         "要么是回归（重点查 q_v/q_y 与走廊硬界）";
 }
 
 TEST(MpcLocalPlanner, StrictCorridorHeadingSweep) {
-  // "有角度的路网时机器基本不会动"（用户 2026-09-22
-  // 报的现象）——先量清**多大角度**
-  // 会拒动，再决定对正阈值该设多少。这里用闭环（不是单周期）：单周期只能看出
-  // "这一步走不走"，闭环才能看出"是不是一直不走"。
+  // "有角度的路网时机器基本不会动"（用户 2026-09-22 报的现象）——
+  // 量清**多大角度**
+  // 会拒动。这里用闭环（不是单周期）：单周期只能看出"这一步走不走"，闭环才能看出
+  // "是不是一直不走"。
+  //
+  // ★ M5.2 之后这条用例只负责**记录纯跟踪器的弱点**：修法（先原地转正再走）已经
+  //   搬到装饰器里，对应的"修好之后必须走起来"断言在
+  //   `test_heading_shim_planner.cpp`（HeadingShim.RotatesInPlaceWhenHeadingOffsetIsLarge）。
   auto field = freeSpaceField();
 
-  auto sweep = [&](double align_deg, double yaw_deg) {
+  auto sweep = [&](double yaw_deg) {
     MpcLocalPlanner mpc;
     MemoryParamReader p;
     p.setDouble("local_mpc.v_max", 0.42);
     p.setDouble("local_mpc.w_max", 0.65);
     p.setDouble("local_mpc.reference_speed", 0.35);
     p.setDouble("local_mpc.a_max", 0.6);
-    p.setDouble("local_mpc.align_in_place_deg", align_deg);
-    p.setDouble("local_mpc.align_exit_deg", 8.0);
     mpc.configure(p);
     mpc.setDistanceField(&field);
     RouteCorridor c;
@@ -808,27 +816,25 @@ TEST(MpcLocalPlanner, StrictCorridorHeadingSweep) {
     return std::make_pair(travelled, blocked);
   };
 
-  std::printf(
-      "  [严格走廊+航向偏差] 6 s 闭环走了多少（对正关闭 / 对正 20°）：\n");
-  double worst_raw = 1e9, worst_angle = 0.0;
+  std::printf("  [严格走廊+航向偏差] MPC（纯跟踪器）6 s 闭环走了多少：\n");
+  double worst = 1e9, worst_angle = 0.0;
   for (double a : {10.0, 20.0, 30.0, 40.0, 60.0}) {
-    const auto raw = sweep(0.0, a);
-    const auto fixed = sweep(20.0, a);
-    std::printf("      航向差 %2.0f°：关=%.3f m（被挡 %d 周期） | 开=%.3f m\n",
-                a, raw.first, raw.second, fixed.first);
-    if (raw.first < worst_raw) {
-      worst_raw = raw.first;
+    const auto r = sweep(a);
+    std::printf("      航向差 %2.0f°：%.3f m（被挡 %d 周期）\n", a, r.first,
+                r.second);
+    if (r.first < worst) {
+      worst = r.first;
       worst_angle = a;
     }
-    // ★ 对正开着时，任何角度都必须真的走起来（这正是用户要的行为：
-    //    "先原地转，对齐目标后，再走"）
-    EXPECT_GT(fixed.first, 0.5)
-        << "航向差 " << a << "° 下开了原地对正仍然没走起来";
   }
-  // 关掉对正时，角度越大越走不动（记录这个旧行为，防止有人"顺手"把对正默认关掉）
-  EXPECT_LT(worst_raw, 0.3) << "关掉对正时最大角度的行驶距离变大了，请复核";
-  std::printf("      （关掉对正时最差：航向差 %.0f° 只走 %.3f m）\n",
-              worst_angle, worst_raw);
+  // 角度越大越走不动：这就是"为什么要 heading_shim"。
+  //   ⚠ 如果哪天 worst 变大了（不拒动了），**不要把这里放宽了事** ——
+  //     先确认没有别人也在偷偷做转向（"转向只能有一处"）。
+  EXPECT_LT(worst, 0.3)
+      << "纯跟踪器的拒动行为变了，请复核（是不是又有人在偷偷转向）";
+  std::printf(
+      "      （最差：航向差 %.0f° 只走 %.3f m —— 这就是 shim 要解决的）\n",
+      worst_angle, worst);
 }
 
 TEST(MpcLocalPlanner, StrictCorridorOffLaneIsReportedImmediately) {
@@ -853,7 +859,6 @@ TEST(MpcLocalPlanner, StrictCorridorOffLaneIsReportedImmediately) {
     q.setDouble("local_mpc.w_max", 0.65);
     q.setDouble("local_mpc.reference_speed", 0.35);
     q.setDouble("local_mpc.a_max", 0.6);
-    q.setDouble("local_mpc.align_in_place_deg", 0.0);
     q.setDouble("local_mpc.corridor_min_tolerance", 0.05);
     m.configure(q);
     m.setDistanceField(&field);
@@ -909,68 +914,10 @@ TEST(MpcLocalPlanner, StrictCorridorOffLaneIsReportedImmediately) {
   }
 }
 
-TEST(MpcLocalPlanner, HeadingOffsetIsFixedByAligningInPlaceFirst) {
-  // 用户 2026-09-22 定的行为：**先原地对正机头，对好再走**。
-  // 为什么不是"边转边走"：预测轨迹一边前进一边转弯会扫出走廊/障碍硬界，代价上
-  // "不动"更便宜 ⇒ 车拒动（见上一条用例）。足式/差速底盘 ω 与 v 解耦，原地转正
-  // 物理可行，所以先转正是唯一能同时满足"严格走廊"和"能动"的做法。
-  auto field = freeSpaceField();
-  MpcLocalPlanner mpc;
-  MemoryParamReader p;
-  p.setDouble("local_mpc.v_max", 0.42);
-  p.setDouble("local_mpc.w_max", 0.65);
-  p.setDouble("local_mpc.reference_speed", 0.35);
-  p.setDouble("local_mpc.a_max", 0.6);
-  p.setDouble("local_mpc.align_in_place_deg", 30.0);
-  p.setDouble("local_mpc.align_exit_deg", 8.0);
-  p.setDouble("local_mpc.align_gain", 1.2);
-  mpc.configure(p);
-  mpc.setDistanceField(&field);
-  RouteCorridor c;
-  c.centerline = straightPath(30.0, 0.05);
-  c.half_width = 0.0; // 严格贴线
-  c.speed_limit = 0.35;
-  mpc.setCorridor(&c);
-
-  Pose2D pose{0.0, 0.0, 60.0 * kPi / 180.0}; // 车头差 60°
-  const double dt = mpc.params().dt;
-  double v = 0.0;
-  int align_cycles = 0, drive_cycles = 0;
-  double max_abs_y_while_aligning = 0.0;
-  double first_drive_v = 0.0;
-  for (int k = 0; k < 200; ++k) {
-    mpc.setCurrentVelocity(v, 0.0);
-    const auto r = mpc.computeCommand(pose, dt);
-    ASSERT_TRUE(r.ok()) << toString(r.status) << " " << r.message;
-    if (mpc.aligning()) {
-      ++align_cycles;
-      EXPECT_NEAR(r.cmd.v, 0.0, 1e-9) << "原地对正期间不应发线速度";
-      EXPECT_GT(std::fabs(r.cmd.w), 1e-3) << "原地对正期间应在转";
-      max_abs_y_while_aligning =
-          std::max(max_abs_y_while_aligning, std::fabs(pose.y));
-    } else if (r.cmd.v > 1e-3) {
-      ++drive_cycles;
-      if (first_drive_v == 0.0)
-        first_drive_v = r.cmd.v;
-    }
-    pose.yaw += r.cmd.w * dt;
-    pose.x += r.cmd.v * std::cos(pose.yaw) * dt;
-    pose.y += r.cmd.v * std::sin(pose.yaw) * dt;
-    v = r.cmd.v;
-    if (align_cycles > 0 && drive_cycles > 3)
-      break;
-  }
-  std::printf("  [原地对正] 对正 %d 周期 / 起步 %d 周期，起步 v=%.3f，"
-              "对正期间 |y| ≤ %.4f m\n",
-              align_cycles, drive_cycles, first_drive_v,
-              max_abs_y_while_aligning);
-
-  EXPECT_GT(align_cycles, 0) << "大航向差下没有进入原地对正模式";
-  EXPECT_GT(drive_cycles, 3) << "对正后没有恢复沿线行驶（应能从拒动改为可动）";
-  // 原地转正必须是"真的原地"：不产生横向位移（严格走廊的硬界就是横向 0.05 m）
-  EXPECT_LT(max_abs_y_while_aligning, 0.05)
-      << "对正期间出现了横向位移，说明不是原地转";
-}
+// （原来的 `HeadingOffsetIsFixedByAligningInPlaceFirst` 也一起搬到
+//   `test_heading_shim_planner.cpp`：MPC
+//   不再做原地对正，所以这条不能再钉在它身上。 语义等价的用例是
+//   `HeadingShim.RotatesInPlaceWhenHeadingOffsetIsLarge`。）
 
 TEST(MpcLocalPlanner, TerminalProfileSlowsDownAndStopsBeforeGoal) {
   // 终点段语义（到点精度 ≤ 3 cm 靠它）：进入 approach_dist 后参考限速到
@@ -1010,226 +957,113 @@ TEST(MpcLocalPlanner, TerminalProfileSlowsDownAndStopsBeforeGoal) {
   EXPECT_NEAR(v_settle, 0.0, 1e-9) << "惯性段内参考应已归零（靠底盘惯性走完）";
 }
 
-/// ★ 到点后的**目标朝向**对正（用户 2026-09-23：到点判定原来只管 xy）。
+/// ★★ 终点剖面必须是**底盘跟得上**的（2026-09-28 加，起因是一次到点 4.3 cm
+/// 超差）。
 ///
-/// 语义：位置到了（剩余 ≤ goal_yaw_align_distance）而 |目标朝向误差| > 容差 ⇒
-/// **原地转**（v = 0，ω = gain·e 限幅），转进容差才算到达。
-/// 目标朝向 = 路径**最后一点**的 yaw（全局规划把目标 yaw 放在末点）。
-TEST(MpcLocalPlanner, AlignsGoalYawInPlaceAtGoal) {
-  auto field = freeSpaceField();
-  auto mpc = makeMpc(0.42);
-  MemoryParamReader p;
-  p.setDouble("local_mpc.v_max", 0.42);
-  p.setDouble("local_mpc.w_max", 0.65);
-  p.setDouble("local_mpc.goal_yaw_tolerance_deg", 5.0);
-  p.setDouble("local_mpc.goal_yaw_align_distance", 0.10);
-  p.setDouble("local_mpc.align_gain", 1.2);
-  p.setDouble("local_mpc.stop_coast", 0.035);
-  mpc.configure(p);
-  mpc.setDistanceField(&field);
-  // 直线路径：末点 yaw = 0（= 目标朝向"朝 +x"）。5 m 长，车停在 4.97 m 处
-  auto path = straightPath(5.0, 0.05);
-  path.back().yaw = 0.0;
-  mpc.setGlobalPlan(path);
-  mpc.setCurrentVelocity(0.0, 0.0);
-
-  // ① 机头差 +60°：应在原地转（不前进），且转向朝着目标朝向
-  const double yaw0 = 60.0 * M_PI / 180.0;
-  mpc.computeCommand(Pose2D{4.97, 0.0, yaw0}, mpc.params().dt);
-  const auto &st = mpc.solveInfo();
-  std::printf("  [终点朝向] 差 60°：status=%d v=%.3f w=%.3f（%s）\n",
-              static_cast<int>(LocalStatus::kFollowing), 0.0, 0.0,
-              st.solver_status.c_str());
-  EXPECT_EQ(st.solver_status, "goal-yaw-align") << "没进终点朝向对正模式";
-  EXPECT_TRUE(mpc.goalYawAligning());
-
-  // ② 闭环：一直原地转到容差内 ⇒ 状态回到 kGoalReached、yaw 误差 ≤ 5°
-  Pose2D s{4.97, 0.0, yaw0};
-  bool saw_align = false;
-  for (int i = 0; i < 400; ++i) {
-    const auto r = mpc.computeCommand(s, mpc.params().dt);
-    if (mpc.goalYawAligning()) {
-      saw_align = true;
-      EXPECT_NEAR(r.cmd.v, 0.0, 1e-9) << "对正期间不该前进";
-      integrate(s, r.cmd.v, r.cmd.w, mpc.params().dt);
-      continue;
-    }
-    break;
-  }
-  const double err_deg = std::fabs(wrap(s.yaw - 0.0)) * 180.0 / M_PI;
-  std::printf("  [终点朝向] 对正后 yaw=%.1f°（误差 %.2f°，容差 5°）\n",
-              s.yaw * 180.0 / M_PI, err_deg);
-  EXPECT_TRUE(saw_align);
-  EXPECT_LE(err_deg, 5.0 + 1e-6) << "对正没收敛到容差内";
-  EXPECT_NEAR(s.x, 4.97, 0.02) << "原地对正不该把位置带跑";
-
-  // ③ 容差关掉（0 = 旧行为）：同样的位姿**不进对正模式**（照旧跟踪/边走边转），
-  //    也就是说"到点朝向"完全没人管 —— 这正是用户报的那个缺陷。
-  MpcLocalPlanner mpc0;
-  MemoryParamReader p0;
-  p0.setDouble("local_mpc.v_max", 0.42);
-  mpc0.configure(p0); // goal_yaw_tolerance_deg 默认 0
-  mpc0.setDistanceField(&field);
-  mpc0.setGlobalPlan(path);
-  const auto r0 =
-      mpc0.computeCommand(Pose2D{4.97, 0.0, yaw0}, mpc0.params().dt);
-  std::printf("  [终点朝向·容差关] status=%d v=%.3f w=%.3f（%s）\n",
-              static_cast<int>(r0.status), r0.cmd.v, r0.cmd.w,
-              mpc0.solveInfo().solver_status.c_str());
-  EXPECT_FALSE(mpc0.goalYawAligning()) << "容差 0 时不该进对正模式";
-  EXPECT_NE(mpc0.solveInfo().solver_status, "goal-yaw-align");
-  EXPECT_EQ(r0.status, LocalStatus::kFollowing) << "旧行为：照旧跟踪，不判朝向";
-  EXPECT_DOUBLE_EQ(mpc0.goalYawTolerance(), 0.0)
-      << "0 = 节点不判朝向（兼容旧行为）";
-
-  // ④ 节点侧查询：容差按弧度给，且与配置一致
-  EXPECT_NEAR(mpc.goalYawTolerance(), 5.0 * M_PI / 180.0, 1e-12);
-}
-
-/// 空间不够时**不允许原地转**（矩形车体旋转会扫过外接圆）：要如实报 BLOCKED
-/// 并说明"已到点但没法对正"，而不是硬转去刮蹭、也不是默默算到达。
-TEST(MpcLocalPlanner, BlocksGoalYawAlignWhenTooTightToRotate) {
-  // 障碍就在车旁边 0.10 m（< align_min_clearance 0.25）
-  auto field = radialObstacleField(4.87, 0.0, 8.0);
-  MpcLocalPlanner mpc;
-  MemoryParamReader p;
-  p.setDouble("local_mpc.v_max", 0.42);
-  p.setDouble("local_mpc.goal_yaw_tolerance_deg", 5.0);
-  p.setDouble("local_mpc.goal_yaw_align_distance", 0.10);
-  p.setDouble("local_mpc.align_min_clearance", 0.25);
-  mpc.configure(p);
-  mpc.setDistanceField(&field);
-  mpc.setGlobalPlan(straightPath(5.0, 0.05));
-  mpc.setCurrentVelocity(0.0, 0.0);
-  const auto r = mpc.computeCommand(Pose2D{4.97, 0.0, 60.0 * M_PI / 180.0},
-                                    mpc.params().dt);
-  std::printf("  [终点朝向·贴障碍] %s：%s\n", toString(r.status),
-              r.message.c_str());
-  EXPECT_EQ(r.status, LocalStatus::kBlocked);
-  EXPECT_NE(r.message.find("目标朝向"), std::string::npos) << r.message;
-  EXPECT_DOUBLE_EQ(r.cmd.v, 0.0);
-  EXPECT_DOUBLE_EQ(r.cmd.w, 0.0) << "不能一边报没空间一边硬转";
-}
-
-/// ★ 对正的**起步角速度**（用户实测："角度判断太严格，导致无法收敛"）。
+/// 现象（任务级实测量测）：终点前 7 cm 时 `v_ref=0.030` 而车实际 **0.24
+/// m/s**，控制器 还发 0.18 ⇒ 车高速贴到目标 → 判定后滑行 **8~11 cm** →
+/// 最终停点误差在 6 mm ~ 43 mm 之间随机（同一套代码）。
 ///
-/// 底盘低速有死区：`ω = gain·e` 在 e 接近容差时给的指令太小 ⇒ 车不动 ⇒ 停在
-/// 容差**外**永远不满足。所以对正必须有一个角速度下限。
-TEST(MpcLocalPlanner, GoalYawAlignHasBreakawayOmega)
-{
+/// 机制：参考剖面里有**两段互相矛盾**的减速要求 ——
+///   · `sqrt(2·brake_acc·s_eff)` 段：按底盘实测减速能力 0.15 m/s² 减速；
+///   · `approach_speed` 钳位段：一进 `approach_dist` 就把参考**阶跃**压到
+///   0.03。
+/// 两个数放在一起算，隐含要求的减速度是 `(v² −
+/// approach_speed²)/(2·approach_dist)`， 它**大于** `brake_acc` ⇒
+/// 参考在那一小段里是"物理上跟不上的"，车只能冲过去。 ⇒
+/// 本用例把这条**不变量**钉住：**参考剖面自身要求的减速度不许超过底盘能力**。
+///   （"参考跟自己矛盾"属于"跳层物理量各配一份"的同一类错：`brake_acc` 与
+///   `approach_dist/approach_speed` 表达的是同一件事。）
+TEST(MpcLocalPlanner, TerminalProfileIsFollowableByTheChassis) {
   auto field = freeSpaceField();
-  auto makeIt = [&](double w_min) {
-    auto mpc = std::make_shared<MpcLocalPlanner>();
+  // 出厂参数（config/local_mpc.yaml + config/go2_run.yaml），别改成"好看"的值
+  const double v_cruise = 0.35, brake_acc = 0.15;
+  auto refV = [&](double approach_dist, double approach_speed,
+                  double s_from_end) {
+    MpcLocalPlanner mpc;
     MemoryParamReader p;
     p.setDouble("local_mpc.v_max", 0.42);
-    p.setDouble("local_mpc.w_max", 0.65);
-    p.setDouble("local_mpc.align_gain", 0.3);
-    p.setDouble("local_mpc.align_w_min", w_min);
-    p.setDouble("local_mpc.goal_yaw_tolerance_deg", 10.0);
-    p.setDouble("local_mpc.goal_yaw_align_distance", 0.10);
-    p.setDouble("local_mpc.goal_yaw_align_timeout", 0.0); // 本用例不判超时
-    mpc->configure(p);
-    mpc->setDistanceField(&field);
-    auto path = straightPath(5.0, 0.05);
-    path.back().yaw = 0.0;
-    mpc->setGlobalPlan(path);
-    mpc->setCurrentVelocity(0.0, 0.0);
-    return mpc;
+    p.setDouble("local_mpc.reference_speed", v_cruise);
+    p.setDouble("local_mpc.brake_acc", brake_acc);
+    p.setDouble("local_mpc.approach_dist", approach_dist);
+    p.setDouble("local_mpc.approach_speed", approach_speed);
+    p.setDouble("local_mpc.crawl_speed", 0.015);
+    p.setDouble("local_mpc.stop_coast", 0.035);
+    mpc.configure(p);
+    mpc.setDistanceField(&field);
+    mpc.setGlobalPlan(straightPath(5.0, 0.05));
+    mpc.setCurrentVelocity(0.2, 0.0);
+    mpc.computeCommand(Pose2D{5.0 - s_from_end, 0.0, 0.0}, mpc.params().dt);
+    return mpc.solveInfo().ref_v;
   };
-  // 容差 10°、当前差 11°（e 很小、gain 也小）：
-  //   ① 没有下限 ⇒ ω = 0.3·(−0.19) ≈ −0.058 rad/s（底盘角速度死区里 ⇒ 车不动 ⇒ 死锁）
-  const auto no_min = makeIt(0.0);
-  const auto r1 = no_min->computeCommand(Pose2D{4.97, 0.0, 11.0 * M_PI / 180.0},
-                                         no_min->params().dt);
-  EXPECT_EQ(no_min->solveInfo().solver_status, "goal-yaw-align");
-  //   ② 有下限 ⇒ |ω| ≥ w_min，方向仍朝目标朝向
-  const auto with_min = makeIt(0.20);
-  const auto r2 = with_min->computeCommand(Pose2D{4.97, 0.0, 11.0 * M_PI / 180.0},
-                                           with_min->params().dt);
-  std::printf("  [对正下限] 无下限 w=%.4f | 有下限 w=%.4f（w_min 0.20）\n",
-              r1.cmd.w, r2.cmd.w);
-  EXPECT_LT(std::fabs(r1.cmd.w), 0.08) << "这就是“无法收敛”的机制：指令小到车不动";
-  EXPECT_GE(std::fabs(r2.cmd.w), 0.20 - 1e-9) << "下限没生效，仍可能卡在死区";
-  EXPECT_LT(r2.cmd.w, 0.0) << "车头 +11°（偏左）⇒ 应往回转（ω<0）";
-  EXPECT_DOUBLE_EQ(r2.cmd.v, 0.0) << "对正期间不前进";
+
+  // 逐点扫，算每一段隐含要求的减速度 a_req = (v1² − v2²)/(2·Δs)
+  const double ss[] = {0.60, 0.50, 0.40, 0.30, 0.25, 0.20, 0.16,
+                       0.15, 0.14, 0.12, 0.10, 0.07, 0.05, 0.04};
+  auto scan = [&](const char *tag, double ad, double as) {
+    std::printf("  [终点剖面·%s] approach_dist=%.2f / approach_speed=%.2f"
+                "（底盘能力 %.2f m/s²）\n",
+                tag, ad, as, brake_acc);
+    double worst = 0.0, worst_s = 0.0;
+    double prev_v = refV(ad, as, ss[0]), prev_s = ss[0];
+    for (std::size_t i = 1; i < sizeof(ss) / sizeof(ss[0]); ++i) {
+      const double v = refV(ad, as, ss[i]);
+      const double ds = prev_s - ss[i];
+      const double a_req = std::fabs(prev_v * prev_v - v * v) / (2.0 * ds);
+      std::printf("      距终点 %.2f→%.2f m: v_ref %.3f→%.3f ⇒ 要求减速 "
+                  "%.2f m/s²%s\n",
+                  prev_s, ss[i], prev_v, v, a_req,
+                  (a_req > brake_acc * 1.05) ? "   ← 底盘做不到" : "");
+      if (a_req > worst) {
+        worst = a_req;
+        worst_s = ss[i];
+      }
+      prev_v = v;
+      prev_s = ss[i];
+    }
+    std::printf("      最陡的一段：距终点 %.2f m 处要求 %.2f m/s²\n", worst_s,
+                worst);
+    return worst;
+  };
+
+  // ① 出厂配置（approach_dist=0，即"只有制动剖面 + 爬行保底"）必须**能跟得上**
+  const double worst_shipped = scan("出厂", 0.0, 0.03);
+  EXPECT_LE(worst_shipped, brake_acc * 1.05)
+      << "出厂终点剖面要求的减速度超过底盘能力 ⇒ 车会高速贴到目标、冲过头";
+  // 参考在目标前 stop_coast 处归零，但**不会更早**归零（否则车差几厘米停死）
+  EXPECT_GT(refV(0.0, 0.03, 0.15), 0.05) << "目标前 15 cm 参考应还没被压到很低";
+  EXPECT_GT(refV(0.0, 0.03, 0.06), 0.0)
+      << "惯性段之前（> stop_coast）参考不应归零 ⇒ 否则车停死、判据永不满足";
+  EXPECT_NEAR(refV(0.0, 0.03, 0.03), 0.0, 1e-9)
+      << "惯性段内（< stop_coast）参考应已归零（把最后几厘米交给底盘惯性）";
+
+  // ② 反例：历史上那套"慢速贴拢"（0.15/0.03）是**阶跃**的，要求 0.49 m/s²
+  //    ⇒ 这条把"为什么它被关掉"钉住（免得有人觉得 0.03 更慢更好又开回去）
+  const double worst_bad = scan("历史配置（反例）", 0.15, 0.03);
+  EXPECT_GT(worst_bad, brake_acc * 2.0)
+      << "历史配置的阶跃变平了？请复核代码里钳位是否变成连续的了（那要更新本条"
+         "）";
 }
 
-/// 对正**超时**：转不出来就如实报失败（不许无限原地转 —— 任务层看就是卡死）。
-TEST(MpcLocalPlanner, GoalYawAlignTimesOutWithActionableReason)
-{
-  auto field = freeSpaceField();
-  MpcLocalPlanner mpc;
-  MemoryParamReader p;
-  p.setDouble("local_mpc.v_max", 0.42);
-  p.setDouble("local_mpc.w_max", 0.65);
-  p.setDouble("local_mpc.goal_yaw_tolerance_deg", 10.0);
-  p.setDouble("local_mpc.goal_yaw_align_distance", 0.10);
-  p.setDouble("local_mpc.goal_yaw_align_timeout", 0.02); // 20 ms 便于单测
-  mpc.configure(p);
-  mpc.setDistanceField(&field);
-  auto path = straightPath(5.0, 0.05);
-  path.back().yaw = 0.0;
-  mpc.setGlobalPlan(path);
-  mpc.setCurrentVelocity(0.0, 0.0);
-
-  // 第一次：进对正模式（同时开始计时）
-  const auto r1 = mpc.computeCommand(Pose2D{4.97, 0.0, 60.0 * M_PI / 180.0},
-                                     mpc.params().dt);
-  EXPECT_EQ(mpc.solveInfo().solver_status, "goal-yaw-align");
-  // 等过超时后再来一次（位姿不动 = 车被卡住转不动）
-  std::this_thread::sleep_for(std::chrono::milliseconds(40));
-  const auto r2 = mpc.computeCommand(Pose2D{4.97, 0.0, 60.0 * M_PI / 180.0},
-                                     mpc.params().dt);
-  std::printf("  [对正超时] %s：%s\n", toString(r2.status), r2.message.c_str());
-  EXPECT_EQ(r2.status, LocalStatus::kFailed) << "超时必须报失败，不能无限转";
-  EXPECT_NE(r2.message.find("超时"), std::string::npos);
-  EXPECT_NE(r2.message.find("align_w_min"), std::string::npos)
-      << "失败原因要指向可能的原因（含参数名）";
-  EXPECT_FALSE(mpc.goalYawAligning());
-  EXPECT_DOUBLE_EQ(r2.cmd.v, 0.0);
-  EXPECT_DOUBLE_EQ(r2.cmd.w, 0.0);
-  (void)r1;
-}
-
-/// 对正超时必须按“**无进展**”判，不能按墙钟判：180° @ 0.65 rad/s ≈ 5 s，
-/// 本来就慢；若按墙钟计时，一个“转得慢但一直在收敛”的对正会被误判失败。
-TEST(MpcLocalPlanner, GoalYawAlignDoesNotTimeOutWhileProgressing)
-{
-  auto field = freeSpaceField();
-  MpcLocalPlanner mpc;
-  MemoryParamReader p;
-  p.setDouble("local_mpc.v_max", 0.42);
-  p.setDouble("local_mpc.w_max", 0.65);
-  p.setDouble("local_mpc.goal_yaw_tolerance_deg", 10.0);
-  p.setDouble("local_mpc.goal_yaw_align_distance", 0.10);
-  p.setDouble("local_mpc.goal_yaw_align_timeout", 0.05); // 远小于总耗时
-  mpc.configure(p);
-  mpc.setDistanceField(&field);
-  auto path = straightPath(5.0, 0.05);
-  path.back().yaw = 0.0;
-  mpc.setGlobalPlan(path);
-  mpc.setCurrentVelocity(0.0, 0.0);
-
-  // 车头每周期朝目标转 5°（慢，但一直在收敛）：总共 ~0.4 s ≫ 超时 0.05 s
-  double deg = 60.0;
-  for (int k = 0; k < 8; ++k) {
-    const auto r = mpc.computeCommand(
-        Pose2D{4.97, 0.0, deg * M_PI / 180.0}, mpc.params().dt);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50)); // 每次都超过“墙钟”
-    EXPECT_NE(r.status, LocalStatus::kFailed)
-        << "剩 " << deg << "° 时被误判超时（按墙钟计了？）";
-    EXPECT_TRUE(mpc.goalYawAligning());
-    deg -= 5.0;
-  }
-  std::printf("  [对正进展] 60°→20° 共 8 周期（每周期 > 墙钟超时）未被判失败 ✓\n");
-}
+// ★ 到点后的"目标朝向对正"与"大航向差先原地转"的用例（原
+// AlignsGoalYawInPlaceAtGoal /
+//   BlocksGoalYawAlignWhenTooTightToRotate / GoalYawAlignHasBreakawayOmega /
+//   GoalYawAlignTimesOutWithActionableReason /
+//   GoalYawAlignDoesNotTimeOutWhileProgressing /
+//   HeadingOffsetIsFixedByAligningInPlaceFirst）已随功能一起搬到
+//   `test/test_heading_shim_planner.cpp`（M5.2：MPC
+//   只做跟踪，转向在装饰器里）。
+//   语义等价的用例：RotatesInPlaceWhenHeadingOffsetIsLarge /
+//   HysteresisAndHandoffKeepsTurning /
+//   HandsBackWhenRotationWouldSweepIntoObstacle /
+//   ReportsBlockedWhenGoalYawRotationIsImpossible / AlignsGoalYawInPlaceAtGoal
+//   / GoalYawRotationTimesOutWithoutProgress / DoesNotTimeOutWhileProgressing。
 
 /// ★ 自由模式"顺滑优先"（用户 2026-09-23：自由导航不该严格贴线，摇摇摆摆）。
 ///
 /// 三件事分开测：① 横向死区（带内偏差不纠）② 横向权重缩放（同样的偏差纠得更轻）
 /// ③ ω 上限（不许左右打满）。走廊模式必须**不受**这些影响（严格贴线照旧）。
-TEST(MpcLocalPlanner, FreeModePrefersSmoothnessOverLineTracking)
-{
+TEST(MpcLocalPlanner, FreeModePrefersSmoothnessOverLineTracking) {
   auto field = freeSpaceField();
   auto run = [&](bool soften, double lat, bool route_mode) {
     auto mpc = std::make_shared<MpcLocalPlanner>();
@@ -1261,8 +1095,9 @@ TEST(MpcLocalPlanner, FreeModePrefersSmoothnessOverLineTracking)
   // ① 带内偏差（0.05 m < 死区 0.10）：自由模式**不该**去纠 ⇒ |w| 明显更小
   const auto hard_in = run(false, 0.05, false);
   const auto soft_in = run(true, 0.05, false);
-  std::printf("  [自由顺滑] 横向 5 cm：硬贴线 w=%+.3f | 顺滑 w=%+.3f（限幅 %.2f）\n",
-              hard_in.first.cmd.w, soft_in.first.cmd.w, soft_in.second);
+  std::printf(
+      "  [自由顺滑] 横向 5 cm：硬贴线 w=%+.3f | 顺滑 w=%+.3f（限幅 %.2f）\n",
+      hard_in.first.cmd.w, soft_in.first.cmd.w, soft_in.second);
   EXPECT_LT(std::fabs(soft_in.first.cmd.w), std::fabs(hard_in.first.cmd.w))
       << "死区没生效：带内偏差仍在打方向盘";
   EXPECT_LT(std::fabs(soft_in.first.cmd.w), 0.15) << "带内偏差不该有明显转向";
@@ -1272,21 +1107,25 @@ TEST(MpcLocalPlanner, FreeModePrefersSmoothnessOverLineTracking)
   const auto soft_out = run(true, 0.30, false);
   std::printf("  [自由顺滑] 横向 30 cm：硬贴线 w=%+.3f | 顺滑 w=%+.3f\n",
               hard_out.first.cmd.w, soft_out.first.cmd.w);
-  EXPECT_LT(std::fabs(soft_out.first.cmd.w), std::fabs(hard_out.first.cmd.w) + 1e-9);
+  EXPECT_LT(std::fabs(soft_out.first.cmd.w),
+            std::fabs(hard_out.first.cmd.w) + 1e-9);
 
   // ③ ω 上限：自由模式被压到 free_w_max；走廊模式仍可用满 w_max
   EXPECT_LE(std::fabs(soft_out.first.cmd.w), 0.45 + 1e-9) << "自由模式没压 ω";
-  EXPECT_NEAR(soft_out.second, 0.45, 1e-9) << "自由模式生效的 ω 上限应问 free_w_max";
+  EXPECT_NEAR(soft_out.second, 0.45, 1e-9)
+      << "自由模式生效的 ω 上限应问 free_w_max";
   const auto route_hard = run(false, 0.30, true);
   EXPECT_NEAR(route_hard.second, 0.65, 1e-9)
       << "走廊模式（严格贴线）必须保持 w_max，不受自由模式影响";
   // 即使把顺滑参数配上，走廊模式也不该被压 ω
   const auto route_soft = run(true, 0.30, true);
-  EXPECT_NEAR(route_soft.second, 0.65, 1e-9) << "走廊模式不该被 free_w_max 影响";
+  EXPECT_NEAR(route_soft.second, 0.65, 1e-9)
+      << "走廊模式不该被 free_w_max 影响";
 }
 
-/// ★ 扫参数：障碍代价权重 / 安全带半径调大，到底换来多少“离远一点”，代价是什么。
-/// 用户 2026-09-23 问：“能不能把 MPC 的障碍代价调大，让局部远离障碍物？”
+/// ★ 扫参数：障碍代价权重 /
+/// 安全带半径调大，到底换来多少“离远一点”，代价是什么。 用户 2026-09-23
+/// 问：“能不能把 MPC 的障碍代价调大，让局部远离障碍物？”
 /// 实测结论（这个用例把数字钉住，防止凭感觉调参）：
 ///   · `obstacle_weight` 的收益是**次线性**的（≈√w）：400 → 10000（25×）只多让
 ///     ~5 cm，且多让出来多少就等于**偏离参考线多少**（走廊模式里那点余量往往
@@ -1322,9 +1161,10 @@ TEST(MpcLocalPlanner, ObstacleCostSweepQuantifiesAvoidanceVsFreeze) {
     }
   };
 
-  std::printf("\n  障碍在 0.35 m 外、安全带 0.45 m（车贴参考线走，横向偏差 0.0）：\n");
-  std::printf("    %-10s %-8s %-12s %-10s %-9s\n", "权重w", "安全带", "最近距[m]",
-              "该点y[m]", "指令v[m/s]");
+  std::printf(
+      "\n  障碍在 0.35 m 外、安全带 0.45 m（车贴参考线走，横向偏差 0.0）：\n");
+  std::printf("    %-10s %-8s %-12s %-10s %-9s\n", "权重w", "安全带",
+              "最近距[m]", "该点y[m]", "指令v[m/s]");
   double md_400 = 0.0, md_10000 = 0.0;
   {
     double lat = 0.0, v = 0.0;
@@ -1335,18 +1175,21 @@ TEST(MpcLocalPlanner, ObstacleCostSweepQuantifiesAvoidanceVsFreeze) {
   for (double w : {400.0, 1000.0, 3000.0, 10000.0}) {
     double md = 0.0, lat = 0.0, v = 0.0;
     probe(w, 0.45, 0.0, md, lat, v);
-    if (w == 10000.0) md_10000 = md;
-    std::printf("    %-10.0f %-8.2f %-12.4f %+-10.4f %-9.3f\n", w, 0.45, md, lat, v);
+    if (w == 10000.0)
+      md_10000 = md;
+    std::printf("    %-10.0f %-8.2f %-12.4f %+-10.4f %-9.3f\n", w, 0.45, md,
+                lat, v);
   }
   for (double safe : {0.60, 0.80}) {
     double md = 0.0, lat = 0.0, v = 0.0;
     probe(1000.0, safe, 0.0, md, lat, v);
-    std::printf("    %-10.0f %-8.2f %-12.4f %+-10.4f %-9.3f\n", 1000.0, safe, md,
-                lat, v);
+    std::printf("    %-10.0f %-8.2f %-12.4f %+-10.4f %-9.3f\n", 1000.0, safe,
+                md, lat, v);
   }
   // 收益次线性：权重 ×25 只换来 ≤ 6 cm（不要期望“调大就躲得远远的”）
   EXPECT_LT(md_10000 - md_400, 0.06) << "权重收益应该次线性（实测 ~5 cm）";
-  EXPECT_GT(md_10000 - md_400, 0.03) << "但至少要真的变远一点，否则这个旋钮没用";
+  EXPECT_GT(md_10000 - md_400, 0.03)
+      << "但至少要真的变远一点，否则这个旋钮没用";
 
   // ② 安全带 = **限速半径**：调大后净距很快饱和，速度却一路掉到底。
   //    所以“让局部离远一点”不能靠安全带，它是“减速让路”不是“绕开”。
@@ -1377,8 +1220,8 @@ TEST(MpcLocalPlanner, ObstacleCostSweepQuantifiesAvoidanceVsFreeze) {
     double md = 0.0, v = 0.0;
     std::string st;
     probe2(1000.0, safe, md, v, st);
-    std::printf("    w=%-8.0f safe=%.2f  %-9s 最近距 %.4f  指令 v=%.3f\n", 1000.0,
-                safe, st.c_str(), md, v);
+    std::printf("    w=%-8.0f safe=%.2f  %-9s 最近距 %.4f  指令 v=%.3f\n",
+                1000.0, safe, st.c_str(), md, v);
     if (safe > 1.0) {
       md_big = md;
       v_big = v;

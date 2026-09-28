@@ -362,8 +362,8 @@ private:
     traj_v_.assign(res->traj_v.begin(), res->traj_v.end());
     traj_w_.assign(res->traj_w.begin(), res->traj_w.end());
     if (traj_valid_ &&
-        !(traj_s_.size() == traj_v_.size() && traj_s_.size() == traj_w_.size() &&
-          traj_s_.size() >= 2)) {
+        !(traj_s_.size() == traj_v_.size() &&
+          traj_s_.size() == traj_w_.size() && traj_s_.size() >= 2)) {
       // 上游字段自相矛盾 ⇒ 宁可当"没有剖面"（回退旧行为），也不要拿半张表去限速
       RCLCPP_WARN(get_logger(),
                   "[sm] 参考剖面长度不自洽（s=%zu v=%zu w=%zu）⇒ 丢弃",
@@ -374,10 +374,11 @@ private:
       traj_w_.clear();
     }
     if (traj_valid_)
-      RCLCPP_INFO(get_logger(), "[sm] 参考剖面：%zu 点 / 弧长 %.2f m / 峰值 %.2f m/s",
-                  traj_s_.size(), traj_s_.back(),
-                  traj_v_.empty() ? 0.0
-                                  : *std::max_element(traj_v_.begin(), traj_v_.end()));
+      RCLCPP_INFO(
+          get_logger(), "[sm] 参考剖面：%zu 点 / 弧长 %.2f m / 峰值 %.2f m/s",
+          traj_s_.size(), traj_s_.back(),
+          traj_v_.empty() ? 0.0
+                          : *std::max_element(traj_v_.begin(), traj_v_.end()));
     else if (!traj_note_.empty())
       RCLCPP_INFO(get_logger(), "[sm] 无参考剖面：%s", traj_note_.c_str());
     const std::size_t corr_pts = static_cast<std::size_t>(std::count_if(

@@ -35,8 +35,10 @@ import sim_common as sc
 from sim_common import (chk, load_limits, pose_speed, signed_offset, stop,
                         summary)
 
-# 到点**朝向**容差 [°]：与 local_mpc.goal_yaw_tolerance_deg 同源（不写死）
+# 到点**朝向**容差 [°]：与节点实际用的那份同源（M5.2 后在 heading_shim 片段里）
 GOAL_YAW_TOL_DEG = sc.load_goal_yaw_tol_deg()
+# 到点**沿向/横向**容差 [m]：与节点实际用的判定参数同源（不写死）
+GOAL_TOL_M, LAT_TOL_M = sc.load_goal_tolerances()
 
 
 def self_diagnose(p, obstacle, sx, sy):
@@ -233,14 +235,15 @@ def main():
         rms_w = math.sqrt(sum(w * w for w in stw) / len(stw)) if stw else 0.0
         print(f"★ 顺滑度(稳态)  ω 反向 {flips} 次 / {dur_st:.1f} s = {flip_hz:.2f} Hz | "
               f"RMS|w| {rms_w:.3f} rad/s"
-              + ("  ⚠ 反向频繁 ⇒ 像摇摆，检查 free_lat_deadband/free_w_max"
+              + ("  ⚠ 反向频繁 ⇒ 像摇摆，查 free_lat_scale/free_w_max"
+                 "（free_lat_deadband 已于 2026-09-28 置 0，见 doc §M5.0.5）"
                  if flip_hz > 1.0 else "  ✓ 未见持续左右打摆"))
         print(f"★ 被控对象保真度  稳态段路程/指令积分 = {gain:.3f}"
               f"（{dist_st:.2f} m / {cmd_int:.2f} m·s⁻¹·s；1.0 = 指令完全被实现）")
 
         chk("[A1] 到点停车误差 ≤ 0.03 m（用户要求）", d_goal <= 0.03,
             f"停稳后 {d_goal:.3f} m；判定时 {d_at_reached:.3f} m + 滑行 {coast:.3f} m；"
-            f"判定容差 local.goal_tolerance=0.02")
+            f"节点判定容差 沿向 {GOAL_TOL_M:.3f} / 横向 {LAT_TOL_M:.3f} m")
         chk("[A2] 末速 ≈ 0（位姿差分，不看噪声 twist）", v_end <= 0.05,
             f"{v_end:.3f} m/s")
         # ★ 末期朝向也算“到达”的一部分：位置对、机头不对不算完成（差速可以原地对正）

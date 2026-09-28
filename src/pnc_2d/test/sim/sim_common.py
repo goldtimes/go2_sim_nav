@@ -89,8 +89,15 @@ KILL_HINT = ("pkill -f 'pnc_2d.launch.py'; "
              "pkill -f 'pnc_2d/(pnc_manager|global_planner|local_planner)_node'")
 
 
-def launch(planner="astar", extra_cfg=None):
-    # ★ 起栈之前先确认没有残留的 pnc_2d（否则两套栈的数会混在一起，见上面的说明）
+def launch(planner="astar", extra_cfg=None, local_type=None):
+    # ★ 用哪种局部算法：默认跟**平台**一致（go2_run.yaml 里 `local.type: heading_shim`
+    #   —— 转向装饰器 + MPC 主控制器）。想做 A/B（纯跟踪器 vs 带转向装饰器）就传
+    #   `local_type="mpc"` 或设环境变量 PNC2D_LOCAL_TYPE。
+    #   ⚠ 必须从 launch 参数给（不能只靠 go2_run.yaml）：launch 会用最终的
+    #     `local.type` 覆盖 yaml，而且**只加载所选类型对应的片段** —— 给了 mpc
+    #     就不会加载 local_heading_shim.yaml，`shim.*` 全部落回库默认值。
+    lt = local_type or os.environ.get("PNC2D_LOCAL_TYPE", "heading_shim")
+    # 起栈之前先确认没有残留的 pnc_2d（否则两套栈的数会混在一起，见上面的说明）
     stray = running_pnc_nodes()
     if stray and not os.environ.get("PNC2D_ALLOW_EXTRA_STACK"):
         raise RuntimeError(
@@ -101,7 +108,7 @@ def launch(planner="astar", extra_cfg=None):
             % (", ".join(stray), KILL_HINT))
 
     cmd = ("ros2 launch pnc_2d pnc_2d.launch.py "
-           f"planner_type:={planner} local_type:=mpc use_sim_time:=true "
+           f"planner_type:={planner} local_type:={lt} use_sim_time:=true "
            f"extra_config:={extra_cfg or GO2_CFG}")
     # 可选：给**单个**节点套一个前缀（例如 gdb），用来拿崩溃回溯。
     #   export PNC2D_LAUNCH_PREFIX="gdb -batch -ex run -ex bt -ex quit --args"
@@ -443,14 +450,53 @@ def load_limits():
 
 
 def load_goal_yaw_tol_deg():
-    """到点**朝向**容差 [°]：从 local_mpc.yaml 读（不在测试里写死；容器用的是
-    算法片段里的值，与节点走 `goalYawTolerance()` 取的是同一个参数）"""
+    """到点**朝向**容差 [°]：与节点实际用的那份同源（不写死）。
+
+    ★ M5.2 之后这个参数的**主人**是转向装饰器（`local.type: heading_shim`），
+      键名从 `local_mpc.goal_yaw_tolerance_deg` 变成 `shim.goal_yaw_tolerance_deg`；
+      单独跑 `local_type:=mpc` 时它不存在（那时**不判朝向**）。所以这里两处都找，
+      找不到就返回 0（= 不判朝向，与节点行为一致），而不是给个默认 10° 骗自己。
+    """
     import os
     import yaml
-    cfg = os.path.join(os.path.dirname(GO2_CFG), "local_mpc.yaml")
-    doc = yaml.safe_load(open(cfg, encoding="utf-8"))
-    p = list(doc.values())[0]["ros__parameters"]
-    return float(p.get("local_mpc.goal_yaw_tolerance_deg", 0.0))
+    keys = ("shim.goal_yaw_tolerance_deg", "local_mpc.goal_yaw_tolerance_deg")
+    val = 0.0
+    for f in (os.path.join(os.path.dirname(GO2_CFG), "local_heading_shim.yaml"),
+              os.path.join(os.path.dirname(GO2_CFG), "local_mpc.yaml"),
+              GO2_CFG):
+        if not os.path.exists(f):
+            continue
+        doc = yaml.safe_load(open(f, encoding="utf-8")) or {}
+        p = list(doc.values())[0].get("ros__parameters", {})
+        for k in keys:
+            if k in p:
+                val = float(p[k])
+    return val
+
+
+def load_goal_tolerances():
+    """到点判定的两个容差 (沿向, 横向) [m]：**按 launch 的覆盖顺序**读
+    （pnc_2d.yaml → go2_run.yaml，后者赢）。
+
+    ★ 为什么不能写死：`test_drive_goal.py` 的 A1 详情里原来写死
+      "判定容差 local.goal_tolerance=0.02"，而实际是 **0.01** ——
+      诊断串自己就在误导（和 §M5.0.5 那次"两处同配一个参数"同型）。
+      "到点 ≤3 cm"能不能被验收，前提就是这两个容差**必须小于阈值**，
+      所以它们得跟配置同源。
+    """
+    import os
+    import yaml
+    keys = ("local.goal_tolerance", "local.lateral_tolerance")
+    vals = {k: None for k in keys}
+    for f in (os.path.join(os.path.dirname(GO2_CFG), "pnc_2d.yaml"), GO2_CFG):
+        if not os.path.exists(f):
+            continue
+        doc = yaml.safe_load(open(f, encoding="utf-8"))
+        p = list(doc.values())[0]["ros__parameters"]
+        for k in keys:
+            if k in p:
+                vals[k] = float(p[k])
+    return vals["local.goal_tolerance"], vals["local.lateral_tolerance"]
 
 
 def wrap_pi(a: float) -> float:

@@ -39,9 +39,16 @@ FRAGMENT_BY_TYPE = {
 # local.type → 局部片段。**不要按类型名拼文件名**：`local.type: none` 对应的文件叫
 # local_null.yaml（yaml 里写 none 更自然，但实现类叫 NullLocalPlanner），拼字符串会找错。
 LOCAL_FRAGMENT_BY_TYPE = {
-    'none': 'local_null.yaml',
-    'null': 'local_null.yaml',
+    'none': ('local_null.yaml',),
+    'null': ('local_null.yaml',),
+    # 装饰器 = 自己那段 + 主控制器那段（见 pnc_2d.launch.py 的说明）
+    'heading_shim': ('local_heading_shim.yaml', 'local_mpc.yaml'),
 }
+
+
+def _local_fragments(local_type):
+    return LOCAL_FRAGMENT_BY_TYPE.get(local_type,
+                                     ('local_%s.yaml' % local_type,))
 
 
 def _make_node(context, *args, **kwargs):
@@ -53,8 +60,7 @@ def _make_node(context, *args, **kwargs):
     extra = LaunchConfiguration('extra_config').perform(context).strip()
 
     fragment = FRAGMENT_BY_TYPE.get(planner_type, 'global_%s.yaml' % planner_type)
-    local_fragment = LOCAL_FRAGMENT_BY_TYPE.get(local_type,
-                                                'local_%s.yaml' % local_type)
+    local_fragments = _local_fragments(local_type)
 
     def cfg_path(name):
         """找片段：先看 install 目录，找不到就报清楚点（含可用清单）"""
@@ -65,7 +71,8 @@ def _make_node(context, *args, **kwargs):
                 % (path, planner_type, local_type, sorted(os.listdir(cfg_dir))))
         return path
 
-    files = [cfg_path('pnc_2d.yaml'), cfg_path(local_fragment), cfg_path(fragment)]
+    files = [cfg_path('pnc_2d.yaml')] + [cfg_path(f) for f in local_fragments]
+    files.append(cfg_path(fragment))
     if extra:
         files.append(extra)
 

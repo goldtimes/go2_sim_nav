@@ -32,9 +32,14 @@ GLOBAL_FRAGMENT_BY_TYPE = {
     'route_network': 'route_network.yaml',
 }
 LOCAL_FRAGMENT_BY_TYPE = {
-    'none': 'local_null.yaml',
-    'null': 'local_null.yaml',
-    'mpc': 'local_mpc.yaml',
+    'none': ('local_null.yaml',),
+    'null': ('local_null.yaml',),
+    'mpc': ('local_mpc.yaml',),
+    # ★ 装饰器类型 = **自己那段 + 主控制器那段**。
+    #   `heading_shim` 内部建的是 mpc（`shim.primary`），若只加载它自己那段，
+    #   主控制器就只能用库里的默认参数（v_max/w_max/q_* 全是代码默认值）——
+    #   行为会惄惄变差，而且日志上看不出来（“参数都配了”）。
+    'heading_shim': ('local_heading_shim.yaml', 'local_mpc.yaml'),
 }
 # 全局节点的"手工目标"入口（**相对名**：根命名空间下是 /pnc_2d/manual_goal；
 # 加上 ns:=/e2e 就变 /e2e/pnc_2d/manual_goal，不会与另一套栈碰撞）
@@ -57,8 +62,8 @@ def _make_nodes(context, *args, **kwargs):
 
     global_frag = GLOBAL_FRAGMENT_BY_TYPE.get(
         planner_type, 'global_%s.yaml' % planner_type)
-    local_frag = LOCAL_FRAGMENT_BY_TYPE.get(
-        local_type, 'local_%s.yaml' % local_type)
+    local_frags = LOCAL_FRAGMENT_BY_TYPE.get(
+        local_type, ('local_%s.yaml' % local_type,))
 
     def cfg_path(name):
         path = os.path.join(cfg_dir, name)
@@ -70,7 +75,9 @@ def _make_nodes(context, *args, **kwargs):
 
     # 三份 yaml 都传给三个节点：每个节点只看自己那一段（实测：没有自己段落的
     # 文件不会报错，只是不生效），所以可以用同一组文件。
-    shared = [cfg_path('pnc_2d.yaml'), cfg_path(local_frag), cfg_path(global_frag)]
+    shared = [cfg_path('pnc_2d.yaml')]
+    shared += [cfg_path(f) for f in local_frags]
+    shared += [cfg_path(global_frag)]
     if extra:
         shared.append(extra)
 

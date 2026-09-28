@@ -35,8 +35,8 @@ struct ReferenceProfile {
   ///   · 三个数组长度一致且 ≥ 2；
   ///   · 所有值有限（无 NaN/Inf）、v ≥ 0；
   ///   · `s` 严格递增。
-  bool set(const std::vector<double> & s_in, const std::vector<double> & v_in,
-           const std::vector<double> & w_in, std::string & err);
+  bool set(const std::vector<double> &s_in, const std::vector<double> &v_in,
+           const std::vector<double> &w_in, std::string &err);
 
   void clear();
   bool valid() const { return valid_; }
@@ -44,15 +44,16 @@ struct ReferenceProfile {
   /// 弧长总长 [m]（无效时为 0）
   double length() const { return valid_ ? s_.back() : 0.0; }
 
-  /// v(s)：**线性插值**，端点处夹取（越界不报错 —— 调用方按"没有更多信息"处理）。
+  /// v(s)：**线性插值**，端点处夹取（越界不报错 ——
+  /// 调用方按"没有更多信息"处理）。
   double speedAt(double s_query) const;
   /// ω(s)：同上
   double omegaAt(double s_query) const;
 
   /// 弧长轴 / 速度 / 角速度（只读；长度一致，无效时为空）
-  const std::vector<double> & sAxis() const { return s_; }
-  const std::vector<double> & speeds() const { return v_; }
-  const std::vector<double> & omegas() const { return w_; }
+  const std::vector<double> &sAxis() const { return s_; }
+  const std::vector<double> &speeds() const { return v_; }
+  const std::vector<double> &omegas() const { return w_; }
   /// 峰值速度 [m/s]（**无效或为空时返回 0，不会崩**）。
   /// 为什么把它收进结构体：日志/A-B 表每处都要打峰值，让调用方各自写
   /// `max_element` 就是反复往同一个坑里跳（见上面的说明）。
@@ -65,4 +66,4 @@ private:
   bool valid_{false};
 };
 
-}  // namespace pnc_2d
+} // namespace pnc_2d

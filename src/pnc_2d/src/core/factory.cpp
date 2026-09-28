@@ -3,6 +3,7 @@
 #include "pnc_2d/core/replan_recovery.hpp"
 #include "pnc_2d/global/astar_planner.hpp"
 #include "pnc_2d/global/route_network_planner.hpp"
+#include "pnc_2d/local/heading_shim_planner.hpp"
 #include "pnc_2d/local/mpc_local_planner.hpp"
 #include "pnc_2d/local/null_local_planner.hpp"
 #include "pnc_2d/traj/minco_optimizer.hpp"
@@ -31,12 +32,15 @@ std::unique_ptr<LocalPlanner> createLocalPlanner(const std::string &type) {
     return std::make_unique<NullLocalPlanner>();
   if (type == "mpc")
     return std::make_unique<MpcLocalPlanner>();
+  // 装饰器：内部自己建主控制器（`shim.primary`，默认 mpc）
+  if (type == "heading_shim")
+    return std::make_unique<HeadingShimPlanner>();
   return nullptr;
 }
 
 std::vector<std::string> availableLocalPlanners() {
   // "none": yaml 里更自然的写法，映射到同一个 NullLocalPlanner
-  return {"none", "null", "mpc"};
+  return {"none", "null", "mpc", "heading_shim"};
 }
 
 std::unique_ptr<RecoveryBehavior>

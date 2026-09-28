@@ -117,6 +117,10 @@ bool GlobalPlanner::loadCommonParams(const ParamReader &p,
   prune_mode_ = p.getString(prefix + ".path_prune_mode", prune_mode_);
   prune_max_span_m_ =
       p.getDouble(prefix + ".path_prune_max_span", prune_max_span_m_);
+  prune_extra_margin_ =
+      p.getDouble(prefix + ".path_prune_extra_margin", prune_extra_margin_);
+  if (prune_extra_margin_ < 0.0)
+    prune_extra_margin_ = 0.0;
   path_resample_spacing_ =
       p.getDouble(prefix + ".path_resample_spacing", path_resample_spacing_);
   keep_start_yaw_ = p.getBool(prefix + ".keep_start_yaw", keep_start_yaw_);
@@ -133,8 +137,10 @@ bool GlobalPlanner::loadCommonParams(const ParamReader &p,
       p.getDouble("planner.clearance_prefer_dist", clearance_prefer_dist_);
   clearance_cost_weight_ =
       p.getDouble("planner.clearance_cost_weight", clearance_cost_weight_);
-  if (clearance_prefer_dist_ < 0.0) clearance_prefer_dist_ = 0.0;
-  if (clearance_cost_weight_ < 0.0) clearance_cost_weight_ = 0.0;
+  if (clearance_prefer_dist_ < 0.0)
+    clearance_prefer_dist_ = 0.0;
+  if (clearance_cost_weight_ < 0.0)
+    clearance_cost_weight_ = 0.0;
   if (fp_.length <= 0.0 || fp_.width <= 0.0)
     fp_.enable = false; // 尺寸非法 → 关掉 footprint
   if (fp_.safe_margin < 0.0)
@@ -202,6 +208,28 @@ bool GlobalPlanner::lineIsCollisionFree(const Pose2D &a,
   return !collision_.edgeInCollision(a.x, a.y, b.x, b.y);
 }
 
+bool GlobalPlanner::chordIsFreeAtMargin(const Pose2D &a, const Pose2D &b,
+                                        double margin) const {
+  if (!map_ || !map_->valid())
+    return false;
+  const double dx = b.x - a.x;
+  const double dy = b.y - a.y;
+  const double len = std::hypot(dx, dy);
+  const double yaw = std::atan2(dy, dx);
+  // 采样粒度取半格（全局图 0.05 m ⇒ 2.5 cm）：矩形 0.70×0.40，相邻两个采样
+  // 位姿的扫掠面重叠很多 ⇒ 不会漏掉"采样点之间擦角"（这正是原来
+  // `edgeInCollision` 用"两端 + 中心线 + 四角轨迹"近似的东西）。
+  const double step = std::max(1.0e-3, 0.5 * map_->resolution());
+  const int n = std::max(1, static_cast<int>(std::ceil(len / step)));
+  for (int k = 0; k <= n; ++k) {
+    const double t = static_cast<double>(k) / static_cast<double>(n);
+    if (collision_.poseInCollisionAtMargin(a.x + dx * t, a.y + dy * t, yaw,
+                                           margin))
+      return false;
+  }
+  return true;
+}
+
 bool GlobalPlanner::lineHitsHardObstacle(double x0, double y0, double x1,
                                          double y1) const {
   if (!map_ || !map_->valid())
@@ -223,7 +251,7 @@ double GlobalPlanner::cellExtraCost(int x, int y) const {
     const double d = clearance_->distanceToLethal(x, y);
     const double pen = clearance_prefer_dist_ - d;
     if (pen > 0.0) {
-      const double t = pen / clearance_prefer_dist_;   // 0..1 之内
+      const double t = pen / clearance_prefer_dist_; // 0..1 之内
       c += clearance_cost_weight_ * t * t;
     }
   }
@@ -236,8 +264,7 @@ double GlobalPlanner::softCostAlong(double x0, double y0, double x1,
   //   全 0/100（map_server 膨胀后就是这样）时，早退会让剪枝忽略偏好 ⇒ 剪出来的
   //   直线又把路径贴回墙边（偏好白开了）。
   const bool any_soft = map_has_soft_cells_ || clearance_cost_weight_ > 0.0;
-  if (!map_ || !map_->valid() || cost_.soft_cost_weight <= 0.0 ||
-      !any_soft)
+  if (!map_ || !map_->valid() || cost_.soft_cost_weight <= 0.0 || !any_soft)
     return 0.0;
   double sum = 0.0;
   // DDA 遍历保证每格只访问一次，直接累加即可
@@ -318,6 +345,15 @@ void GlobalPlanner::postProcessPath(std::vector<Pose2D> &path,
           softCostAlong(path[i - 1].x, path[i - 1].y, path[i].x, path[i].y);
     }
     const bool check_soft = mapHasSoftCells() && cost_.soft_cost_weight > 0.0;
+    // 剪枝余量：>0 时改用在弦上密采样、且要比 A* 节点检查多撑开
+    // `prune_extra_margin_` 的位姿判据（=0 时完全保持旧行为）。
+    const double prune_margin = (prune_extra_margin_ > 0.0)
+                                    ? fp_.safe_margin + prune_extra_margin_
+                                    : 0.0;
+    const auto chord_free = [&](const Pose2D &a, const Pose2D &b) {
+      return prune_extra_margin_ > 0.0 ? chordIsFreeAtMargin(a, b, prune_margin)
+                                       : lineIsCollisionFree(a, b);
+    };
 
     std::vector<Pose2D> out;
     out.reserve(n);
@@ -330,7 +366,7 @@ void GlobalPlanner::postProcessPath(std::vector<Pose2D> &path,
           break; // 跨度上限（限制单次检查长度）
         if (lineHitsHardObstacle(path[i].x, path[i].y, path[j].x, path[j].y))
           break;
-        if (lineIsCollisionFree(path[i], path[j])) {
+        if (chord_free(path[i], path[j])) {
           // 只有"软代价不变差"才接受捷径：否则会把"绕开软代价区"的路径又拉回去穿过它
           if (check_soft &&
               softCostAlong(path[i].x, path[i].y, path[j].x, path[j].y) >

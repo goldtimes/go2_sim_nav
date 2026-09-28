@@ -40,9 +40,10 @@
 #include "pnc_2d/core/corridor_slice.hpp"
 #include "pnc_2d/core/cost_map_2d.hpp"
 #include "pnc_2d/core/factory.hpp"
+#include "pnc_2d/core/goal_checker.hpp" // 到点判定（M5.1：判定只在这一处）
 #include "pnc_2d/core/local_distance_field.hpp"
 #include "pnc_2d/core/local_planner.hpp"
-#include "pnc_2d/core/map_zones.hpp" // 区域层（禁行区/限速区）
+#include "pnc_2d/core/map_zones.hpp"         // 区域层（禁行区/限速区）
 #include "pnc_2d/core/reference_profile.hpp" // 参考速度剖面（M4）
 #include "pnc_2d/core/route_graph.hpp" // distanceToPolyline（点到折线中心线的距离）
 #include "pnc_2d/msg/local_status.hpp"
@@ -127,6 +128,11 @@ public:
     //   0.10 是**当前控制器实测能到的水平**，不是目标值；M5 的"到点/对正"要把
     //   它收到 ~0.03。现在必须先能通过，否则任务在终点必然失败。
     lateral_tolerance_ = paramDouble("local.lateral_tolerance", 0.10);
+    // 到点判定的**锁存**（Nav2 SimpleGoalChecker 的 stateful 语义，M5.1）：
+    //   一旦满足就锁住，直到下一个任务。它治的是真故障：算法已报"到终点"，
+    //   但判定之后底盘还会滑行 ~9 cm（实测），残差被推出容差 ⇒ 会把一次成功的
+    //   到点报成 FAILED。默认 true。
+    goal_stateful_ = paramBool("local.goal_stateful", true);
     // BLOCKED 要连续持续这么久才结束 action（把决定权交回状态机）：
     // 瞬时遮挡（有人走过、点云抖一帧）不该让任务失败。
     blocked_abort_s_ = paramDouble("local.blocked_abort_s", 1.0);
@@ -155,7 +161,8 @@ public:
     vel_filter_tau_ = paramDouble("local.vel_filter_tau", 0.15);
     // 区域在**局部侧**的额外膨胀：默认 0（见成员声明处的长注释）。
     zones_local_inflate_ = paramDouble("zones.local_inflate", 0.0);
-    if (zones_local_inflate_ < 0.0) zones_local_inflate_ = 0.0;
+    if (zones_local_inflate_ < 0.0)
+      zones_local_inflate_ = 0.0;
 
     if (control_rate_ <= 0.0) {
       RCLCPP_WARN(get_logger(),
@@ -671,13 +678,15 @@ private:
       RCLCPP_WARN(get_logger(), "[local] 收到新目标，终止上一个未完成的跟随");
       endAsCanceled(LocalPlanResult{}, "被新目标顶掉");
     }
-    RCLCPP_INFO(
-        get_logger(),
-        "[local] 接受目标：%zu 点 / %.2f m | 走廊 %s | 限速 %.2f | 严格贴线 %s | 剖面 %s",
-        path.size(), polylineLength(path),
-        goal->corridor_width.empty() ? "无（自由空间模式）" : "有",
-        goal->speed_limit, goal->strict_corridor ? "是" : "否",
-        (goal->traj_valid && goal->traj_s.size() >= 2) ? "有" : "无（自查限速）");
+    RCLCPP_INFO(get_logger(),
+                "[local] 接受目标：%zu 点 / %.2f m | 走廊 %s | 限速 %.2f | "
+                "严格贴线 %s | 剖面 %s",
+                path.size(), polylineLength(path),
+                goal->corridor_width.empty() ? "无（自由空间模式）" : "有",
+                goal->speed_limit, goal->strict_corridor ? "是" : "否",
+                (goal->traj_valid && goal->traj_s.size() >= 2)
+                    ? "有"
+                    : "无（自查限速）");
     return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
   }
 
@@ -789,6 +798,9 @@ private:
     last_pose_ = pose_;
     has_last_pose_ = true;
     finished_ = false;
+    // ★ 新任务：清掉到点锁存（上一次任务的"已到"不能带到这次）
+    goal_checker_.reset();
+    was_reached_ = false;
 
     planner_->reset();
     planner_->setGlobalPlan(plan_);
@@ -801,7 +813,8 @@ private:
       std::string perr;
       if (goal->traj_valid &&
           ref_profile_.set(goal->traj_s, goal->traj_v, goal->traj_w, perr)) {
-        // ★ 交给 MPC 用它当速度上限（真正生效与否由 `local_mpc.use_upstream_profile`
+        // ★ 交给 MPC 用它当速度上限（真正生效与否由
+        // `local_mpc.use_upstream_profile`
         //   决定）。指针是非拥有的：`ref_profile_` 是节点成员，生命周期足够。
         planner_->setReferenceProfile(&ref_profile_);
         // ★ 峰值用 `peakSpeed()`，**不要**自己写 max_element —— 详见
@@ -818,10 +831,10 @@ private:
         //   （“新旧参考混用”是最难查的一类：现象是刚起步就莫名减速/超速）。
         planner_->setReferenceProfile(nullptr);
         RCLCPP_INFO(get_logger(), "[local] 无参考剖面：%s",
-                    goal->traj_valid ? perr.c_str()
-                                     : (goal->traj_note.empty()
-                                            ? "上游未提供"
-                                            : goal->traj_note.c_str()));
+                    goal->traj_valid
+                        ? perr.c_str()
+                        : (goal->traj_note.empty() ? "上游未提供"
+                                                   : goal->traj_note.c_str()));
       }
     }
     // 走廊：逐点半宽 → 切出**真正受约束的那一段**（通常是路网段；hybrid
@@ -973,8 +986,8 @@ private:
       const std::string diag = planner_->diagString();
       if (!diag.empty())
         RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
-                             "[local] cmd v=%.3f w=%.3f | %s%s", r.cmd.v, r.cmd.w,
-                             diag.c_str(), profileSummary().c_str());
+                             "[local] cmd v=%.3f w=%.3f | %s%s", r.cmd.v,
+                             r.cmd.w, diag.c_str(), profileSummary().c_str());
     }
 
     // ★ M4.4（R9）：**剖面一致性** —— 两个数分开报（只算一个会造出假警报）。
@@ -1110,7 +1123,8 @@ private:
   ///
   /// ★★ 为什么必须拆（2026-09-24 实测根因：A1"到点误差 ≤ 3 cm"一直失败）：
   ///   · 局部**算法**的"到达"判据是**弧长投影**（`s ≥ ref_length − 1e-3`）——
-  ///     车停在终点旁边 10 cm，投到终点就是 `s = ref_length_`，算法照样报"已到"；
+  ///     车停在终点旁边 10 cm，投到终点就是 `s =
+  ///     ref_length_`，算法照样报"已到"；
   ///   · 节点层的兜底判据原来是**欧氏距离**（`remaining() ≤ tol + stop_coast`）
   ///     —— 横向残差**全部**记进去。
   ///   ⇒ 同一个瞬间两边结论相反，任务被判 `FollowFail`。
@@ -1138,8 +1152,7 @@ private:
     if (L2 > 1e-12) {
       // 末端那一段（倒数第二点 → 末点）：横向残差对它算（投影参数夹到 [0,1]）
       const double t = std::min(
-          1.0, std::max(0.0, ((pose_.x - ax) * dx + (pose_.y - ay) * dy) /
-                                 L2));
+          1.0, std::max(0.0, ((pose_.x - ax) * dx + (pose_.y - ay) * dy) / L2));
       lat = std::hypot(pose_.x - (ax + dx * t), pose_.y - (ay + dy * t));
       // 沿向 = √(斜边² − 垂距²)：末段是直线时**精确**，一般情况也是很好的
       // 近似，且**永不为负**
@@ -1148,8 +1161,8 @@ private:
     // 还没走完的折线段（**不含末段本身**，末段已由 along_end 表达）
     double extra = 0.0;
     for (std::size_t i = pass_index_ + 1; i + 1 < n; ++i)
-      extra += std::hypot(plan_[i + 1].x - plan_[i].x,
-                          plan_[i + 1].y - plan_[i].y);
+      extra +=
+          std::hypot(plan_[i + 1].x - plan_[i].x, plan_[i + 1].y - plan_[i].y);
     e.along = along_end + extra;
     e.lateral = lat;
     e.euclid = d_end + extra;
@@ -1159,23 +1172,25 @@ private:
   /// 原来的"欧氏剩余"（保留：反馈/上报仍在用；语义 = `endResidual().euclid`）
   double remaining() const { return endResidual().euclid; }
 
-  /// 把"哪一个残差不过"说清楚（沿向 / 横向 / 两者）—— 原来只能报一个欧氏数，
+  /// 把"哪一个残差不过"说清楚（沿向 / 横向 / 朝向）—— 原来只能报一个欧氏数，
   /// 分不清该修哪个（实测为此查了好几轮）
+  ///
+  /// ★ M5.1：**判据本身归 `core/goal_checker`**，这里只加一项本层才有的诊断信息
+  ///   （欧氏合计）。"是哪一个超"也去问它 —— 否则同一条判据就有两份实现。
   std::string describeResidual(const EndResidual &e) const {
-    const double along_tol = goal_tolerance_ + planner_->stopCoast();
-    const bool along_bad = e.along - planner_->stopCoast() > goal_tolerance_;
-    const bool lat_bad = e.lateral > lateral_tolerance_;
-    std::string s = "沿向残差 " + std::to_string(e.along) + " m（容差 " +
-                    std::to_string(along_tol) + "，含停车惯性 " +
-                    std::to_string(planner_->stopCoast()) + "）";
-    s += " / 横向残差 " + std::to_string(e.lateral) + " m（容差 " +
-         std::to_string(lateral_tolerance_) + "）";
-    s += "（欧氏合计 " + std::to_string(e.euclid) + " m）";
-    s += along_bad && lat_bad
-             ? " —— **两个都超**"
-             : (along_bad ? " —— **沿向超**（没走到）"
-                          : " —— **横向超**（没贴线）");
-    return s;
+    return goal_checker_.describe(toResidual(e)) + "（欧氏合计 " +
+           std::to_string(e.euclid) + " m）";
+  }
+
+  /// 路径层残差 → 判定用残差（把"朝向"这一项从路径末点补上）
+  GoalResidual toResidual(const EndResidual &res) const {
+    GoalResidual r;
+    r.along = res.along;
+    r.lateral = res.lateral;
+    r.has_yaw = !plan_.empty() && plan_.back().has_yaw;
+    if (r.has_yaw)
+      r.yaw_err = std::fabs(pnc_2d::wrapAngle(plan_.back().yaw - pose_.yaw));
+    return r;
   }
 
   /// 到点判定：比的是"**预判停点**到目标的距离"，不是当前距离。
@@ -1193,29 +1208,35 @@ private:
   ///   朝向还没对好时**不判到达**，只打一行日志（算法正在原地转），
   ///   任务自然多走几个周期。
   bool finishReached(const EndResidual &res) {
-    // ① **沿向**：有没有走完（扣掉停车惯性，口径同原来）
-    if (res.along - planner_->stopCoast() > goal_tolerance_)
-      return false;
-    // ② **横向**：有没有贴到线上（与沿向**正交**，口径完全不同）
-    //    ★ 单独一条：横向残差不是"没走到"，但"停在离目标 10 cm 的侧面"同样不是
-    //      到点。拆开之后报数才说得清是哪一个不满足。
-    if (res.lateral > lateral_tolerance_)
-      return false;
-    const double tol = planner_->goalYawTolerance(); // [rad]，0 = 不判朝向
-    if (tol <= 0.0)
-      return true;
-    // 路径末点没带朝向（纯路径点）⇒ 这个任务本来就没有朝向要求，不判
-    if (plan_.empty() || !plan_.back().has_yaw)
-      return true;
-    const double e = std::fabs(pnc_2d::wrapAngle(plan_.back().yaw - pose_.yaw));
-    if (e <= tol)
-      return true;
-    RCLCPP_INFO_THROTTLE(
-        get_logger(), *get_clock(), 2000,
-        "[local] 已到点位置，正在原地对正目标朝向（偏差 %.1f° > "
-        "%.1f°）",
-        e * 180.0 / M_PI, tol * 180.0 / M_PI);
-    return false;
+    // 判定本体在 `core/goal_checker`（可单测；含 stateful 锁存）。
+    // 本函数只负责：① 把参数与残差翻译过去；② 报一条可读日志。
+    //
+    // 容差来源（**刻意共用同一份数据**，避免"算法按 5° 对正、节点按 2° 判"
+    // 导致两边互等、任务卡到超时）：节点参数 = 沿/横容差；算法 = 朝向容差 +
+    // 停车惯性。
+    GoalChecker::Params p;
+    p.along_tolerance = goal_tolerance_;
+    p.lateral_tolerance = lateral_tolerance_;
+    p.yaw_tolerance = planner_ ? planner_->goalYawTolerance() : 0.0;
+    p.stop_coast = planner_ ? planner_->stopCoast() : 0.0;
+    p.stateful = goal_stateful_;
+    goal_checker_.configure(p); // ★ 不碰锁存（参数热重载不许把"已到"抖掉）
+
+    GoalResidual r = toResidual(res);
+
+    const bool ok = goal_checker_.update(r);
+    if (ok && goal_checker_.justLatched() && !was_reached_) {
+      // 只在**上升沿**打一条（否则每周期都刷）
+      was_reached_ = true;
+      RCLCPP_INFO(get_logger(), "[local] 到点：%s",
+                  goal_checker_.describe(r).c_str());
+    } else if (!ok && std::string(goal_checker_.firstFailure(r)) == "yaw") {
+      // 位置到了但朝向没对好：算法正在原地对正，这里只提示（**不判到达**）
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "[local] 已到点位置，正在原地对正目标朝向：%s",
+                           goal_checker_.describe(r).c_str());
+    }
+    return ok;
   }
 
   // ------------------------------------------------------------ 停车
@@ -1248,7 +1269,7 @@ private:
   ///   ⇒ 进程 abort。现象是「按 Ctrl-C 退出时节点报 terminate」，而且 exit code
   ///   是 -6 而不是 0，脚本里会误判成“节点崩了”。
   ///   只检查 `rclcpp::ok()` 不够：检查与调用之间那条缝就是竞态本身。
-  template <typename F> void safePublish(F && f) {
+  template <typename F> void safePublish(F &&f) {
     try {
       f();
     } catch (const std::exception &) {
@@ -1440,6 +1461,12 @@ private:
 
   double control_rate_{20.0};
   double goal_tolerance_{0.30};
+  /// 到点判定的锁存开关（`local.goal_stateful`，M5.1）
+  bool goal_stateful_{true};
+  /// 到点判定本体（`core/goal_checker`）；判定只此一处，见 finishReached
+  GoalChecker goal_checker_;
+  /// 本次任务是否已经报过"到点"（只用于"上升沿打一条日志"）
+  bool was_reached_{false};
   /// 到点的**横向**容差 [m]（与沿向容差正交；见 endResidual / finishReached）
   double lateral_tolerance_{0.10};
   double blocked_abort_s_{1.0};
@@ -1498,9 +1525,11 @@ private:
   pnc_2d::ZoneSet zones_;
   /// 区域的膨胀量 [m]：**与 map_server 烧全局图用的是同一个值**（消息带过来），
   /// 两边必须一致，否则同一个区域全局说能过、局部说不能。
-  double zone_inflate_msg_{0.0};   // /global_map/zones 消息里报的 inflate（仅记录/告警）
-  /// 局部侧额外膨胀 [m]：**默认 0** —— 全局图已经把区域按 zones.inflate 膨胀过了，
-  /// 局部再叠加同一个值 ⇒ 两边判据完全相等（零余量），任何栅格离散化/图差都会
+  double zone_inflate_msg_{
+      0.0}; // /global_map/zones 消息里报的 inflate（仅记录/告警）
+  /// 局部侧额外膨胀 [m]：**默认 0** —— 全局图已经把区域按 zones.inflate
+  /// 膨胀过了， 局部再叠加同一个值 ⇒
+  /// 两边判据完全相等（零余量），任何栅格离散化/图差都会
   /// 变成"全局给路、局部在障碍里" ⇒ BLOCKED ⇒ 恢复重规划又因起点余量重叠失败
   /// ⇒ 任务死锁（2026-09-23 实测）。与 "topics.local_map 用未膨胀图" 完全同构。
   double zones_local_inflate_{0.0};

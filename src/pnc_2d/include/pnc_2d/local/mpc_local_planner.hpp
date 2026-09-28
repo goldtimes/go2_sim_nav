@@ -107,12 +107,13 @@ struct MpcParams {
 
   // ---------------- 参考轨迹 ----------------
   double reference_speed{0.0}; ///< >0 时覆盖"默认巡航速度"（0 = 用 v_max/限速）
-  /// ★★ A/B 开关（M4.3）：是否用**上游剖面**（`setReferenceProfile()` 给的那一份）
+  /// ★★ A/B 开关（M4.3）：是否用**上游剖面**（`setReferenceProfile()`
+  /// 给的那一份）
   ///   作为速度上限。
   ///   true （默认）：有剖面时**换掉**本地的曲率限速，并用剖面的 ω 顶替 κ·v；
   ///   false：完全忽略剖面（= M4.2 之前的现网行为，做对照用）。
   bool use_upstream_profile{true};
-  double lat_acc_max{1.5};     ///< 曲率限速用：允许的最大向心加速度 [m/s²]
+  double lat_acc_max{1.5}; ///< 曲率限速用：允许的最大向心加速度 [m/s²]
   /// 终点制动剖面用的减速度 [m/s²]。
   /// ★ 有上游剖面时它**仍然是兜底**（不是冗余）：上游剖面可能只覆盖前 N 米，
   ///   尾部需要它接手；而且 `brake_acc` 比 `traj.a_max` 大时上游总是更紧，
@@ -144,44 +145,24 @@ struct MpcParams {
   /// （用户要求停点误差 ≤ 3 cm）。
   double stop_coast{0.0};
 
-  // ---------------- 大航向偏差：先原地对正再走 ----------------
-  /// 进入"原地对正"模式的航向偏差阈值 [°/rad]；0 = 关闭。
-  ///
-  /// 为什么单独做这个模式：参考折线是"沿路径前进"的语义，车头差几十度时 MPC 会
-  /// 去找一个"边转边走"的解；在严格走廊/障碍靠近时这个解几乎必然撞硬界 ⇒ 代价上
-  /// "原地不动"更便宜 ⇒ **车拒动**（实测 航向差 7/15/25° 用满加速能力起步，
-  /// 40/60° → `cmd v=0`）。而差速/足式底盘的 ω 与 v
-  /// 是解耦的，原地转正物理可行，
-  /// 所以正确行为是"先把机头对到参考方向，再起步"。
-  double align_in_place_deg{0.0};
-  /// 退出阈值 [°]（滞环，避免在阈值上来回切模式）
-  double align_exit_deg{8.0};
-  /// 对正角速度增益 [1/s]：ω = gain·(−e_ψ)（再受 w_max 限幅）
-  double align_gain{1.2};
-  /// 允许原地旋转的最小净距 [m]：车体是矩形，原地转会扫过外接圆。
-  /// 离障碍比这个值更近时不转（交给正常流程，宁可停也不剧蹭）。
-  double align_min_clearance{0.25};
-
-  // ---------------- 到点后的**目标朝向**对正 ----------------
-  /// 目标朝向容差 [°]；0 = 不判定朝向（旧行为）。
-  ///
-  /// ★ 为什么必须有（用户 2026-09-23 指出）：原来的到点判定只管 xy
-  ///   （`remaining − stop_coast ≤
-  ///   goal_tolerance`），于是"位置到了、机头朝哪都行" 也算到达 ——
-  ///   而任务目标本身是带 yaw 的（例：面向充电桩/面向通道口）。 实测验收只量
-  ///   xy，yaw 可以差 90° 都没人发现。
-  ///
-  /// 行为：到达终点**位置**附近（剩余 ≤ `goal_yaw_align_distance`）而 |目标朝向
-  /// 误差| > 本阈值时，原地对正到**目标朝向**（复用 align_gain /
-  /// align_min_clearance / w_max），对正到容差内才算到达。
-  /// 目标朝向取**路径最后一点**的 yaw（全局规划把目标 yaw 放在末点）。
-  double goal_yaw_tolerance_deg{0.0};
-  /// 进入"终点朝向对正"的剩余弧长 [m]。
-  ///
-  /// ⚠ 必须 **> 节点的到点位置容差**（`local.goal_tolerance`）：否则会出现“节点
-  ///   已判到点、算法还在等朝向”的死锁 —— 算法在 `remaining≈0` 时会先返回
-  ///   kGoalReached + 零速。留 10 cm 是经验值（比常见容差 1~5 cm 大一倍）。
-  double goal_yaw_align_distance{0.10};
+  // ---------------- 大航向偏差 / 到点朝向：**不住这里，见 M5.2**
+  // ---------------- 本算法**只做跟踪**：不再有"起步原地对正"（原
+  // align_in_place_deg/
+  // align_exit_deg/align_gain/align_w_min/align_min_clearance）与"到点目标朝向
+  // 对正"（原 goal_yaw_tolerance_deg/goal_yaw_align_distance/
+  // goal_yaw_align_timeout）。
+  //
+  // 为什么搬走（2026-09-28，M5.2）：
+  //   ① 转向与跟踪是两件事。MPC 的目标函数是"贴线 + 前进"的二次型，车头差几十度
+  //      时它只有解空间里的妥協（"边转边走"），而"原地不动"往往更便宜 ⇒ 拒动：
+  //      实测严格走廊下航向差 ≥30° ⇒ 120/120 周期被挡、一步不走。
+  //   ② 两套对正各配一份阀值/增益、各写一遍判据，同一个物理量配两遍必不一致。
+  //   ③ 现在的实现是 `local/heading_shim_planner.hpp`（装饰器，`local.type:
+  //      heading_shim`），控制律、迟滞、旋转碰撞扫掠都只有一份。
+  //
+  // ⚠ 因此 `local.type: mpc`
+  // 单独跑时**没有任何朝向对正**（大角度起步就"边转边走"，
+  //   终点也不管朝向）—— 要旧行为请用 `local.type: heading_shim`。
 
   // ---------------- 自由模式的“顺滑优先”（用户 2026-09-23）----------------
   //
@@ -199,32 +180,25 @@ struct MpcParams {
   //
   // ⚠ 这几个量的默认值是**中立**的（= 旧行为，严格贴线）：
   //   · 库层的"跟踪精度"单测量的是**控制器**本身的能力，默认严格才有意义；
-  //   · 而"自由导航要顺滑"是本产品的**策略选择**，写在 local_mpc.yaml 里（已开）。
+  //   · 而"自由导航要顺滑"是本产品的**策略选择**，写在 local_mpc.yaml
+  //   里（已开）。
   /// 自由模式横向权重缩放（1 = 与走廊一样严；走廊模式恒为 1）
   double free_lat_scale{1.0};
   /// 自由模式航向权重缩放（1 = 一样严；走廊模式恒为 1）
   double free_yaw_scale{1.0};
   /// 自由模式横向**死区** [m]：偏差在带内就不纠（把参考线平移到车这一侧），
   /// 只纠超出带的部分。0 = 关。目的是“几 cm 的偏差不值得动方向盘”。
+  ///
+  /// ★★ 2026-09-28 实测：**不要开**（默认就是 0）。它连**终端目标**一起平移，
+  ///   把到点横向精度写死成 deadband（= 0.10 m = `local.lateral_tolerance`
+  ///   ⇒ 判定骑在阈值上、随机 FAIL）。同一条直线各跑 3 条腿：开 0.10 时稳态
+  ///   横向偏置 +3.8~4.3 / −5.1 cm、到点横向残差 4.5~6.0 cm；置 0 后变成
+  ///   −0.2~+0.1 cm 与 0.01~0.9 cm，而**位姿**口径的车体摆动几乎不变
+  ///   （ω 反向 15→14）。代码保留只为可回滚/供单测，配置里已置 0。
+  ///   详见 doc/minco_trajectory_plan.md §M5.0.5。
   double free_lat_deadband{0.0};
   /// 自由模式角速度上限 [rad/s]（0 = 用 w_max）。直接治“左右打满”的摆动。
   double free_w_max{0.0};
-
-  // ---------------- 原地对正的“起步角速度” ----------------
-  /// 对正（含先对正机头、到点对正目标朝向）时的角速度**下限** [rad/s]，0 = 关。
-  ///
-  /// ★ 为什么必须有：底盘低速有死区（指令太小步态/电机不动），而
-  ///   `ω = align_gain·e` 在 e 小时给不出能动的指令 ⇒ 车停在容差**外**永远
-  ///   不再转 ⇒ “无法收敛”（用户 2026-09-23 实测）。给一个下限打破死区：
-  ///   宁可多转一点点、下个周期再修，也不要停在那儿不动。
-  /// 默认 0（中立）：具体值属底盘特性（死区大小不同），在 <底盘>_run.yaml 里标定。
-  double align_w_min{0.0};
-  /// 终点朝向对正**无进展超时** [s]（0 = 不限时）：一段时间内偏差没有实质改善
-  /// （= 车根本转不动，底盘死区）⇒ 报 kFailed 并说明“还差多少度”，而不是无限
-  /// 原地转下去（无限转在任务层看就是卡死）。
-  /// ★ 是“无进展”而非“墙钟”：180° @ 0.65 rad/s ≈ 5 s 本来就慢，按墙钟计会把
-  ///   “转得慢但一直在收敛”判成失败。
-  double goal_yaw_align_timeout{6.0};
 
   // ---------------- 走廊（route profile）----------------
   /// "严格贴线"（corridor_width = 0）时的数值下限 [m]。
@@ -280,7 +254,7 @@ struct MpcSolveInfo {
   double cross_track{0.0}; ///< 当前横向偏差 [m]
 
   // ---- 调参诊断（"为什么只发这么慢/为什么在扭"只能靠这些量说清）----
-  double ref_v{0.0};   ///< 参考窗口第一步的速度 ref[0].v（= 本周期限速）
+  double ref_v{0.0}; ///< 参考窗口第一步的速度 ref[0].v（= 本周期限速）
   /// 参考窗口第一步的角速度 ref[0].w（M4.3：有上游剖面时它**来自剖面**，
   /// 否则来自本地 κ·v）。A/B 表里"ω 反向次数/RMS|ω|"就看它。
   double ref_w{0.0};
@@ -354,10 +328,13 @@ public:
   double maxSpeed() const override { return p_.v_max; }
   /// 本算法的减速能力（节点算限速区前瞻距离用，见 LocalPlanner::brakeAcc）
   double brakeAcc() const override { return p_.brake_acc; }
-  /// 是否处于“原地对正”模式（诊断/单测用）
-  bool aligning() const { return aligning_; }
-  /// 是否处于“**终点朝向**对正”模式（诊断/单测用）
-  bool goalYawAligning() const { return goal_aligning_; }
+  /// 本算法能给出的最大角速度（装饰器算"交棒动力学"用，见
+  /// LocalPlanner::maxOmega）。 ★ 取**硬上限 `w_max`**（不取自由模式的
+  /// `free_w_max`）：按 R10 的口径，要比的是
+  ///   "主控制器**能不能**给出这个角速度"。`free_w_max`
+  ///   是自由模式的**顺滑软限** （治左右打满的摆动），不是底盘能力上限 ——
+  ///   拿它比会让检查形同虚设的正好 反过来：起步段就该按能力比。
+  double maxOmega() const override { return p_.w_max; }
   /// 上一周期实际生效的角速度上限 [rad/s]（自由模式会被 free_w_max 压；单测用）
   double lastWLimit() const { return last_w_limit_; }
 
@@ -367,21 +344,11 @@ public:
   /// 诊断字符串（见
   /// LocalPlanner::diagString）：调参时一眼看清"为什么这么慢/在扭"
   std::string diagString() const override;
-  /// 到点后的**目标朝向**对正；返回 true = 本周期已处理（out 已填好，直接
-  /// return）
-  bool goalYawAlign(const Pose2D &pose, double remaining, LocalPlanResult &out);
-  /// 对正用的角速度（`align_gain·e` 限幅 + `align_w_min` 下限打破底盘死区）
-  double alignRate(double e_yaw) const;
   /// 本模式下的角速度上限：自由模式会被 `free_w_max` 压（治“左右打满”的摆动）
-  double wMaxEff(bool route_mode) const
-  {
+  double wMaxEff(bool route_mode) const {
     return (route_mode || p_.free_w_max <= 0.0)
                ? p_.w_max
                : std::min(p_.w_max, p_.free_w_max);
-  }
-  /// 见 LocalPlanner::goalYawTolerance（节点用它做到点判定）
-  double goalYawTolerance() const override {
-    return p_.goal_yaw_tolerance_deg * M_PI / 180.0;
   }
   /// 上一周期解出的预测轨迹（世界系，N+1 点）—— 可视化与单测用
   const std::vector<Pose2D> &predictedTrajectory() const { return predicted_; }
@@ -476,16 +443,6 @@ private:
   /// route 模式下用走廊中心线（非拥有，来自 setCorridor 的指针）
   bool route_mode_{false};
 
-  /// 是否处于“原地对正”模式（带滞环的状态，见 align_in_place_deg）
-  bool aligning_{false};
-
-  /// 是否处于“**终点朝向**对正”模式（与 aligning_ 分开：两者目标不同 ——
-  /// 前者对的是参考切线方向、后者对的是目标 yaw，滞环也不能共用一个）
-  bool goal_aligning_{false};
-  /// 进入“终点朝向对正”的时刻（用于 goal_yaw_align_timeout 判超时）
-  std::chrono::steady_clock::time_point goal_align_since_{};
-  /// 进对正后见过的最小偏差 [°]（偏差改善 ≥ 2° 就把超时计时重置）
-  double goal_align_best_deg_{1e9};
   /// 自由模式下实际使用的角速度上限（诊断/单测用）
   double last_w_limit_{0.0};
 

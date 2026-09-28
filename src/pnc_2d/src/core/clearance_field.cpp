@@ -18,9 +18,8 @@ namespace {
 constexpr float kInf = std::numeric_limits<float>::max() / 4.0F;
 
 /// 1D 变换：d[q] = min_p ( (q-p)^2 + f[p] )
-void dt1d(const std::vector<float> & f, std::vector<float> & d,
-          std::vector<int> & v, std::vector<float> & z, int n)
-{
+void dt1d(const std::vector<float> &f, std::vector<float> &d,
+          std::vector<int> &v, std::vector<float> &z, int n) {
   int k = 0;
   v[0] = 0;
   z[0] = -kInf;
@@ -42,17 +41,17 @@ void dt1d(const std::vector<float> & f, std::vector<float> & d,
   }
   k = 0;
   for (int q = 0; q < n; ++q) {
-    while (z[k + 1] < static_cast<float>(q)) ++k;
+    while (z[k + 1] < static_cast<float>(q))
+      ++k;
     const float dq = static_cast<float>(q - v[k]);
     d[q] = dq * dq + f[v[k]];
   }
 }
 
-}  // namespace
+} // namespace
 
-bool ClearanceField::build(const CostMap2D & map, int hard_threshold,
-                          bool unknown_as_occupied)
-{
+bool ClearanceField::build(const CostMap2D &map, int hard_threshold,
+                           bool unknown_as_occupied) {
   if (!map.valid()) {
     width_ = height_ = 0;
     dist_.clear();
@@ -75,8 +74,9 @@ bool ClearanceField::build(const CostMap2D & map, int hard_threshold,
   for (int y = 0; y < height_; ++y) {
     for (int x = 0; x < width_; ++x) {
       const int8_t raw = map.rawValue(x, y);
-      const bool lethal = (raw < 0) ? unknown_as_occupied
-                                    : (raw >= static_cast<int8_t>(hard_threshold));
+      const bool lethal = (raw < 0)
+                              ? unknown_as_occupied
+                              : (raw >= static_cast<int8_t>(hard_threshold));
       if (lethal) {
         dist_[static_cast<std::size_t>(y) * width_ + x] = 0.0F;
         ++lethal_count_;
@@ -92,24 +92,29 @@ bool ClearanceField::build(const CostMap2D & map, int hard_threshold,
 
   std::vector<float> col_in(height_), col_out(height_);
   for (int y = 0; y < height_; ++y) {
-    for (int x = 0; x < width_; ++x) f[x] = dist_[static_cast<std::size_t>(y) * width_ + x];
+    for (int x = 0; x < width_; ++x)
+      f[x] = dist_[static_cast<std::size_t>(y) * width_ + x];
     dt1d(f, d, v, z, width_);
-    for (int x = 0; x < width_; ++x) dist_[static_cast<std::size_t>(y) * width_ + x] = d[x];
+    for (int x = 0; x < width_; ++x)
+      dist_[static_cast<std::size_t>(y) * width_ + x] = d[x];
   }
   for (int x = 0; x < width_; ++x) {
-    for (int y = 0; y < height_; ++y) col_in[y] = dist_[static_cast<std::size_t>(y) * width_ + x];
+    for (int y = 0; y < height_; ++y)
+      col_in[y] = dist_[static_cast<std::size_t>(y) * width_ + x];
     dt1d(col_in, col_out, v, z, height_);
-    for (int y = 0; y < height_; ++y) dist_[static_cast<std::size_t>(y) * width_ + x] = col_out[y];
+    for (int y = 0; y < height_; ++y)
+      dist_[static_cast<std::size_t>(y) * width_ + x] = col_out[y];
   }
 
   // 平方距离 → 距离（单位：格）
-  for (auto & value : dist_) value = std::sqrt(value);
+  for (auto &value : dist_)
+    value = std::sqrt(value);
   return true;
 }
 
-bool ClearanceField::insideWorld(double wx, double wy) const
-{
-  if (!valid()) return false;
+bool ClearanceField::insideWorld(double wx, double wy) const {
+  if (!valid())
+    return false;
   double gx = 0.0;
   double gy = 0.0;
   worldToGridContinuous(wx, wy, gx, gy);
@@ -128,12 +133,11 @@ struct BilinearSample {
   double d11{0.0};
   double fu{0.0};
   double fv{0.0};
-  double center{0.0};   // 最近格中心的值（= 四角加权后仍是有限的）
+  double center{0.0}; // 最近格中心的值（= 四角加权后仍是有限的）
 };
 
-BilinearSample sampleBilinear(const std::vector<float> & dist, int width, int height,
-                              double gx, double gy)
-{
+BilinearSample sampleBilinear(const std::vector<float> &dist, int width,
+                              int height, double gx, double gy) {
   // 以格子下标为单位的连续坐标（格中心 = 整数）；夹到 [0, n-1] 避免越界
   const double u = gx - 0.5;
   const double v = gy - 0.5;
@@ -156,28 +160,31 @@ BilinearSample sampleBilinear(const std::vector<float> & dist, int width, int he
   return s;
 }
 
-}  // namespace
+} // namespace
 
-double ClearanceField::distanceAtWorld(double wx, double wy, double max_m) const
-{
-  if (!valid()) return max_m;
-  if (!insideWorld(wx, wy)) return max_m;   // 越界："不算障碍"
+double ClearanceField::distanceAtWorld(double wx, double wy,
+                                       double max_m) const {
+  if (!valid())
+    return max_m;
+  if (!insideWorld(wx, wy))
+    return max_m; // 越界："不算障碍"
   double gx = 0.0;
   double gy = 0.0;
   worldToGridContinuous(wx, wy, gx, gy);
   const BilinearSample s = sampleBilinear(dist_, width_, height_, gx, gy);
   const double meters = s.center * resolution_;
-  if (!std::isfinite(meters)) return max_m;   // 全图无致命格（EDT 初值）
+  if (!std::isfinite(meters))
+    return max_m; // 全图无致命格（EDT 初值）
   return std::min(max_m, meters);
 }
 
-bool ClearanceField::gradientAtWorld(double wx, double wy, double g[2]) const
-{
+bool ClearanceField::gradientAtWorld(double wx, double wy, double g[2]) const {
   if (g != nullptr) {
     g[0] = 0.0;
     g[1] = 0.0;
   }
-  if (g == nullptr || !valid() || !insideWorld(wx, wy)) return false;
+  if (g == nullptr || !valid() || !insideWorld(wx, wy))
+    return false;
   double gx = 0.0;
   double gy = 0.0;
   worldToGridContinuous(wx, wy, gx, gy);
@@ -194,4 +201,4 @@ bool ClearanceField::gradientAtWorld(double wx, double wy, double g[2]) const
   return true;
 }
 
-}  // namespace pnc_2d
+} // namespace pnc_2d

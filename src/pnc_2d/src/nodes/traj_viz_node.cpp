@@ -1,9 +1,11 @@
 // P6 / M2 阶段性验证节点：**A* 全局路径 → MINCO 轨迹 → RViz 对比**
 //
 // 为什么单独一个节点，而不是直接插进 global_planner_node：
-//   · 阶段性验证要**零风险** —— 不动现网主链路（A* 行为、latched 语义、话题全不变），
+//   · 阶段性验证要**零风险** —— 不动现网主链路（A* 行为、latched
+//   语义、话题全不变），
 //     确认满意之后再按 M4 接进主链路；
-//   · 但参数与判据必须与主链路**同源**（`common.*` / `footprint.*` / `traj.*` 用同一批
+//   · 但参数与判据必须与主链路**同源**（`common.*` / `footprint.*` / `traj.*`
+//   用同一批
 //     key，地图/距离场/轮廓判定器都按同一套阈值建），否则会出现"我看的图跟你判断的
 //     不是一回事"这种跨层不一致 —— 这类问题我们已经栽过好几次。
 //
@@ -15,6 +17,18 @@
 //   · /pnc_2d/minco_traj    ← MINCO 轨迹（绿）
 //   状态与指标在 /pnc_2d/minco_status（latched 文本，含净距/终点残差/耗时）
 // 触发：每收到一条新的 global_path（latched）就跑一次 MINCO。
+//
+// ⚠ 2026-09-28：主链路已经能跑 MINCO 了（`traj.type: minco`，平台片段里开着），
+//   而且**采纳优化轨迹时会把"优化前 A* 折线 / 优化后轨迹 / 指标文本"一起画进
+//   `/pnc_2d/plan_markers`**（ns = traj_raw / traj_opt / traj_stats）。
+//   ⇒ 本节点现在的适用场景只剩两种：
+//     · `traj.type: none`（或不想动主链路）时的**离线对比**；
+//     · 想拿 `/pnc_2d/minco_traj` 这条**独立 Path 话题**给脚本/RViz
+//     做几何对比。
+//   ⚠ 注意：`traj.type: minco` 时 `/pnc_2d/global_path`
+//   **已经是优化后的轨迹**，
+//     本节点的"A* vs MINCO"对比会退化成"两条几乎一样的优化线"——要看优化前后，
+//     看主链路的 `plan_markers`（那里留了优化前的原折线）。
 
 #include <chrono>
 #include <cmath>
@@ -37,14 +51,12 @@
 
 namespace {
 
-double yawOf(const geometry_msgs::msg::Quaternion & q)
-{
+double yawOf(const geometry_msgs::msg::Quaternion &q) {
   return std::atan2(2.0 * (q.w * q.z + q.x * q.y),
                     1.0 - 2.0 * (q.y * q.y + q.z * q.z));
 }
 
-geometry_msgs::msg::Quaternion quatOf(double yaw)
-{
+geometry_msgs::msg::Quaternion quatOf(double yaw) {
   geometry_msgs::msg::Quaternion q;
   q.x = 0.0;
   q.y = 0.0;
@@ -53,18 +65,22 @@ geometry_msgs::msg::Quaternion quatOf(double yaw)
   return q;
 }
 
-}  // namespace
+} // namespace
 
 class TrajVizNode : public rclcpp::Node {
 public:
-  TrajVizNode() : rclcpp::Node("traj_viz_node")
-  {
+  TrajVizNode() : rclcpp::Node("traj_viz_node") {
     frame_id_ = declare_parameter<std::string>("planner.frame_id", "map");
-    topic_map_ = declare_parameter<std::string>("topics.map", "/global_map/occupancy");
-    topic_odom_ = declare_parameter<std::string>("topics.odom", "/lightning/perception/pose");
-    topic_in_ = declare_parameter<std::string>("traj.viz.input", "pnc_2d/global_path");
-    topic_out_ = declare_parameter<std::string>("traj.viz.output", "pnc_2d/minco_traj");
-    topic_status_ = declare_parameter<std::string>("traj.viz.status", "pnc_2d/minco_status");
+    topic_map_ =
+        declare_parameter<std::string>("topics.map", "/global_map/occupancy");
+    topic_odom_ = declare_parameter<std::string>("topics.odom",
+                                                 "/lightning/perception/pose");
+    topic_in_ =
+        declare_parameter<std::string>("traj.viz.input", "pnc_2d/global_path");
+    topic_out_ =
+        declare_parameter<std::string>("traj.viz.output", "pnc_2d/minco_traj");
+    topic_status_ = declare_parameter<std::string>("traj.viz.status",
+                                                   "pnc_2d/minco_status");
 
     // ★ 参数必须在这里**一次性声明**：latched 话题（地图/路径）会**重复到达**，
     //   在回调里 declare_parameter 第二次就抛 ParameterAlreadyDeclaredException
@@ -74,23 +90,27 @@ public:
     fp_.enable = declare_parameter<bool>("footprint.enable", fp_.enable);
     fp_.length = declare_parameter<double>("footprint.length", fp_.length);
     fp_.width = declare_parameter<double>("footprint.width", fp_.width);
-    fp_.offset_x = declare_parameter<double>("footprint.offset_x", fp_.offset_x);
-    fp_.offset_y = declare_parameter<double>("footprint.offset_y", fp_.offset_y);
-    fp_.safe_margin = declare_parameter<double>("footprint.safe_margin", fp_.safe_margin);
+    fp_.offset_x =
+        declare_parameter<double>("footprint.offset_x", fp_.offset_x);
+    fp_.offset_y =
+        declare_parameter<double>("footprint.offset_y", fp_.offset_y);
+    fp_.safe_margin =
+        declare_parameter<double>("footprint.safe_margin", fp_.safe_margin);
 
     // 优化器：参数与主链路同源（读同一批 key）
     pnc_2d::RosParamReader reader(*this);
     opt_ = std::make_unique<pnc_2d::MincoOptimizer>();
     if (!opt_->configure(reader)) {
-      RCLCPP_ERROR(get_logger(), "MINCO 配置失败：检查 traj.* 参数（限值必须 > 0）");
+      RCLCPP_ERROR(get_logger(),
+                   "MINCO 配置失败：检查 traj.* 参数（限值必须 > 0）");
     }
 
-    pub_traj_ = create_publisher<nav_msgs::msg::Path>(topic_out_,
-                                                      rclcpp::QoS(1).transient_local());
-    pub_status_ = create_publisher<std_msgs::msg::String>(topic_status_,
-                                                          rclcpp::QoS(1).transient_local());
-    pub_in_ = create_publisher<nav_msgs::msg::Path>(topic_in_copy_(),
-                                                    rclcpp::QoS(1).transient_local());
+    pub_traj_ = create_publisher<nav_msgs::msg::Path>(
+        topic_out_, rclcpp::QoS(1).transient_local());
+    pub_status_ = create_publisher<std_msgs::msg::String>(
+        topic_status_, rclcpp::QoS(1).transient_local());
+    pub_in_ = create_publisher<nav_msgs::msg::Path>(
+        topic_in_copy_(), rclcpp::QoS(1).transient_local());
 
     sub_map_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
         topic_map_, rclcpp::QoS(1).transient_local(),
@@ -102,17 +122,18 @@ public:
         topic_in_, rclcpp::QoS(1).transient_local(),
         [this](nav_msgs::msg::Path::SharedPtr msg) { onPath(msg); });
 
-    RCLCPP_INFO(get_logger(),
-                "就绪：%s（A*）→ %s（MINCO），状态见 %s；RViz 里同时显示两条 Path 对比",
-                topic_in_.c_str(), topic_out_.c_str(), topic_status_.c_str());
+    RCLCPP_INFO(
+        get_logger(),
+        "就绪：%s（A*）→ %s（MINCO），状态见 %s；RViz 里同时显示两条 Path 对比",
+        topic_in_.c_str(), topic_out_.c_str(), topic_status_.c_str());
   }
 
 private:
   std::string topic_in_copy_() const { return topic_in_ + "_input"; }
 
-  void onMap(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
-  {
-    if (msg->info.width == 0 || msg->info.height == 0) return;
+  void onMap(const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
+    if (msg->info.width == 0 || msg->info.height == 0)
+      return;
     const double oyaw = yawOf(msg->info.origin.orientation);
     // 重复到达同样的图（latched 补发）就不要再建一遍：重建要几十 ms
     if (map_ && map_->width() == static_cast<int>(msg->info.width) &&
@@ -122,9 +143,10 @@ private:
       return;
     }
     map_ = std::make_shared<pnc_2d::CostMap2D>();
-    if (!map_->set(static_cast<int>(msg->info.width), static_cast<int>(msg->info.height),
-                   msg->info.resolution, msg->info.origin.position.x,
-                   msg->info.origin.position.y, oyaw, msg->data, msg->header.frame_id)) {
+    if (!map_->set(static_cast<int>(msg->info.width),
+                   static_cast<int>(msg->info.height), msg->info.resolution,
+                   msg->info.origin.position.x, msg->info.origin.position.y,
+                   oyaw, msg->data, msg->header.frame_id)) {
       RCLCPP_ERROR(get_logger(), "地图字段不自洽（尺寸/分辨率/数据长度）");
       map_.reset();
       return;
@@ -145,18 +167,18 @@ private:
     opt_->setCollisionChecker(ck_.get());
     opt_->reset();
 
-    RCLCPP_INFO(get_logger(), "地图 %dx%d @%.3f m，轮廓 %.2fx%.2f + %.2f，距离场致命格 %zu",
-                map_->width(), map_->height(), map_->resolution(), fp_.length, fp_.width,
-                fp_.safe_margin, cf_->lethalCount());
-    if (pending_path_) {   // 地图晚于路径到达：补跑一次
+    RCLCPP_INFO(get_logger(),
+                "地图 %dx%d @%.3f m，轮廓 %.2fx%.2f + %.2f，距离场致命格 %zu",
+                map_->width(), map_->height(), map_->resolution(), fp_.length,
+                fp_.width, fp_.safe_margin, cf_->lethalCount());
+    if (pending_path_) { // 地图晚于路径到达：补跑一次
       const auto p = pending_path_;
       pending_path_.reset();
       onPath(p);
     }
   }
 
-  void onOdom(const nav_msgs::msg::Odometry::SharedPtr msg)
-  {
+  void onOdom(const nav_msgs::msg::Odometry::SharedPtr msg) {
     pose_.x = msg->pose.pose.position.x;
     pose_.y = msg->pose.pose.position.y;
     pose_.yaw = yawOf(msg->pose.pose.orientation);
@@ -166,12 +188,12 @@ private:
     has_odom_ = true;
   }
 
-  void onPath(const nav_msgs::msg::Path::SharedPtr msg)
-  {
+  void onPath(const nav_msgs::msg::Path::SharedPtr msg) {
     using namespace std::chrono;
-    if (!map_ || !cf_ || !ck_) {   // 地图还没到：记下来，等地图到了补跑
+    if (!map_ || !cf_ || !ck_) { // 地图还没到：记下来，等地图到了补跑
       pending_path_ = msg;
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000, "等地图（%s）…", topic_map_.c_str());
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000, "等地图（%s）…",
+                           topic_map_.c_str());
       return;
     }
     if (msg->poses.size() < 2) {
@@ -192,7 +214,7 @@ private:
 
     pnc_2d::TrajOptRequest req;
     req.path.reserve(msg->poses.size());
-    for (const auto & ps : msg->poses) {
+    for (const auto &ps : msg->poses) {
       pnc_2d::Pose2D p;
       p.x = ps.pose.position.x;
       p.y = ps.pose.position.y;
@@ -221,25 +243,29 @@ private:
     if (r.samples.size() < 2) {
       // 没东西可画（无输入/求解失败）：只发状态，不改语义
       std_msgs::msg::String s;
-      s.data = std::string("[MINCO] ") + pnc_2d::toString(r.status) + "：" + r.message;
+      s.data = std::string("[MINCO] ") + pnc_2d::toString(r.status) + "：" +
+               r.message;
       pub_status_->publish(s);
       RCLCPP_WARN(get_logger(), "%s", s.data.c_str());
       return;
     }
     if (r.status != pnc_2d::TrajStatus::kSuccess) {
-      // ★ 终检不过（kCheckFailed）等情况：**仍然把轨迹发出来** —— 这是可视化节点，
+      // ★ 终检不过（kCheckFailed）等情况：**仍然把轨迹发出来** ——
+      // 这是可视化节点，
       //   用户必须看到"失败在哪、长什么样"才能改。但状态里点名 + 明说不得执行。
-      //   （主链路走的是 srv/action，不消费这个话题；失败语义由 `status` 决定。）
-      RCLCPP_WARN(get_logger(),
-                  "[MINCO] %s —— 轨迹不可执行，仅用于诊断（下方 minco_traj 仍画出）",
-                  pnc_2d::toString(r.status));
+      //   （主链路走的是 srv/action，不消费这个话题；失败语义由 `status`
+      //   决定。）
+      RCLCPP_WARN(
+          get_logger(),
+          "[MINCO] %s —— 轨迹不可执行，仅用于诊断（下方 minco_traj 仍画出）",
+          pnc_2d::toString(r.status));
     }
 
     nav_msgs::msg::Path out;
     out.header.frame_id = frame_id_;
     out.header.stamp = now();
     out.poses.reserve(r.samples.size());
-    for (const pnc_2d::TrajSample & sm : r.samples) {
+    for (const pnc_2d::TrajSample &sm : r.samples) {
       geometry_msgs::msg::PoseStamped ps;
       ps.header = out.header;
       ps.pose.position.x = sm.x;
@@ -250,24 +276,30 @@ private:
     }
     pub_traj_->publish(out);
 
-    const pnc_2d::TrajOptStats & st = r.stats;
+    const pnc_2d::TrajOptStats &st = r.stats;
     char buf[1024];
     std::snprintf(buf, sizeof(buf),
                   "[MINCO] %s | %zu 点 / 时长 %.2f s / 路径 %.2f m\n"
-                  "轮廓净距(排除首末) %s%.3f m @s=%.2f | 输入路径净距见 /pnc_2d/global_path\n"
-                  "max|v| %.3f m/s | max|ω| %.3f rad/s | max|a| %.3f | max|α| %.3f | max|κ| %.3f\n"
-                  "终点残差 %.4f m / 末朝向误差 %.2f° | 时间缩放 ×%.2f | 平滑偏移 max %.3f m\n"
-                  "终检 %s：硬门 %d 位姿（统计 %d 位姿）/ %d 个不过 / 最差净距 %.4f m @s=%.2f m\n"
+                  "轮廓净距(排除首末) %s%.3f m @s=%.2f | 输入路径净距见 "
+                  "/pnc_2d/global_path\n"
+                  "max|v| %.3f m/s | max|ω| %.3f rad/s | max|a| %.3f | max|α| "
+                  "%.3f | max|κ| %.3f\n"
+                  "终点残差 %.4f m / 末朝向误差 %.2f° | 时间缩放 ×%.2f | "
+                  "平滑偏移 max %.3f m\n"
+                  "终检 %s：硬门 %d 位姿（统计 %d 位姿）/ %d 个不过 / 最差净距 "
+                  "%.4f m @s=%.2f m\n"
                   "运动学终验 %s\n"
                   "求解 %.1f ms（wall %.1f ms）\n%s",
-                  pnc_2d::toString(r.status), r.samples.size(), st.duration, st.path_length,
-                  st.clearance_valid ? "" : "(未测) ", st.min_clearance, st.min_clearance_s,
-                  st.max_v, st.max_omega, st.max_a, st.max_alpha, st.max_curvature,
-                  st.terminal_error, st.terminal_error_yaw * 180.0 / M_PI, st.time_scale,
-                  st.path_shift_max, st.check_ok ? "通过" : "**不过**", st.check_points,
-                  st.check_stats_points, st.check_violations, st.check_worst_clearance,
-                  st.check_worst_s, st.kin_ok ? "通过" : "**不过（缩放未收敛）**",
-                  st.solve_ms, wall_ms, st.note.c_str());
+                  pnc_2d::toString(r.status), r.samples.size(), st.duration,
+                  st.path_length, st.clearance_valid ? "" : "(未测) ",
+                  st.min_clearance, st.min_clearance_s, st.max_v, st.max_omega,
+                  st.max_a, st.max_alpha, st.max_curvature, st.terminal_error,
+                  st.terminal_error_yaw * 180.0 / M_PI, st.time_scale,
+                  st.path_shift_max, st.check_ok ? "通过" : "**不过**",
+                  st.check_points, st.check_stats_points, st.check_violations,
+                  st.check_worst_clearance, st.check_worst_s,
+                  st.kin_ok ? "通过" : "**不过（缩放未收敛）**", st.solve_ms,
+                  wall_ms, st.note.c_str());
     std_msgs::msg::String s;
     s.data = buf;
     pub_status_->publish(s);
@@ -308,8 +340,7 @@ private:
   nav_msgs::msg::Path::SharedPtr pending_path_;
 };
 
-int main(int argc, char ** argv)
-{
+int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
   rclcpp::spin(std::make_shared<TrajVizNode>());
   rclcpp::shutdown();

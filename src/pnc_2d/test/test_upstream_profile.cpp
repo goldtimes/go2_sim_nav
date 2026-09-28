@@ -40,7 +40,8 @@ std::vector<Pose2D> arcPath(double radius, double length, double res) {
   std::vector<Pose2D> p;
   for (double s = 0.0; s <= length + 1e-9; s += res) {
     const double th = s / radius;
-    p.push_back(Pose2D{radius * std::sin(th), radius * (1.0 - std::cos(th)), th});
+    p.push_back(
+        Pose2D{radius * std::sin(th), radius * (1.0 - std::cos(th)), th});
   }
   return p;
 }
@@ -120,8 +121,8 @@ TEST(UpstreamProfile, InvalidProfileIsIgnored) {
 // ③ 弯道：本地曲率限速是**被换掉**，不是被取 min
 // ---------------------------------------------------------------------------
 TEST(UpstreamProfile, CurvatureLimitIsReplacedNotMinned) {
-  const double R = 1.0;                 // 半径 1 m ⇒ κ ≈ 1 /m
-  const double V = 2.0;                 // v_max 高于本地曲率限速，才看得出差别
+  const double R = 1.0; // 半径 1 m ⇒ κ ≈ 1 /m
+  const double V = 2.0; // v_max 高于本地曲率限速，才看得出差别
   const double kappa = 1.0 / R;
   const double local_cap = std::sqrt(1.5 / kappa); // lat_acc_max 默认 1.5
   auto path = arcPath(R, 6.0, 0.05);
@@ -198,7 +199,7 @@ TEST(UpstreamProfile, RefDeviationIsZeroWhenProfileIsBinding) {
   // 剖面就是本周期生效的上限 ⇒ 参考偏差 = 0（**与实测速度无关**：
   // 车还没加速上来不算"剖面没生效"）
   mpc.setGlobalPlan(straightPath(10.0, 0.05));
-  mpc.setCurrentVelocity(0.0, 0.0);   // 车还是静止的
+  mpc.setCurrentVelocity(0.0, 0.0); // 车还是静止的
   Pose2D pose = straightPath(10.0, 0.05).front();
   pose.has_yaw = true;
   const auto r = mpc.computeCommand(pose, mpc.params().dt);
@@ -224,9 +225,9 @@ TEST(UpstreamProfile, RefDeviationReportsWhoCapsTheSpeed) {
 TEST(UpstreamProfile, RefDeviationDenominatorHasFloor) {
   auto path = straightPath(10.0, 0.05);
   auto mpc = makeMpc(1.0, true);
-  auto prof = makeProfile(10.0, 0.03);   // 终点贴拢量级的低速
+  auto prof = makeProfile(10.0, 0.03); // 终点贴拢量级的低速
   mpc.setReferenceProfile(&prof);
-  mpc.setSpeedLimit(0.01);               // 限速比剖面更低 ⇒ 生效 0.01
+  mpc.setSpeedLimit(0.01); // 限速比剖面更低 ⇒ 生效 0.01
   // |0.01 − 0.03| / max(0.03, 0.10) = 20%（若没地板就是 67%，纯噪声量级）
   EXPECT_NEAR(profileDev(mpc, path, 0.01), 0.20, 1e-9);
 }

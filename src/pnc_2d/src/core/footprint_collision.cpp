@@ -11,12 +11,11 @@
 namespace pnc_2d {
 namespace {
 
-/// 方格 [cx0,cx0+res]×[cy0,cy0+res] 与"中心 (rx,ry)、长轴 (ux,uy)、半长 hu、半宽 hv"的
-/// 旋转矩形是否相交（2D 分离轴 SAT，四个轴：世界 x/y + 矩形两个轴）。
-bool cellIntersectsRect(double cx0, double cy0, double res,
-                        double rx, double ry, double ux, double uy,
-                        double hu, double hv)
-{
+/// 方格 [cx0,cx0+res]×[cy0,cy0+res] 与"中心 (rx,ry)、长轴 (ux,uy)、半长
+/// hu、半宽 hv"的 旋转矩形是否相交（2D 分离轴 SAT，四个轴：世界 x/y +
+/// 矩形两个轴）。
+bool cellIntersectsRect(double cx0, double cy0, double res, double rx,
+                        double ry, double ux, double uy, double hu, double hv) {
   const double sx = cx0 + 0.5 * res;
   const double sy = cy0 + 0.5 * res;
   const double sh = 0.5 * res;
@@ -24,35 +23,40 @@ bool cellIntersectsRect(double cx0, double cy0, double res,
   const double vy = ux;
 
   // 轴 1：世界 x
-  if (std::fabs(sx - rx) > sh + hu * std::fabs(ux) + hv * std::fabs(vx)) return false;
+  if (std::fabs(sx - rx) > sh + hu * std::fabs(ux) + hv * std::fabs(vx))
+    return false;
   // 轴 2：世界 y
-  if (std::fabs(sy - ry) > sh + hu * std::fabs(uy) + hv * std::fabs(vy)) return false;
+  if (std::fabs(sy - ry) > sh + hu * std::fabs(uy) + hv * std::fabs(vy))
+    return false;
   // 轴 3：矩形长轴
-  if (std::fabs((sx - rx) * ux + (sy - ry) * uy) > hu + sh * (std::fabs(ux) + std::fabs(uy))) {
+  if (std::fabs((sx - rx) * ux + (sy - ry) * uy) >
+      hu + sh * (std::fabs(ux) + std::fabs(uy))) {
     return false;
   }
   // 轴 4：矩形短轴
-  if (std::fabs((sx - rx) * vx + (sy - ry) * vy) > hv + sh * (std::fabs(vx) + std::fabs(vy))) {
+  if (std::fabs((sx - rx) * vx + (sy - ry) * vy) >
+      hv + sh * (std::fabs(vx) + std::fabs(vy))) {
     return false;
   }
   return true;
 }
 
-}  // namespace
+} // namespace
 
-void FootprintCollisionChecker::configure(const FootprintParams & fp, int hard_threshold,
-                                          bool unknown_as_occupied)
-{
+void FootprintCollisionChecker::configure(const FootprintParams &fp,
+                                          int hard_threshold,
+                                          bool unknown_as_occupied) {
   fp_ = fp;
   fp_eff_ = fp;
-  if (margin_overridden_) setMarginOverride(margin_override_);   // 保留 override 语义
+  if (margin_overridden_)
+    setMarginOverride(margin_override_); // 保留 override 语义
   hard_threshold_ = hard_threshold;
   unknown_as_occupied_ = unknown_as_occupied;
-  if (map_) buildDirectionOffsets();
+  if (map_)
+    buildDirectionOffsets();
 }
 
-void FootprintCollisionChecker::setMarginOverride(double m)
-{
+void FootprintCollisionChecker::setMarginOverride(double m) {
   margin_override_ = m;
   margin_overridden_ = true;
   fp_eff_ = fp_;
@@ -61,57 +65,59 @@ void FootprintCollisionChecker::setMarginOverride(double m)
   fp_eff_.fast_path = false;
 }
 
-void FootprintCollisionChecker::clearMarginOverride()
-{
+void FootprintCollisionChecker::clearMarginOverride() {
   margin_overridden_ = false;
   margin_override_ = -1.0;
   fp_eff_ = fp_;
 }
 
-void FootprintCollisionChecker::setMap(const CostMap2D * map)
-{
+void FootprintCollisionChecker::setMap(const CostMap2D *map) {
   map_ = map;
   buildDirectionOffsets();
 }
 
-bool FootprintCollisionChecker::cellLethal(int x, int y) const
-{
-  if (!map_ || !map_->valid()) return true;
-  if (!map_->inside(x, y)) return true;   // 图外视为不可通行（保守）
+bool FootprintCollisionChecker::cellLethal(int x, int y) const {
+  if (!map_ || !map_->valid())
+    return true;
+  if (!map_->inside(x, y))
+    return true; // 图外视为不可通行（保守）
   const int8_t raw = map_->rawValue(x, y);
-  if (raw < 0) return unknown_as_occupied_;
+  if (raw < 0)
+    return unknown_as_occupied_;
   return raw >= static_cast<int8_t>(hard_threshold_);
 }
 
-bool FootprintCollisionChecker::pointLethal(double wx, double wy) const
-{
+bool FootprintCollisionChecker::pointLethal(double wx, double wy) const {
   int x = 0;
   int y = 0;
-  if (!map_ || !map_->worldToGrid(wx, wy, x, y)) return true;
+  if (!map_ || !map_->worldToGrid(wx, wy, x, y))
+    return true;
   return cellLethal(x, y);
 }
 
-double FootprintCollisionChecker::distanceToLethal(double wx, double wy) const
-{
-  if (!cf_ || !cf_->valid()) return std::numeric_limits<double>::quiet_NaN();
-  if (!map_ || !map_->valid()) return std::numeric_limits<double>::quiet_NaN();
+double FootprintCollisionChecker::distanceToLethal(double wx, double wy) const {
+  if (!cf_ || !cf_->valid())
+    return std::numeric_limits<double>::quiet_NaN();
+  if (!map_ || !map_->valid())
+    return std::numeric_limits<double>::quiet_NaN();
   int cx = 0;
   int cy = 0;
-  if (!map_->worldToGrid(wx, wy, cx, cy)) return 0.0;   // 图外：按"贴着障碍"算
+  if (!map_->worldToGrid(wx, wy, cx, cy))
+    return 0.0; // 图外：按"贴着障碍"算
   return cf_->distanceToLethal(cx, cy);
 }
 
-void FootprintCollisionChecker::rectOffsets(double yaw, std::vector<Cell> & out,
-                                            const FootprintParams * fp) const
-{
+void FootprintCollisionChecker::rectOffsets(double yaw, std::vector<Cell> &out,
+                                            const FootprintParams *fp) const {
   out.clear();
-  if (!map_ || !map_->valid()) return;
-  const FootprintParams & f = (fp != nullptr) ? *fp : fp_eff_;
+  if (!map_ || !map_->valid())
+    return;
+  const FootprintParams &f = (fp != nullptr) ? *fp : fp_eff_;
 
   const double c = std::cos(yaw);
   const double s = std::sin(yaw);
   const double ux = c;
-  const double uy = s;              // 长轴 = 朝向
+  const double uy = s; // 长轴 = 朝向
   const double hu = f.halfLength();
   const double hv = f.halfWidth();
 
@@ -136,142 +142,156 @@ void FootprintCollisionChecker::rectOffsets(double yaw, std::vector<Cell> & out,
   }
 }
 
-void FootprintCollisionChecker::buildDirectionOffsets()
-{
-  for (auto & v : dir_offsets_) v.clear();
-  if (!map_ || !map_->valid()) return;
+void FootprintCollisionChecker::buildDirectionOffsets() {
+  for (auto &v : dir_offsets_)
+    v.clear();
+  if (!map_ || !map_->valid())
+    return;
   for (int k = 0; k < 8; ++k) {
     rectOffsets(k * (M_PI / 4.0), dir_offsets_[static_cast<std::size_t>(k)]);
   }
 }
 
-int FootprintCollisionChecker::directionIndex(double yaw) const
-{
+int FootprintCollisionChecker::directionIndex(double yaw) const {
   const double step = M_PI / 4.0;
   const double q = yaw / step;
   const long k = std::lround(q);
-  if (std::fabs(q - static_cast<double>(k)) > 1e-6) return -1;
+  if (std::fabs(q - static_cast<double>(k)) > 1e-6)
+    return -1;
   long idx = k % 8;
-  if (idx < 0) idx += 8;
+  if (idx < 0)
+    idx += 8;
   return static_cast<int>(idx);
 }
 
-std::size_t FootprintCollisionChecker::offsetsAtYaw(double yaw) const
-{
+std::size_t FootprintCollisionChecker::offsetsAtYaw(double yaw) const {
   const int dir = directionIndex(yaw);
-  if (dir >= 0) return dir_offsets_[static_cast<std::size_t>(dir)].size();
+  if (dir >= 0)
+    return dir_offsets_[static_cast<std::size_t>(dir)].size();
   std::vector<Cell> tmp;
   rectOffsets(yaw, tmp);
   return tmp.size();
 }
 
-bool FootprintCollisionChecker::fullCheckAtCell(int cx, int cy, double yaw,
-                                               const FootprintParams * fp) const
-{
+bool FootprintCollisionChecker::fullCheckAtCell(
+    int cx, int cy, double yaw, const FootprintParams *fp) const {
   ++full_checks_;
   // 用外部 footprint（例如"去掉 safe_margin"）：预计算表不适用，直接算
   if (fp != nullptr) {
     std::vector<Cell> offs;
     rectOffsets(yaw, offs, fp);
-    for (const Cell & o : offs) {
-      if (cellLethal(cx + o.dx, cy + o.dy)) return true;
+    for (const Cell &o : offs) {
+      if (cellLethal(cx + o.dx, cy + o.dy))
+        return true;
     }
     return false;
   }
   // override 生效期间同样不能用预计算表（表是按原 margin 建的）
   const int dir = margin_overridden_ ? -1 : directionIndex(yaw);
   if (dir >= 0) {
-    for (const Cell & o : dir_offsets_[static_cast<std::size_t>(dir)]) {
-      if (cellLethal(cx + o.dx, cy + o.dy)) return true;
+    for (const Cell &o : dir_offsets_[static_cast<std::size_t>(dir)]) {
+      if (cellLethal(cx + o.dx, cy + o.dy))
+        return true;
     }
     return false;
   }
   // 非 8 方向之一（终点/剪枝用）：临时算一次（每次几十个格子，可接受）
   std::vector<Cell> offs;
   rectOffsets(yaw, offs);
-  for (const Cell & o : offs) {
-    if (cellLethal(cx + o.dx, cy + o.dy)) return true;
+  for (const Cell &o : offs) {
+    if (cellLethal(cx + o.dx, cy + o.dy))
+      return true;
   }
   return false;
 }
 
-bool FootprintCollisionChecker::hasMap() const
-{
+bool FootprintCollisionChecker::hasMap() const {
   return map_ != nullptr && map_->valid();
 }
 
-bool FootprintCollisionChecker::poseInCollision(double wx, double wy, double yaw) const
-{
-  if (!map_ || !map_->valid()) return true;
+bool FootprintCollisionChecker::poseInCollision(double wx, double wy,
+                                                double yaw) const {
+  if (!map_ || !map_->valid())
+    return true;
   int cx = 0;
   int cy = 0;
-  if (!map_->worldToGrid(wx, wy, cx, cy)) return true;   // 图外 = 碰撞
+  if (!map_->worldToGrid(wx, wy, cx, cy))
+    return true; // 图外 = 碰撞
 
-  if (!fp_eff_.enable) return cellLethal(cx, cy);          // 退化为点判定
+  if (!fp_eff_.enable)
+    return cellLethal(cx, cy); // 退化为点判定
 
-  // ---- 快路径：一次查表 + 两个阈值（override 生效时 fp_eff_.fast_path 已置 false）----
+  // ---- 快路径：一次查表 + 两个阈值（override 生效时 fp_eff_.fast_path 已置
+  // false）----
   if (fp_eff_.fast_path && cf_ != nullptr && cf_->valid() &&
-      cf_->width() == map_->width() && cf_->height() == map_->height())
-  {
+      cf_->width() == map_->width() && cf_->height() == map_->height()) {
     const double offs = std::hypot(fp_eff_.offset_x, fp_eff_.offset_y);
     if (cf_->lowerBoundM(cx, cy) - offs >= fp_eff_.circumscribedRadius()) {
-      return false;                                      // 任何朝向都安全
+      return false; // 任何朝向都安全
     }
     if (cf_->upperBoundM(cx, cy) + offs < fp_eff_.inscribedRadius()) {
-      return true;                                       // 任何朝向都碰撞
+      return true; // 任何朝向都碰撞
     }
   }
   return fullCheckAtCell(cx, cy, yaw);
 }
 
 bool FootprintCollisionChecker::poseInCollisionNoMargin(double wx, double wy,
-                                                       double yaw) const
-{
+                                                        double yaw) const {
   return poseInCollisionAtMargin(wx, wy, yaw, 0.0);
 }
 
 bool FootprintCollisionChecker::poseInCollisionAtMargin(double wx, double wy,
-                                                       double yaw,
-                                                       double margin) const
-{
-  if (!map_ || !map_->valid()) return true;
+                                                        double yaw,
+                                                        double margin) const {
+  if (!map_ || !map_->valid())
+    return true;
   int cx = 0;
   int cy = 0;
-  if (!map_->worldToGrid(wx, wy, cx, cy)) return true;   // 图外 = 碰撞
-  if (!fp_.enable) return cellLethal(cx, cy);            // 退化为点判定
+  if (!map_->worldToGrid(wx, wy, cx, cy))
+    return true; // 图外 = 碰撞
+  if (!fp_.enable)
+    return cellLethal(cx, cy); // 退化为点判定
   FootprintParams f0 = fp_;
-  f0.safe_margin = margin;   // 0 = 真实轮廓；负 = 把轮廓缩小（问“穿透多深”）
-  f0.fast_path = false;      // 快路径表是按含余量的 footprint 建的
+  f0.safe_margin = margin; // 0 = 真实轮廓；负 = 把轮廓缩小（问“穿透多深”）
+  f0.fast_path = false;    // 快路径表是按含余量的 footprint 建的
   return fullCheckAtCell(cx, cy, yaw, &f0);
 }
 
-double FootprintCollisionChecker::signedClearanceAt(double wx, double wy, double yaw,
-                                                    double max_search) const
-{
-  if (max_search <= 0.0) return 0.0;
-  if (!map_ || !map_->valid()) return -max_search;
+double FootprintCollisionChecker::signedClearanceAt(double wx, double wy,
+                                                    double yaw,
+                                                    double max_search) const {
+  if (max_search <= 0.0)
+    return 0.0;
+  if (!map_ || !map_->valid())
+    return -max_search;
 
   // 轮廓判定被关掉时，margin 不参与判定 ⇒ 二分没有意义（退化点判定）
-  if (!fp_.enable) return pointLethal(wx, wy) ? -max_search : max_search;
+  if (!fp_.enable)
+    return pointLethal(wx, wy) ? -max_search : max_search;
 
-  // ---- 快路径：最近致命格中心距离 d ≥ reach0 + e + max_search ⇒ 任何朝向都够开阔
+  // ---- 快路径：最近致命格中心距离 d ≥ reach0 + e + max_search ⇒
+  // 任何朝向都够开阔
   if (cf_ != nullptr && cf_->valid() && cf_->width() == map_->width() &&
-      cf_->height() == map_->height())
-  {
-    const double d = distanceToLethal(wx, wy);          // NaN = 拿不到距离场
+      cf_->height() == map_->height()) {
+    const double d = distanceToLethal(wx, wy); // NaN = 拿不到距离场
     if (!std::isnan(d)) {
       const double reach0 = std::hypot(0.5 * fp_.length, 0.5 * fp_.width) +
                             std::hypot(fp_.offset_x, fp_.offset_y);
-      if (d - reach0 - cf_->marginM() >= max_search) return max_search;
+      if (d - reach0 - cf_->marginM() >= max_search)
+        return max_search;
     }
   }
 
-  // ---- 二分：free(m) = !poseInCollisionAtMargin(m) 对 m 单调递减（m↑ ⇒ 轮廓↑ ⇒ 更易碰）
-  if (!poseInCollisionAtMargin(wx, wy, yaw, max_search)) return max_search;   // 开阔、饱和
-  if (poseInCollisionAtMargin(wx, wy, yaw, -max_search)) return -max_search;  // 穿透很深、饱和
+  // ---- 二分：free(m) = !poseInCollisionAtMargin(m) 对 m 单调递减（m↑ ⇒ 轮廓↑
+  // ⇒ 更易碰）
+  if (!poseInCollisionAtMargin(wx, wy, yaw, max_search))
+    return max_search; // 开阔、饱和
+  if (poseInCollisionAtMargin(wx, wy, yaw, -max_search))
+    return -max_search; // 穿透很深、饱和
 
-  double lo = -max_search;   // free(lo) = true
-  double hi = max_search;    // free(hi) = false
+  double lo = -max_search; // free(lo) = true
+  double hi = max_search;  // free(hi) = false
   for (int i = 0; i < 14; ++i) {
     const double mid = 0.5 * (lo + hi);
     if (poseInCollisionAtMargin(wx, wy, yaw, mid)) {
@@ -283,9 +303,9 @@ double FootprintCollisionChecker::signedClearanceAt(double wx, double wy, double
   return lo;
 }
 
-void FootprintCollisionChecker::cornerWorld(double x, double y, double yaw, int i,
-                                            double & ox, double & oy) const
-{
+void FootprintCollisionChecker::cornerWorld(double x, double y, double yaw,
+                                            int i, double &ox,
+                                            double &oy) const {
   const double c = std::cos(yaw);
   const double s = std::sin(yaw);
   const double hu = fp_.halfLength();
@@ -298,17 +318,16 @@ void FootprintCollisionChecker::cornerWorld(double x, double y, double yaw, int 
 }
 
 void FootprintCollisionChecker::footprintCorners(double x, double y, double yaw,
-                                                double out[8]) const
-{
+                                                 double out[8]) const {
   for (int i = 0; i < 4; ++i) {
     cornerWorld(x, y, yaw, i, out[2 * i], out[2 * i + 1]);
   }
 }
 
 bool FootprintCollisionChecker::lineHitsLethal(double x0, double y0, double x1,
-                                               double y1) const
-{
-  if (!map_ || !map_->valid()) return true;
+                                               double y1) const {
+  if (!map_ || !map_->valid())
+    return true;
 
   double gx0 = 0.0;
   double gy0 = 0.0;
@@ -322,20 +341,26 @@ bool FootprintCollisionChecker::lineHitsLethal(double x0, double y0, double x1,
   const double dxg = gx1 - gx0;
   const double dyg = gy1 - gy0;
 
-  if (cellLethal(x, y)) return true;
-  if (std::fabs(dxg) < 1e-12 && std::fabs(dyg) < 1e-12) return false;
+  if (cellLethal(x, y))
+    return true;
+  if (std::fabs(dxg) < 1e-12 && std::fabs(dyg) < 1e-12)
+    return false;
 
   const int stepx = (dxg > 0) ? 1 : ((dxg < 0) ? -1 : 0);
   const int stepy = (dyg > 0) ? 1 : ((dyg < 0) ? -1 : 0);
   const double inf = std::numeric_limits<double>::infinity();
   const double tdx = (dxg != 0.0) ? std::fabs(1.0 / dxg) : inf;
   const double tdy = (dyg != 0.0) ? std::fabs(1.0 / dyg) : inf;
-  double tmx = (dxg != 0.0)
-                 ? ((stepx > 0) ? (static_cast<double>(x) + 1.0 - gx0) : (gx0 - x)) / std::fabs(dxg)
-                 : inf;
-  double tmy = (dyg != 0.0)
-                 ? ((stepy > 0) ? (static_cast<double>(y) + 1.0 - gy0) : (gy0 - y)) / std::fabs(dyg)
-                 : inf;
+  double tmx =
+      (dxg != 0.0)
+          ? ((stepx > 0) ? (static_cast<double>(x) + 1.0 - gx0) : (gx0 - x)) /
+                std::fabs(dxg)
+          : inf;
+  double tmy =
+      (dyg != 0.0)
+          ? ((stepy > 0) ? (static_cast<double>(y) + 1.0 - gy0) : (gy0 - y)) /
+                std::fabs(dyg)
+          : inf;
 
   // Amanatides & Woo：逐格推进（不靠采样，因此不会穿过单格厚的薄墙）
   const long max_steps = static_cast<long>(std::fabs(dxg) + std::fabs(dyg)) + 4;
@@ -350,24 +375,29 @@ bool FootprintCollisionChecker::lineHitsLethal(double x0, double y0, double x1,
       y += stepy;
       tmy += tdy;
     }
-    if (t > 1.0) break;
-    if (cellLethal(x, y)) return true;
+    if (t > 1.0)
+      break;
+    if (cellLethal(x, y))
+      return true;
   }
   return false;
 }
 
 bool FootprintCollisionChecker::edgeInCollision(double x0, double y0, double x1,
-                                                double y1) const
-{
+                                                double y1) const {
   // 整条边用同一个 yaw = 线段方向：机器人是"直线行驶 + 到点再原地转"，
   // 不是"边平移边旋转"。两端各查一次位姿，中间靠中心线与四角轨迹覆盖。
   const double yaw = std::atan2(y1 - y0, x1 - x0);
-  if (poseInCollision(x0, y0, yaw)) return true;
-  if (poseInCollision(x1, y1, yaw)) return true;
-  if (!fp_.enable || !fp_.check_edges) return false;
+  if (poseInCollision(x0, y0, yaw))
+    return true;
+  if (poseInCollision(x1, y1, yaw))
+    return true;
+  if (!fp_.enable || !fp_.check_edges)
+    return false;
 
   // 中心线：车体中心扫过的路径
-  if (lineHitsLethal(x0, y0, x1, y1)) return true;
+  if (lineHitsLethal(x0, y0, x1, y1))
+    return true;
 
   // 四角轨迹：挡住"两端都不碰、但中间擦角"的情况
   for (int i = 0; i < 4; ++i) {
@@ -377,9 +407,10 @@ bool FootprintCollisionChecker::edgeInCollision(double x0, double y0, double x1,
     double by = 0.0;
     cornerWorld(x0, y0, yaw, i, ax, ay);
     cornerWorld(x1, y1, yaw, i, bx, by);
-    if (lineHitsLethal(ax, ay, bx, by)) return true;
+    if (lineHitsLethal(ax, ay, bx, by))
+      return true;
   }
   return false;
 }
 
-}  // namespace pnc_2d
+} // namespace pnc_2d

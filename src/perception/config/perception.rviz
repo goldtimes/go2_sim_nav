@@ -189,7 +189,7 @@ Visualization Manager:
       Buffer Length: 1
       Class: rviz_default_plugins/Path
       Color: 25; 255; 0
-      Enabled: true
+      Enabled: false
       Head Diameter: 0.30000001192092896
       Head Length: 0.20000000298023224
       Length: 0.30000001192092896
@@ -212,7 +212,7 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /lightning/path
-      Value: true
+      Value: false
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -422,7 +422,12 @@ Visualization Manager:
       Enabled: true
       Name: goal
       Namespaces:
-        {}
+        footprint: true
+        goal: true
+        start: true
+        traj_opt: true
+        traj_raw: true
+        traj_stats: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -488,16 +493,16 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/XYOrbit
-      Distance: 25.843276977539062
+      Distance: 13.976301193237305
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 6.3004961013793945
-        Y: -4.484282493591309
-        Z: -1.4118403669272084e-05
+        X: 0.8419504165649414
+        Y: -2.062720775604248
+        Z: -1.6979425708996132e-05
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
@@ -506,7 +511,7 @@ Visualization Manager:
       Pitch: 1.5697963237762451
       Target Frame: <Fixed Frame>
       Value: XYOrbit (rviz_default_plugins)
-      Yaw: 4.795976161956787
+      Yaw: 4.620972156524658
     Saved: ~
 Window Geometry:
   Displays:

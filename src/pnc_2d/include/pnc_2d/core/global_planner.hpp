@@ -76,6 +76,11 @@ public:
 
   /// 机器人能否从位姿 a 直线移动到 b（含 footprint 扫掠检查），供剪枝使用
   bool lineIsCollisionFree(const Pose2D &a, const Pose2D &b) const;
+  /// 同上，但用**指定的** safe_margin（剪枝时要求更宽余量用；margin = 0.05 时
+  /// 与 `lineIsCollisionFree` 同一个判据，只是改成沿弦密采样位姿 —— 比
+  /// "两端 + 中心线 + 四角轨迹"更不容易漏掉"采样点之间擦角"）。
+  bool chordIsFreeAtMargin(const Pose2D &a, const Pose2D &b,
+                           double margin) const;
   /// 纯几何：线段是否穿过硬障碍（不含 footprint）
   bool lineHitsHardObstacle(double x0, double y0, double x1, double y1) const;
   /// 线段穿过的格子上的软代价之和（用于剪枝时保护"绕开软代价区"的收益）
@@ -115,6 +120,15 @@ protected:
   FootprintParams fp_;
   std::string prune_mode_{"line_of_sight"};
   double prune_max_span_m_{8.0};
+  /// ★ **剪枝余量**（2026-xx）：line_of_sight 剪枝把"绕开障碍的折线"换成长弦，
+  ///   长弦会切内角 ⇒ **余量变小**。实测（目标 (14.27, 2.87)，Go2 走廊）：
+  ///   原始 A* 节点序列的最窄余量 13 cm，剪枝后只剩 8 cm（路程只短 4%）。
+  ///   8 cm 在"MPC 横向误差 5–20 cm"的量级以下 ⇒ 看上去合法、实际跟踪时就撞。
+  ///   这里要求**弦**比 A* 节点检查再多撑开这么多（m）才接受；撑不开就退回
+  ///   走原节点 ⇒ **永远不会让一条可行路变不可行**（只是不抄近道了）。
+  ///   为什么不直接把 `footprint.safe_margin` 调大：那个是**硬判据**，会把
+  ///   用户定的“最窄可通 0.60 m”一起掐死；这里只约束**可选的**捷径。
+  double prune_extra_margin_{0.0};
   double path_resample_spacing_{0.0};
   bool keep_start_yaw_{true};
   /// ★ **净距偏好**（2026-09-23 用户要求："让局部远离障碍/禁行区"）
@@ -126,7 +140,8 @@ protected:
   ///   0.60 m ⇒ 硬判据必须停在 `半宽 + margin + inflate = 0.30 m`）；
   ///   而这里是**偏好**：窄通道仍可走，只是代价高一点 ⇒ 空处自动走中间，
   ///   窄处照样过得去。
-  /// 另外一个必要性：全局图（map_server 膨胀后）往往是全 0/100、**没有软代价格**
+  /// 另外一个必要性：全局图（map_server 膨胀后）往往是全
+  /// 0/100、**没有软代价格**
   ///   ⇒ `common.soft_cost_weight` 实际上是空转的；这里直接用精确距离场算，与
   ///   地图原始值无关，一定生效。
   double clearance_prefer_dist_{0.0};

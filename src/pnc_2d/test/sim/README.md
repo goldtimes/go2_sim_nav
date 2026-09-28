@@ -32,7 +32,9 @@ python3 src/pnc_2d/test/sim/park_open.py                # 工具：把车开到�
 `test_drive_goal.py` 在稳态窗口里报两个数：
 · **ω 反向频率**（rad/s 指令每秒变号多少次，幅值 <0.02 忽略）—— 真正的“左右打摆”；
 · **RMS|ω|** —— 越大说明越是“顶满方向”而不是“小幅修正”。
-反向频率 > 1 Hz 会多打一行 ⚠ 提示查 `free_lat_deadband`/`free_w_max`。
+反向频率 > 1 Hz 会多打一行 ⚠ 提示查 `free_lat_scale`/`free_w_max`
+（`free_lat_deadband` 已于 2026-09-28 置 0：实测它把到点横向精度写死成 0.10 m，
+而车体摆动几乎不受影响 —— 见 doc/minco_trajectory_plan.md §M5.0.5）。
 **故意不设硬门限**：先看数再定线（反过来容易把正常行为判成失败）；
 门槛要真机/仿真跑几轮后标定，标定完再把它变成断言。
 

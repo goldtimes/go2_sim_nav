@@ -167,41 +167,25 @@ bool MpcLocalPlanner::configure(const ParamReader &params) {
   p_.constrain_control_rate =
       b("constrain_control_rate", p_.constrain_control_rate);
   p_.reference_speed = d("reference_speed", p_.reference_speed);
-  p_.use_upstream_profile =
-      b("use_upstream_profile", p_.use_upstream_profile);
+  p_.use_upstream_profile = b("use_upstream_profile", p_.use_upstream_profile);
   p_.lat_acc_max = d("lat_acc_max", p_.lat_acc_max);
   p_.brake_acc = d("brake_acc", p_.brake_acc);
   p_.approach_dist = d("approach_dist", p_.approach_dist);
   p_.approach_speed = d("approach_speed", p_.approach_speed);
   p_.crawl_speed = d("crawl_speed", p_.crawl_speed);
   p_.stop_coast = d("stop_coast", p_.stop_coast);
-  p_.align_in_place_deg = d("align_in_place_deg", p_.align_in_place_deg);
-  p_.align_exit_deg = d("align_exit_deg", p_.align_exit_deg);
-  p_.align_gain = d("align_gain", p_.align_gain);
-  p_.align_min_clearance = d("align_min_clearance", p_.align_min_clearance);
-  p_.goal_yaw_tolerance_deg =
-      d("goal_yaw_tolerance_deg", p_.goal_yaw_tolerance_deg);
-  p_.goal_yaw_align_distance =
-      d("goal_yaw_align_distance", p_.goal_yaw_align_distance);
-  p_.align_w_min = d("align_w_min", p_.align_w_min);
-  p_.goal_yaw_align_timeout =
-      d("goal_yaw_align_timeout", p_.goal_yaw_align_timeout);
+  // 对正（align_*）与目标朝向（goal_yaw_*）已搬到
+  // local/heading_shim_planner（M5.2）
   p_.free_lat_scale = d("free_lat_scale", p_.free_lat_scale);
   p_.free_yaw_scale = d("free_yaw_scale", p_.free_yaw_scale);
   p_.free_lat_deadband = d("free_lat_deadband", p_.free_lat_deadband);
   p_.free_w_max = d("free_w_max", p_.free_w_max);
-  if (p_.goal_yaw_tolerance_deg < 0.0)
-    p_.goal_yaw_tolerance_deg = 0.0;
-  if (p_.goal_yaw_align_distance < 0.0)
-    p_.goal_yaw_align_distance = 0.0;
   if (p_.free_lat_scale < 0.0)
     p_.free_lat_scale = 0.0;
   if (p_.free_yaw_scale < 0.0)
     p_.free_yaw_scale = 0.0;
   if (p_.free_lat_deadband < 0.0)
     p_.free_lat_deadband = 0.0;
-  if (p_.align_w_min < 0.0)
-    p_.align_w_min = 0.0;
   p_.curvature_lookahead = d("curvature_lookahead", p_.curvature_lookahead);
   p_.back_window = d("back_window", p_.back_window);
   p_.corridor_min_tolerance =
@@ -447,9 +431,6 @@ void MpcLocalPlanner::reset() {
   has_progress_ = false;
   predicted_.clear();
   smooth_v_ = smooth_w_ = 0.0;
-  aligning_ = false;
-  goal_aligning_ = false;
-  goal_align_best_deg_ = 1e9;   // 新任务重新计“无进展超时”
   info_ = MpcSolveInfo{};
 }
 
@@ -636,13 +617,15 @@ double MpcLocalPlanner::speedLimitAt(double s) const {
   //   ② `stop_coast`/`approach_dist`/`approach_speed`/`crawl_speed` 全是**底盘
   //      标定**量，上游结构上不可能知道；
   //   ③ 它是取 min，**会不会打架取决于两个数的相对大小**（这里曾经写错过）：
-  //      · 本地 `brake_acc` > `traj.a_max` ⇒ 上游总是更紧，本地只在截断/降级时接手；
-  //      · **当前配置恰好相反**：`go2_run.yaml` 的 `local_mpc.brake_acc: 0.15`
+  //      · 本地 `brake_acc` > `traj.a_max` ⇒
+  //      上游总是更紧，本地只在截断/降级时接手； ·
+  //      **当前配置恰好相反**：`go2_run.yaml` 的 `local_mpc.brake_acc: 0.15`
   //        远小于 `traj.a_max: 0.50` ⇒ 靠近目标那一段**本地制动比上游紧**，
   //        于是它会盖住上游剖面（M4.4 的"参考偏差"在终点段必然 >0）。
   //        那是**有意的**：0.15 是底盘实测的贴拢减速度，上游结构上不知道它。
   //      ⇒ 想判断"剖面的终点减速有没有被用上"，看 `参考偏差` 是**全程都大**
-  //        还是**只有终点段大**：全程大 = 别的地方在压速度；只有终点段大 = 正常。
+  //        还是**只有终点段大**：全程大 = 别的地方在压速度；只有终点段大 =
+  //        正常。
   //
   // ★ 剩余弧长要扣掉 stop_coast：那是"指令归零后底盘还会自己走的距离"，让惯性替
   //   我们把最后几厘米走完，指令就能提前归零（否则一定冲过目标）。
@@ -656,11 +639,36 @@ double MpcLocalPlanner::speedLimitAt(double s) const {
   //     · approach_speed 把终点段整体压慢 ⇒ 下停止命令时速度已经很低；
   //     · crawl_speed 保证参考**在惯性段之前不会归零**（否则车会差几厘米停住、
   //       完成判据永远不满足 ⇒ 任务卡死等着超时）。
+  //
+  // ★★ 2026-09-28（M5.3）：**爬行保底与"慢速贴拢段"解耦**，而且出厂配置把
+  //    `approach_dist` 关了。原因是量出来一个**自相矛盾**的剖面（别改回去）：
+  //     · 钳位是**阶跃**的：`s_rem ≤ approach_dist` 那一刻参考从制动剖面的
+  //       `sqrt(2·brake_acc·(approach_dist − stop_coast))` 直接跳到
+  //       approach_speed。 实测（Go2：brake_acc 0.15 / approach_dist 0.15 /
+  //       approach_speed 0.03） 那一步要求 **0.49 m/s²**，而底盘能力是 **0.15
+  //       m/s²**（差 3.3 倍）。
+  //     · 于是参考在那一小段上**物理上跟不上**：实测终点前 7 cm 时
+  //     `v_ref=0.030`
+  //       而车还是 **0.24 m/s**、控制器还发 0.18 ⇒ 高速贴到目标 ⇒ 判定后滑行
+  //       8~11 cm ⇒ 停点误差在 6 mm~43 mm 之间随机（同一套代码）。
+  //     · 想让它不是阶跃就得 `approach_speed ≥ sqrt(2·brake_acc·(dist −
+  //     stop_coast))`
+  //       —— 那正好等于**制动剖面在该点的值**，也就是钳位**什么都不做**。
+  //       ⇒ "慢速贴拢段"只可能是"阶跃（跟不上）"或"空操作"，没有第三种；
+  //         所以正解是**不设它**，让制动剖面自己减速（它是自洽的：按同一
+  //         `brake_acc` 减到目标前 `stop_coast` 处归零）。
+  //   爬行保底**不能跟着一起关**：它防的是另一件事（参考先于目标归零 ⇒
+  //   车差几厘米 停死 ⇒ 到点判据永不满足）。原来它写在 approach 块里，关掉
+  //   approach 就会 一起失效 —— 这是个隐藏耦合，所以在这里拆开。
+  if (p_.crawl_speed > 0.0 && s_rem > p_.stop_coast) {
+    const double floor_v = (p_.approach_dist > 0.0 && p_.approach_speed > 0.0)
+                               ? std::min(p_.crawl_speed, p_.approach_speed)
+                               : p_.crawl_speed;
+    v = std::max(v, std::min(floor_v, p_.v_max));
+  }
   if (p_.approach_dist > 0.0 && p_.approach_speed > 0.0 &&
       s_rem <= p_.approach_dist) {
     v = std::min(v, p_.approach_speed);
-    if (p_.crawl_speed > 0.0 && s_rem > p_.stop_coast)
-      v = std::max(v, std::min(p_.crawl_speed, p_.approach_speed));
   }
 
   // 降级（缺距离场）：只看硬判定走路，必须慢
@@ -1061,7 +1069,8 @@ bool MpcLocalPlanner::buildQp(const std::vector<MpcReferencePoint> &ref,
   }
   info_.curv = curv_max;
 
-  // ★ M4.4（R9）：**剖面一致性** —— 分两个数，**不要合成一个**（2026-09-24 实测踩过）。
+  // ★ M4.4（R9）：**剖面一致性** —— 分两个数，**不要合成一个**（2026-09-24
+  // 实测踩过）。
   //   ① `prof_dev`       = |v_ref − v_剖面(s)| / max(v_剖面, 0.1)
   //         "剖面被采纳了吗 / 被谁的限速盖住了"。这是 M4 的验收口径。
   //   ② `prof_track_dev` = |v_实测 − v_ref| / max(v_ref, 0.1)
@@ -1072,10 +1081,10 @@ bool MpcLocalPlanner::buildQp(const std::vector<MpcReferencePoint> &ref,
   //   分母的 0.10 地板：低速段（终点贴拢 1~5 cm/s）的正常抖动就有这个量级。
   if (hasUpstreamProfile()) {
     info_.prof_v = profile_->speedAt(s0);
-    info_.prof_dev = std::fabs(info_.ref_v - info_.prof_v) /
-                     std::max(info_.prof_v, 0.10);
-    info_.prof_track_dev = std::fabs(info_.v_now - info_.ref_v) /
-                           std::max(info_.ref_v, 0.10);
+    info_.prof_dev =
+        std::fabs(info_.ref_v - info_.prof_v) / std::max(info_.prof_v, 0.10);
+    info_.prof_track_dev =
+        std::fabs(info_.v_now - info_.ref_v) / std::max(info_.ref_v, 0.10);
   } else {
     info_.prof_v = 0.0;
     info_.prof_dev = -1.0; // 不适用（不是"偏差 0"）
@@ -1351,120 +1360,9 @@ std::string MpcLocalPlanner::refClearanceNote() const {
          " m）—— 问题在规划路径/地图与局部距离场不同源，不是控制器";
 }
 
-// 对正用的角速度：`gain·e` 再限幅，**并给一个下限打破底盘死区**。
-//
-// 为什么需要下限（用户 2026-09-23 实测“角度判断太严格导致无法收敛”）：
-// 底盘低速有死区，指令太小时步态/电机根本不动，而 `gain·e` 在 e 接近容差时
-// 给的 ω 很小 ⇒ 车停在容差**外**不再转 ⇒ 到点判定永远不满足。
-// 下限保证“只要决定转，就转到车真的会动”。
-
-double MpcLocalPlanner::alignRate(double e_yaw) const
-{
-  if (std::fabs(e_yaw) < 1e-9)
-    return 0.0;
-  const double want = p_.align_gain * e_yaw;
-  const double lo = std::min(p_.align_w_min, p_.w_max);
-  const double mag = clampValue(std::fabs(want), lo, p_.w_max);
-  return (want < 0.0 ? -1.0 : 1.0) * mag;
-}
-
-// ============================================================================
-// 到点后的目标朝向对正
-// ============================================================================
-//
-// 为什么单独做（用户 2026-09-23 指出）：到点判定原来只管 xy，机头朝哪都算到达；
-// 而任务目标天生带 yaw（面向充电桩/面向通道口/面向装货台）。差速与足式底盘的
-// ω 与 v 解耦、可以原地转，所以正确行为是 **位置到了 → 原地把机头对到目标朝向 →
-// 才算到达**；而对正本身需要净距（矩形车体旋转会扫过外接圆），所以复用
-// align_min_clearance 这个门槛。
-//
-// 目标朝向取**路径最后一点**的 yaw（全局规划把目标 yaw 放在末点），这样
-// "目标朝向"与"跟随的参考"是同一份数据，不需要接口再加一个字段。
-bool MpcLocalPlanner::goalYawAlign(const Pose2D &pose, double remaining,
-                                   LocalPlanResult &out) {
-  const auto t_align = std::chrono::steady_clock::now();
-  const double tol = goalYawTolerance(); // [rad]
-  if (tol <= 0.0 || plan_.size() < 2) {
-    goal_aligning_ = false;
-    return false;
-  }
-  const double goal_yaw = plan_.back().yaw;
-  const double e = wrapAngle(goal_yaw - pose.yaw);
-  const double deg = std::fabs(e) * 180.0 / M_PI;
-  const double tol_deg = tol * 180.0 / M_PI;
-  // 到"终点位置附近"才管朝向：距离还很远时该专心走（否则会提前停下转圈）
-  const double near_dist = std::max(p_.goal_yaw_align_distance, 1e-3);
-  if (remaining > near_dist) {
-    goal_aligning_ = false;
-    return false;
-  }
-  // 滞环：进入容差就退出；退出后要超过容差才重新进入（避免在阈值上抖）
-  const bool want = goal_aligning_ ? deg > 0.5 * tol_deg : deg > tol_deg;
-  if (!want) {
-    goal_aligning_ = false;
-    return false;
-  }
-
-  // 超时：**转不动**才算失败 —— 注意是“**无进展**超时”而不是“墙钟超时”：
-  // 大角度对正（180° @ 0.65 rad/s ≈ 5 s）本来就慢，用墙钟计会把“转得慢但一直在收敛”
-  // 判成失败（用户实测的“无法收敛”指的是**车根本不动**）。所以只要这一段时间内
-  // 偏差没有实质改善（< 2°）才计超时，改善即重新计时。
-  if (!goal_aligning_) {
-    goal_align_since_ = t_align;
-    goal_align_best_deg_ = deg;
-  } else if (deg < goal_align_best_deg_ - 2.0) {
-    goal_align_best_deg_ = deg;
-    goal_align_since_ = t_align;
-  }
-  if (p_.goal_yaw_align_timeout > 0.0) {
-    const double elapsed = std::chrono::duration<double>(
-                               t_align - goal_align_since_)
-                               .count();
-    if (elapsed > p_.goal_yaw_align_timeout) {
-      out.status = LocalStatus::kFailed;
-      out.message =
-          "到点朝向对正超时（" + std::to_string(static_cast<int>(elapsed)) +
-          " s 内偏差没有改善，当前仍差 " + std::to_string(static_cast<int>(deg)) +
-          "° > 容差 " + std::to_string(static_cast<int>(tol_deg)) +
-          "°）—— 检查 align_gain/align_w_min（底盘低速死区）、定位朝向噪声，"
-          "或把 goal_yaw_tolerance_deg 放宽";
-      out.cmd = Twist2D{0.0, 0.0};
-      goal_aligning_ = false;
-      return true;
-    }
-  }
-
-  // 车体是矩形，原地旋转会扫过外接圆：贴得太近就不转（宁可如实报"停不下来对正"）
-  const double clear = (dist_field_ && dist_field_->valid())
-                           ? dist_field_->distance(pose.x, pose.y)
-                           : std::numeric_limits<double>::infinity();
-  if (clear < p_.align_min_clearance) {
-    goal_aligning_ = false;
-    out.status = LocalStatus::kBlocked;
-    out.message = "已到点位置，但净距 " + std::to_string(clear) +
-                  " m < align_min_clearance " +
-                  std::to_string(p_.align_min_clearance) +
-                  " m，无法原地对正到目标朝向（还差 " +
-                  std::to_string(static_cast<int>(deg)) + "°）";
-    out.cmd = Twist2D{0.0, 0.0};
-    return true;
-  }
-
-  goal_aligning_ = true;
-  out.cmd = Twist2D{0.0, alignRate(e)};
-  out.status = LocalStatus::kFollowing;
-  out.message = "已到点，原地对正目标朝向（偏差 " +
-                std::to_string(static_cast<int>(deg)) + "° > " +
-                std::to_string(static_cast<int>(tol_deg)) + "°）";
-  info_.solver_status = "goal-yaw-align";
-  info_.ref_v = 0.0;
-  info_.v_now = v_now_;
-  info_.solve_ms = std::chrono::duration<double, std::milli>(
-                       std::chrono::steady_clock::now() - t_align)
-                       .count();
-  out.stats.solve_ms = info_.solve_ms;
-  return true;
-}
+// 对正与到点朝向已搬到 `local/heading_shim_planner`（M5.2）：
+//   本算法**只做跟踪**，不再拦“大航向差先原地转”与“到点对正目标朝向”。
+//   历史与原因见 `mpc_local_planner.hpp` 的 MpcParams 注释。
 
 // ============================================================================
 // 主入口
@@ -1499,13 +1397,7 @@ LocalPlanResult MpcLocalPlanner::computeCommand(const Pose2D &pose, double dt) {
   // 到终点：把状态交给节点判定（P4 已定"到位判定在节点层兜底"），
   // 这里只报告 + 给零指令。
   const double remaining = std::max(0.0, ref_length_ - s0);
-
-  // ---- 1.5) 到点位置但朝向不对：原地对正到**目标朝向**（见 params 注释）----
-  //   ★ 必须放在下面 `remaining <= 1e-3 → kGoalReached + 零速` **之前**：
-  //     否则算法会把车停住、节点又不算到达（朝向不满足）⇒ 双方都在等对方 ⇒
-  //     任务卡死到超时。
-  if (goalYawAlign(pose, remaining, out))
-    return out;
+  info_.e_yaw0 = wrapAngle(pose.yaw - sampleAt(s0, p_.curvature_lookahead).yaw);
 
   if (remaining <= 1e-3) {
     out.status = LocalStatus::kGoalReached;
@@ -1522,47 +1414,11 @@ LocalPlanResult MpcLocalPlanner::computeCommand(const Pose2D &pose, double dt) {
     return out;
   }
 
-  // ---- 2.5) 大航向偏差：先原地对正机头，再走 ----
-  //
-  //   ★ 为什么单独做一个模式（实测根因）：参考折线是"沿路径前进"的语义，车头与
-  //     参考方向差几十度时，MPC 去找的解都是"边转边走"的——而“走”会让预测轨迹
-  //     扫出走廊/障碍硬界，于是代价上"原地不动"更便宜：**车拒动**。实测航向差
-  //     7/15/25° 时用满加速能力起步，40/60° 时 `cmd v=0`（`StrictCorridor-
-  //     WithHeadingOffsetStillDrives` 把这个现象钉住过）。可是差速/足式底盘的
-  //     ω 与 v 是解耦的，原地转正物理上完全可行 ⇒ 正确行为是“先对正再走”。
-  {
-    const double e_yaw0 = wrapAngle(pose.yaw - window[0].yaw);
-    info_.e_yaw0 = e_yaw0; // 诊断行要用（即使本周期不走 QP）
-    const double deg = std::fabs(e_yaw0) * 180.0 / M_PI;
-    const bool want =
-        p_.align_in_place_deg > 0.0 &&
-        (aligning_ ? deg > p_.align_exit_deg : deg > p_.align_in_place_deg);
-    if (!want) {
-      aligning_ = false;
-    } else {
-      // 车体是矩形，原地旋转会扫过外接圆：贴得太近就不转（宁可停也不剧蹭）
-      const double clear = (dist_field_ && dist_field_->valid())
-                               ? dist_field_->distance(pose.x, pose.y)
-                               : std::numeric_limits<double>::infinity();
-      if (clear >= p_.align_min_clearance) {
-        aligning_ = true;
-        out.cmd = Twist2D{0.0, alignRate(-e_yaw0)};
-        out.status = LocalStatus::kFollowing;
-        out.message = "原地对正机头（偏差 " +
-                      std::to_string(static_cast<int>(deg)) + "° > " +
-                      std::to_string(static_cast<int>(p_.align_in_place_deg)) +
-                      "°）—— 对正后再沿路径走";
-        info_.solver_status = "align-in-place";
-        info_.ref_v = 0.0;
-        info_.v_now = v_now_;
-        info_.solve_ms = std::chrono::duration<double, std::milli>(
-                             std::chrono::steady_clock::now() - t0)
-                             .count();
-        out.stats.solve_ms = info_.solve_ms;
-        return out;
-      }
-    }
-  }
+  // ---- 2.5) 航向偏差诊断 ----
+  //   ★ 曾经这里还有"大航向偏差先原地对正"（align_in_place_deg）。已搬到
+  //     `local/heading_shim_planner`（M5.2）。本算法只把偏差报出来，
+  //     让"谁负责转向"这件事只有一处。
+  info_.e_yaw0 = wrapAngle(pose.yaw - window[0].yaw);
 
   // ---- 3) 建 QP 并求解 ----
   const bool route = route_mode_ && corridor_ != nullptr;
@@ -1577,7 +1433,8 @@ LocalPlanResult MpcLocalPlanner::computeCommand(const Pose2D &pose, double dt) {
   if (!route && p_.free_lat_deadband > 0.0 && window.size() > 1) {
     const double n0x = -std::sin(window[0].yaw);
     const double n0y = std::cos(window[0].yaw);
-    const double lat = n0x * (pose.x - window[0].x) + n0y * (pose.y - window[0].y);
+    const double lat =
+        n0x * (pose.x - window[0].x) + n0y * (pose.y - window[0].y);
     const double shift =
         clampValue(lat, -p_.free_lat_deadband, p_.free_lat_deadband);
     if (std::fabs(shift) > 1e-9) {
@@ -1709,8 +1566,9 @@ LocalPlanResult MpcLocalPlanner::computeCommand(const Pose2D &pose, double dt) {
   out.stats.progress = info_.progress;
   out.stats.corridor_violations = info_.corridor_violations;
   out.stats.time_to_goal = v_cmd > 0.05 ? remaining / v_cmd : 0.0;
-  // M4.4（R9）：剖面一致性（分"参考偏差"与"跟踪偏差"，`info_` 在 buildQp 里填好）。
-  // ★ 只在**真正执行了跟踪**的路径上回填：原地对正 / 到点停车那些分支里
+  // M4.4（R9）：剖面一致性（分"参考偏差"与"跟踪偏差"，`info_` 在 buildQp
+  // 里填好）。 ★ 只在**真正执行了跟踪**的路径上回填：原地对正 /
+  // 到点停车那些分支里
   //   v 本来就是 0，拿它去比剖面会得到 100% 的**假偏差**。
   out.stats.profile_dev = info_.prof_dev;
   out.stats.profile_v = info_.prof_v;

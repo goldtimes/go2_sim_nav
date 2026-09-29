@@ -206,6 +206,25 @@ struct MappingParameters {
    * 与索引列表比对，不一致打 ERROR。用于验证增量索引没有漏记。
    */
   bool verify_occ_idx_;
+
+  /* ---------- 占据体素“时效衰减”（decay）----------
+   * 治的是：运动物体离开后，它曾占据过的体素**再也收不到 miss** ⇒ 永远 occupied。
+   * 根因是“写 occupied 容易、清 free 难”：清 free 需要一条射线**恰好穿过**
+   * 这个 0.1 m 体素，而点云是降采样过的（`filter_size_scan 0.2` ⇒ 2 m 处
+   * 相邻射线间隔 ≈5.7°，一个体素只占 ≈2.9°）⇒ 大量体素不在任何射线路径上。
+   * 实测：残留体素 17/17 个都有“从未被 DDA 穿过”的体素（见
+   * test/sim/obstacle_sweep_probe.py）。
+   *
+   * 做法：给每个体素记“最后一次被**命中**的时刻”，超过 `decay_timeout_s` 就把
+   * log-odds 每帧往回拉 `decay_rate_`。
+   * ★ 用“最后一次命中”而不是“最后一次被穿过”：残留格**恰恰是永不被穿过的**，
+   *   用穿过当判据它永远“刚被观测过”。而真障碍（墙/货架/箱子）在视野内
+   *   **每帧都有回波 ⇒ 每帧被命中** ⇒ 永不超时 ⇒ 不会被误清。
+   */
+  bool decay_enable_;
+  double decay_timeout_s_;  ///< 超过这么久没被命中就开始淡 [s]
+  double decay_rate_;       ///< 每帧减多少 log-odds（≈ p_miss 量级）
+  double decay_max_dist_;   ///< 只对离传感器这么近的体素衰减 [m]（≤0 = 不限）
 };
 
 // intermediate mapping data for fusion
@@ -249,9 +268,22 @@ struct MappingData {
   // flag buffers for speeding up raycasting
 
   vector<short> count_hit_, count_hit_and_miss_;
-  vector<char> flag_traverse_, flag_rayend_;
-  char raycast_num_;
+  /* ★ 帧标记必须是 **int32**，不能用 char：char 每 256 帧回绕一次，回绕时会与
+     256 帧前留下的旧标记“假相等” ⇒ 那一条射线被误判为“本帧已标记”而
+     continue/break，整条射线的命中/清空**静默丢失**（表现就是“有些格子清不掉”，
+     而且带 25.6 s 周期性的味道）。 */
+  vector<int32_t> flag_traverse_, flag_rayend_;
+  int32_t raycast_num_;
   queue<Eigen::Vector3i> cache_voxel_;
+
+  /* 每个体素“最后一次被命中”的时刻 [s]（steady_clock 相对 decay_epoch 的秒数）。
+     超时衰减用，见 MappingParameters 里 decay_* 那段的注释。
+     不随滑动窗口维护：addr↔世界格 是环形映射，滑动时清掉的那条 slab 会在
+     updateSlidingMap() 里被重置为 0；新进入的格本来是未知（不能衰减），
+     一旦变 occupied 必然是刚被命中过（时间戳已刷新）⇒ 陈旧值无害。 */
+  std::vector<float> last_hit_s_;
+  float decay_now_s_{0.f};
+  int decay_num_{0}; ///< 本帧衰减掉的体素数（show_occ_time 时打出来）
 
   // range of updating grid
 
@@ -586,6 +618,11 @@ private:
   // main update process
   void projectDepthImage();
   void raycastProcess();
+  /**
+   * 超时未命中的占据体素往 free 拉（每帧调一次，紧跟 raycastProcess）。
+   * 只遍历占据体素索引列表（通常几千个），代价可忽略。
+   */
+  void decayStaleOccupancy();
 
   inline void inflatePoint(const Eigen::Vector3i &pt, int inf_step_xy,
                            int inf_step_z_up, int inf_step_z_down,

@@ -164,6 +164,23 @@ void GridMap::initMap(rclcpp::Node *node) {
   load_parameter(node_, "grid_map.vis_height", mp_.vis_height_, 0.3);
   load_parameter(node_, "grid_map.show_occ_time", mp_.show_occ_time_, false);
 
+  /* ---------- 占据体素时效衰减（治“运动物体走后留下的幽灵格”）----------
+   * 详细理由见 grid_map.h 里 MappingParameters 的 decay_* 注释与
+   * decayStaleOccupancy()。一句话：那些格**永远不会被射线穿过** ⇒ 永远收不到
+   * miss ⇒ 永远 occupied，只能靠“超过 decay_timeout_s 没再被命中”来遗忘。
+   * 真障碍在视野内每帧都被命中 ⇒ 不会超时 ⇒ 不会被误清（这是选
+   * “命中”而不是“穿过”作判据的原因）。 */
+  load_parameter(node_, "grid_map.decay_enable", mp_.decay_enable_, true);
+  load_parameter(node_, "grid_map.decay_timeout_s", mp_.decay_timeout_s_, 5.0);
+  load_parameter(node_, "grid_map.decay_rate", mp_.decay_rate_, 0.3);
+  load_parameter(node_, "grid_map.decay_max_dist", mp_.decay_max_dist_, -1.0);
+  if (mp_.decay_rate_ < 0.0)
+    mp_.decay_rate_ = 0.0;
+  if (mp_.decay_timeout_s_ < 0.0)
+    mp_.decay_timeout_s_ = 0.0;
+  /* 默认上限 = 2D 高度带的上界（超过它上面的格不影响 2D/规划）不好直接推，
+     所以默认 -1（不限），由 decay_timeout_s 把关。 */
+
   load_parameter(node_, "grid_map.frame_id", mp_.frame_id_, string("world"));
   load_parameter(node_, "grid_map.sliding_map_frame_id",
                  mp_.sliding_map_frame_id_, string("sliding_map"));
@@ -358,8 +375,10 @@ void GridMap::initMap(rclcpp::Node *node) {
 
   md_.count_hit_and_miss_ = vector<short>(buffer_size, 0);
   md_.count_hit_ = vector<short>(buffer_size, 0);
-  md_.flag_rayend_ = vector<char>(buffer_size, -1);
-  md_.flag_traverse_ = vector<char>(buffer_size, -1);
+  md_.flag_rayend_ = vector<int32_t>(buffer_size, -1);
+  md_.flag_traverse_ = vector<int32_t>(buffer_size, -1);
+  /* 时效衰减：每个体素“最后一次被命中”的时刻（0 = 从未，对未占据格无害）*/
+  md_.last_hit_s_.assign(buffer_size, 0.f);
 
   /* 占据/膨胀体素索引（可视化发布用，见头文件注释）*/
   md_.occ_idx_flag_.assign(buffer_size, 0);
@@ -602,6 +621,7 @@ void GridMap::resetAllMapData() {
   std::fill(md_.count_hit_.begin(), md_.count_hit_.end(), 0);
   std::fill(md_.flag_rayend_.begin(), md_.flag_rayend_.end(), -1);
   std::fill(md_.flag_traverse_.begin(), md_.flag_traverse_.end(), -1);
+  std::fill(md_.last_hit_s_.begin(), md_.last_hit_s_.end(), 0.f);
   std::queue<Eigen::Vector3i> empty;
   std::swap(md_.cache_voxel_, empty);
 
@@ -713,6 +733,58 @@ void GridMap::applyOccupancyUpdate(const Eigen::Vector3i &id,
     mark2DColumnDirty(id(0), id(1), id(2));
 }
 
+/**
+ * 占据体素时效衰减：超过 decay_timeout_s 没被“命中”过的占据体素，每帧往 free 拉
+ * decay_rate（log-odds）。
+ *
+ * 为什么必须这样做（而不是等射线来清）：见 grid_map.h 里 decay_* 那段的注释 ——
+ * 运动物体离开后，它曾占据的体素**再也不会有射线穿过**，所以永远收不到 miss。
+ * 实测（test/sim/obstacle_sweep_probe.py + 复刻 DDA）：残留体素 17/17 个都存在
+ * “从未被任何射线穿过”的体素。
+ *
+ * 安全性：判据是“最后一次被**命中**”。真障碍（墙/货架/箱子）在视野内每帧都有
+ * 回波 ⇒ 时间戳每帧刷新 ⇒ 永远不会超时；只有“不再被任何回波照到”的格才会淡。
+ * 代价：O(占据体素数)，通常几千个 ⇒ 每帧 <0.1 ms（列表会含坟墓，扫描时跳过）。
+ */
+void GridMap::decayStaleOccupancy() {
+  if (!mp_.decay_enable_ || mp_.decay_rate_ <= 0.0 || md_.last_hit_s_.empty())
+    return;
+  if (md_.raycast_num_ <= 1) // 第一帧没有“历史”可言
+    return;
+
+  const float now = md_.decay_now_s_;
+  const double rate = mp_.decay_rate_;
+  const double max_d2 = mp_.decay_max_dist_ > 0.0
+                            ? mp_.decay_max_dist_ * mp_.decay_max_dist_
+                            : -1.0;
+
+  int faded = 0;
+  for (std::size_t i = 0; i < md_.occ_idx_list_.size(); ++i) {
+    const int addr = md_.occ_idx_list_[i];
+    if (addr < 0 || addr >= static_cast<int>(md_.last_hit_s_.size()))
+      continue;
+    const double v = md_.occupancy_buffer_[addr];
+    if (v <= mp_.min_occupancy_log_)
+      continue; // 坟墓（已不是占据格）：跳过
+    if (now - md_.last_hit_s_[addr] <= mp_.decay_timeout_s_)
+      continue; // 还在宽限期内：什么也不做
+
+    Eigen::Vector3i id_g;
+    hashIdToGlobalIndex(addr, id_g);
+    if (max_d2 > 0.0) {
+      Eigen::Vector3d c;
+      indexToPos(id_g, c);
+      if ((c - md_.ray_pos_).squaredNorm() > max_d2)
+        continue;
+    }
+
+    const double nv = std::max(mp_.clamp_min_log_, v - rate);
+    applyOccupancyUpdate(id_g, nv); // 自动维护膨胀层 + 2D 脏列 + 占据索引
+    ++faded;
+  }
+  md_.decay_num_ = faded;
+}
+
 void GridMap::resetCellByAddress(int addr) {
   Eigen::Vector3i id_g;
   hashIdToGlobalIndex(addr, id_g);
@@ -725,6 +797,8 @@ void GridMap::resetCellByAddress(int addr) {
   md_.count_hit_and_miss_[addr] = 0;
   md_.flag_rayend_[addr] = -1;
   md_.flag_traverse_[addr] = -1;
+  if (!md_.last_hit_s_.empty())
+    md_.last_hit_s_[addr] = 0.f;
   idxDrop(md_.occ_idx_flag_, addr); // 不再占据 → 退出占据索引
 
   // 归零成“未知”：原来不是未知的话，该 2D 列要重扫
@@ -820,6 +894,9 @@ void GridMap::updateSlidingMap(const Eigen::Vector3d &center) {
     md_.count_hit_and_miss_[addr] = 0;
     md_.flag_rayend_[addr] = -1;
     md_.flag_traverse_[addr] = -1;
+    /* 环形缓冲：该物理体素即将被“新进入窗口”的格复用 ⇒ 时间戳必须清 */
+    if (!md_.last_hit_s_.empty())
+      md_.last_hit_s_[addr] = 0.f;
     /* 滑动清图是直接写缓冲（没走 applyOccupancyUpdate/resetCellByAddress），
        所以这两个索引必须在这里同步清位，否则会留下指向空体的坟墓。 */
     idxDrop(md_.occ_idx_flag_, addr);
@@ -871,8 +948,12 @@ int GridMap::setCacheOccupancy(Eigen::Vector3d pos, int occ) {
     md_.cache_voxel_.push(id);
   }
 
-  if (occ == 1)
+  if (occ == 1) {
     md_.count_hit_[idx_ctns] += 1;
+    // ★ “最后一次被命中”的时刻：超时衰减的唯一依据（见 decayStaleOccupancy）
+    if (!md_.last_hit_s_.empty())
+      md_.last_hit_s_[idx_ctns] = md_.decay_now_s_;
+  }
 
   return idx_ctns;
 }
@@ -946,6 +1027,15 @@ void GridMap::raycastProcess() {
   updateSlidingMap(md_.ray_pos_);
 
   md_.raycast_num_ += 1;
+
+  /* 本帧时刻（秒，相对首次调用）。setCacheOccupancy 会把它写进被命中体素的时间戳，
+     decayStaleOccupancy 再拿它判超时 —— 同一帧内必须一致。 */
+  {
+    static const auto epoch = std::chrono::steady_clock::now();
+    md_.decay_now_s_ = static_cast<float>(
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - epoch)
+            .count());
+  }
 
   int vox_idx;
   double length;
@@ -1188,6 +1278,10 @@ void GridMap::updateOccupancyCallback() {
 
   const auto t_3d = std::chrono::steady_clock::now();
   raycastProcess();
+  /* ★ 紧跟 raycast：把“很久没被命中”的占据体素往回拉。
+     必须在 build2DLayer() **之前**，否则 2D 层要等下一帧才反映出来。
+     耗时计入“3D 融合”这一档（它本来就是 3D 层的活）。 */
+  decayStaleOccupancy();
   const double ms_3d = std::chrono::duration<double, std::milli>(
                            std::chrono::steady_clock::now() - t_3d)
                            .count();
@@ -1210,9 +1304,9 @@ void GridMap::updateOccupancyCallback() {
     RCLCPP_INFO(
         node_->get_logger(),
         "[GridMap] 帧耗时: 总 %.1f ms = （点云回调 %.1f + 3D融合 %.1f + 2D "
-        "%.1f）ms | 点数 %d | 帧间隔 %.1f ms（%.2f Hz）",
+        "%.1f）ms | 点数 %d | 帧间隔 %.1f ms（%.2f Hz）| 衰减 %d",
         ms_cb, md_.t_cloud_ms_, ms_3d, ms_2d, md_.proj_points_cnt, frame_gap_ms,
-        hz);
+        hz, md_.decay_num_);
   }
 
   md_.occ_need_update_ = false;

@@ -91,6 +91,8 @@ def main():
     ap.add_argument("--settle", type=float, default=25.0,
                     help="撤障后最多观察多久 [s]")
     ap.add_argument("--solid", action="store_true", help="箱子参与物理碰撞（默认 ghost）")
+    ap.add_argument("--steady", type=float, default=0.0,
+                    help="放箱子后**保持不动**这么久 [s]（验证时效衰减不会误清静态障碍）")
     args = ap.parse_args()
 
     sizes = [float(v) for v in args.sizes.split(",")]
@@ -139,6 +141,23 @@ def main():
                   f"ESDF {(e if e is not None else float('nan')):.2f} m（还没进图）")
         if seen == 0:
             print("  ⚠ 15 s 内箱子没进图 —— 位置/高度带/topic 有问题，先查这个")
+
+        # ---- 阶段一 B：长时保持（回归：时效衰减 grid_map.decay_* 不能误清静态障碍）
+        if args.steady > 0.0:
+            print(f"\n[静态保持 {args.steady:.0f} s] 箱子**不动**，看会不会被衰减误清"
+                  f"（decay_timeout_s 默认 5 s ⇒ 误清会在 ~6 s 内显现）：")
+            t0 = time.time()
+            bad = 0
+            while time.time() - t0 < args.steady:
+                p.spin(5.0)
+                n = count_occ_rect(p.map, bx, by, sizes[0], sizes[1])
+                if n <= 1:
+                    bad += 1
+                    print(f"  +{time.time()-t0:5.0f}s  箱内 {n:3d} 格  "
+                          f"⚠⚠ 被误清了！")
+                else:
+                    print(f"  +{time.time()-t0:5.0f}s  箱内 {n:3d} 格  ✓ 还在")
+            print(f"  ⇒ {'★ 失败：静态障碍被时效衰减误清' if bad else '✓ 通过：静态障碍未被误清'}")
 
         p.remove()
         print("\n[撤障] 逐秒观察（应回落到基线）：")

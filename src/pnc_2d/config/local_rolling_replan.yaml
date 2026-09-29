@@ -1,0 +1,60 @@
+#######################################################################
+# 局部算法：rolling_replan（**滚动式局部重规划**装饰器）
+#
+# 用法：local_type:=rolling_replan。它自己再建主控制器（`rolling.primary`，
+# 默认 heading_shim → 里面再建 mpc），即链路是：
+#     rolling_replan → heading_shim → mpc
+# ⇒ 本文件只管"绕行"这一段；跟踪参数在 local_mpc.yaml、转向参数在
+#   local_heading_shim.yaml（launch 会把三份都加载，见 pnc_2d.launch.py 的
+#   LOCAL_FRAGMENT_BY_TYPE）。
+#
+# 它解决什么（2026-09-29 实测基线）：全局图是离线 PCD，**不含新出现的障碍** ⇒
+# "被挡 → 重规划"拿回同一条路 ⇒ 恢复额度烧光、任务判死（S2/S4 都这样）。
+# 本层在**执行中**把参考路径上被挡的一小段就地换成绕行段，**终点不变**。
+#######################################################################
+/**:
+  ros__parameters:
+    rolling.enable: true
+
+    # ---------------- 什么时候算"被挡" ----------------
+    # 沿参考路径向前看这么远 [m]（要 > 感知可靠范围的一半；太短会"贴脸才绕"）
+    rolling.lookahead_m: 1.60
+    # ★ 触发绕行的**车心净距** [m]。默认 0.45 = `local_mpc.obstacle_safe_distance`
+    #   （MPC 开始付软代价的量级）。
+    #   ⚠ 实测教训（2026-09-29 S1）：一开始设成硬下界 0.25，结果是**已经贴上才绕**
+    #   ——车心→盒面 0.15 m、轮廓穿透 10 cm。绕行必须提前，在"还有地方挪"时开始。
+    rolling.trigger_clearance_m: 0.45
+    # 硬下界 [m]（= `local_mpc.obstacle_hard_distance`）：低于它 MPC 必然无解。
+    # 只用于日志区分"该提前绕/已经晚了"与兼底（触发阈配得比它还紧时）。
+    rolling.blocked_clearance_m: 0.25
+    # ★ 修补段的**额外安全余量** [m]：A* 与自检按 `footprint.safe_margin + 本值`
+    #   判碰。必须留：修补段是给 MPC 跟踪的，跟踪有 2~4 cm 横向误差，
+    #   "恰好不碰"的路径跟偏一点就擦上去。
+    rolling.path_margin_m: 0.06
+    rolling.check_step_m: 0.10
+
+    # ---------------- 修补窗口 ----------------
+    # 冲突点之前多少开始替换 [m]（留出接回原路径的余量；太小会接出折角）
+    rolling.back_m: 0.40
+    # 冲突点之后多少算"要绕过的范围" [m]；这段还在障碍里就继续往外扩
+    rolling.roll_m: 2.00
+    rolling.max_roll_m: 4.00
+    # ★ 绕行幅度上限 [m]：修补段任何点到原路径切线轴的侧向距离超它就**放弃**、
+    #   如实交回主控制器报 BLOCKED。宁可停，也不做"看着绕过去了其实进死胡同"。
+    rolling.max_offset_m: 1.20
+
+    # ---------------- 节流 / 放弃（防"绕行抖动"）----------------
+    rolling.min_interval_s: 0.50
+    rolling.min_progress_m: 0.20
+    rolling.max_consecutive_fail: 2
+    rolling.give_up_s: 3.00
+
+    # ---------------- 局部 A* 代价 ----------------
+    rolling.obs_cost_weight: 0.60     # 靠障碍越近越贵（越大越愿意离远点）
+    rolling.unknown_cost_scale: 1.60  # 未知格可通行，但有惩罚（偏好已观测空地）
+    rolling.lateral_cost_weight: 0.80 # 侧向偏离惩罚（拉成"拐一下"而不是大弧线）
+    rolling.smoothing: true           # 把 A* 的锯齿做 line-of-sight 拉直
+
+    # ---------------- 与全局层同源的几何/口径 ----------------
+    # （`footprint.*` 与 `map.hard_threshold` 在本文件里**不重复配**：那两样由
+    #   pnc_2d.yaml 统一给，避免"两处各配一份"的老问题）

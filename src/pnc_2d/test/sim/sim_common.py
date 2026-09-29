@@ -44,6 +44,12 @@ LIVE = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT,
                   durability=DurabilityPolicy.VOLATILE)
 LATCHED = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                      durability=DurabilityPolicy.TRANSIENT_LOCAL)
+# ★ 定位位姿的参考点：`/lightning/perception/pose` 发的是**雷达**位姿，雷达装在车心
+#   **前方 0.22 m**（URDF velodyne_joint = lightning extrinsic_base_imu_T=[0.22,0,0.09]）。
+#   导航节点在入口就把位姿换算到车心（`pose.base_offset_x: 0.22`）⇒ 本目录所有探针
+#   必须同样换算，否则指标会系统性偏 0.22 m（到点误差、净距、侧偏都中招）。
+#   换平台/定位改成发 base_link 后，这里与 yaml 一起改回 0。
+LIDAR_TO_BASE_X = float(os.environ.get("PNC2D_LIDAR_TO_BASE_X", "0.22"))
 GO2_CFG = os.environ.get(
     "PNC2D_EXTRA_CFG",
     os.path.join(WS, "src", "pnc_2d", "config", "go2_run.yaml"))
@@ -205,7 +211,14 @@ class ObstacleIndex:
 
 # ------------------------------------------------------------------ 采样
 class Probe(Node):
-    """订阅位姿/局部状态/管理器状态/全局路径，记录高频轨迹。"""
+    """订阅位姿/局部状态/管理器状态/全局路径，记录高频轨迹。
+
+    ★ 位姿换算（2026-09-29）：`/lightning/perception/pose` 是**雷达**位姿
+      （车心前 0.22 m，见 pnc_2d/include/pnc_2d/core/types.hpp 与
+      pnc_2d.yaml `pose.base_offset_x`）。本探针把订阅到的位姿**一律换算到车心**，
+      否则所有指标（到点误差、净距、側偏、停滞）都会系统性偏 0.22 m。
+      导航节点内部已经做同样的换算 ⇒ 两边口径一致。
+    """
 
     def __init__(self, name="p5_sim_probe"):
         super().__init__(name)
@@ -225,6 +238,7 @@ class Probe(Node):
         self.global_map = None
         self.first_path = None
         self.first_path3 = None
+        self.path_rejected = 0     # 因「不从车当前位置出发」而被丢掉的路径条数
         self.pose = None
         self.pose_v = 0.0
         self.reached_t = None    # ★ "到达目标"首次出现的时刻：把"判定时误差"
@@ -245,7 +259,10 @@ class Probe(Node):
         q = m.pose.pose.orientation
         yaw = math.atan2(2 * (q.w * q.z + q.x * q.y),
                          1 - 2 * (q.y * q.y + q.z * q.z))
-        self.pose = (m.pose.pose.position.x, m.pose.pose.position.y, yaw)
+        # 雷达位置 → 车心（与导航节点 pose.base_offset_x 同一口径）
+        self.pose = (m.pose.pose.position.x - LIDAR_TO_BASE_X * math.cos(yaw),
+                     m.pose.pose.position.y - LIDAR_TO_BASE_X * math.sin(yaw),
+                     yaw)
         self.pose_v = m.twist.twist.linear.x   # 低速时不可信，只作参考
         self.traj.append((time.time() - self.t0, self.pose[0], self.pose[1], yaw))
 
@@ -277,6 +294,16 @@ class Probe(Node):
     def on_path(self, m):
         pts = [(ps.pose.position.x, ps.pose.position.y) for ps in m.poses]
         if len(pts) >= 2 and self.first_path is None:
+            # ★ `pnc_2d/global_path` 是 latched：`begin()` 之后**先**到达的很可能是
+            #   上一套栈/上一个任务的旧路径。旧路径会让验收脚本把障碍放到**错误
+            #   的轨迹**上（2026-09-29 实测 S1 因此白测一轮：障碍摆在离真实路线
+            #   几米外，侧偏 0.02 m、净距 inf）。
+            #   真路径一定从**车当前位置**起步 ⇒ 不满足就直接丢掉、继续等。
+            if self.pose is not None and \
+                    math.hypot(pts[0][0] - self.pose[0],
+                               pts[0][1] - self.pose[1]) > 1.5:
+                self.path_rejected += 1
+                return
             self.first_path = pts
             # 连朝向一起记："参考里有没有朝向尖刺"只能从这里看出来
             # （朝向误差会积分成横向偏差：n·e(k) = lat0 + dt·v·Σe_ψ）
@@ -317,7 +344,7 @@ class Probe(Node):
         self.traj.clear()
         self.first_path = None
         self.first_path3 = None
-        self.state_seen.clear()
+        self.path_rejected = 0
         self.reached_t = None
         self.t0 = time.time()
 
@@ -343,7 +370,7 @@ def poly_length(pts):
 
 
 def goal_candidates(obstacle, start, want, heading=None, max_turn=75.0,
-                    min_clear=0.45, step=0.25):
+                    min_clear=None, step=0.25):
     """起点周围所有**足够空的直线**方向，按"走得远 + 净距大"排序返回候选目标。
 
     不许假设"起点+4m 一定是空的"：仿真里的车会停在上一次任务结束的地方（可能贴着
@@ -356,7 +383,16 @@ def goal_candidates(obstacle, start, want, heading=None, max_turn=75.0,
 
     ★ 几何够空 ≠ 全局可达（可能在大障碍另一侧、或目标的 footprint 摆不下），所以调用
     方要准备**换下一个候选**，别断言"第一个候选一定规划得出来"。
+
+    ★ `min_clear` 默认 = **按配置的 footprint 算**（外接半径 + 与 `footprint.safe_margin`
+      同口径的 0.05 余量），不再写死 0.45：2026-09-29 footprint 放大到 0.78×0.40
+      （外接半径 0.44 m）后，0.45 m 的候选会报 `GOAL_FOOTPRINT_COLLISION`
+      （实测净距 0.450/0.453 m 全部失败）⇒ 候选看着"几何够空"却一个都规划不出来，
+      测试还误报成"栈没就绪"。
     """
+    if min_clear is None:
+        fl, fw, _, _ = load_footprint()
+        min_clear = math.hypot(fl / 2 + 0.05, fw / 2 + 0.05) + 0.05
     order = list(range(0, 360, 10))
     if heading is not None:
         d0 = math.degrees(heading)
@@ -459,6 +495,13 @@ def load_goal_yaw_tol_deg():
     """
     import os
     import yaml
+    # ★ 2026-09-29：容差必须跟**选中的算法**走，而不是"yaml 里有没有写"。
+    #   纯 `local_type:=mpc` 的 `goalYawTolerance()` 恒为 0（不判朝向）——
+    #   此时若还从 local_heading_shim.yaml 读 10°，脚本就会报"容差 10°"，
+    #   掩盖掉真因（用户报"终点朝向没对准"就是这么来的）。
+    lt = os.environ.get("PNC2D_LOCAL_TYPE", "")
+    if lt and lt != "heading_shim":
+        return 0.0
     keys = ("shim.goal_yaw_tolerance_deg", "local_mpc.goal_yaw_tolerance_deg")
     val = 0.0
     for f in (os.path.join(os.path.dirname(GO2_CFG), "local_heading_shim.yaml"),
@@ -506,3 +549,69 @@ def wrap_pi(a: float) -> float:
     while a <= -math.pi:
         a += 2.0 * math.pi
     return a
+
+
+def load_footprint():
+    """车体轮廓 (length, width, offset_x, offset_y) [m]：**与配置同源**。
+
+    ★ 为什么不写死：2026-09-29 实测发现 footprint 必须覆盖真实外廓
+      （车心：前 +0.332 / 后 −0.407），而"撞没撞"的判定就得用同一块矩形。
+      写死一份 = 迟早与 yaml 脱节（本仓库已踩过 goal_tolerance 那种坑）。
+    """
+    import yaml
+    keys = ("footprint.length", "footprint.width", "footprint.offset_x",
+            "footprint.offset_y")
+    vals = {}
+    for f in (os.path.join(os.path.dirname(GO2_CFG), "pnc_2d.yaml"), GO2_CFG):
+        if not os.path.exists(f):
+            continue
+        doc = yaml.safe_load(open(f, encoding="utf-8")) or {}
+        p = list(doc.values())[0].get("ros__parameters", {})
+        for k in keys:
+            if k in p:
+                vals[k] = float(p[k])
+    return (vals.get("footprint.length", 0.70),
+            vals.get("footprint.width", 0.40),
+            vals.get("footprint.offset_x", 0.0),
+            vals.get("footprint.offset_y", 0.0))
+
+
+def rect_corners(cx, cy, ang, sx, sy):
+    """以 (cx,cy) 为心、朝向 ang、尺寸 (sx,sy) 的矩形四角（世界系）"""
+    c, s = math.cos(ang), math.sin(ang)
+    hx, hy = sx / 2.0, sy / 2.0
+    return [(cx + c * dx - s * dy, cy + s * dx + c * dy)
+            for dx, dy in ((-hx, -hy), (hx, -hy), (hx, hy), (-hx, hy))]
+
+
+def _project(pts, ax, ay):
+    d = [p[0] * ax + p[1] * ay for p in pts]
+    return min(d), max(d)
+
+
+def rects_overlap(a, b, eps=0.0):
+    """两个凸四边形（四角，逆时针）是否重叠 —— 分离轴定理（SAT）。
+
+    返回**最小穿透深度** [m]：0 = 恰好接触/分离，>0 = 真穿插了这么多。
+    ★ 为什么用 SAT 而不是"中心距离 > 半径"：车体是**长条**（0.78×0.40）且
+      朝向任意，中心距离阈值会给出**假通过** —— 2026-09-29 实测 S1 就是
+      "车心离箱子 0.256 m"被判成没撞，而车头（车心前 0.33 m）其实已经插进去了。
+    """
+    axes = []
+    for poly in (a, b):
+        for i in range(len(poly)):
+            x0, y0 = poly[i]
+            x1, y1 = poly[(i + 1) % len(poly)]
+            ex, ey = x1 - x0, y1 - y0
+            n = math.hypot(ex, ey)
+            if n > 1e-9:
+                axes.append((-ey / n, ex / n))
+    pen = 1e9
+    for ax, ay in axes:
+        a0, a1 = _project(a, ax, ay)
+        b0, b1 = _project(b, ax, ay)
+        ov = min(a1, b1) - max(a0, b0)
+        if ov <= eps:
+            return 0.0            # 找到分离轴 ⇒ 不重叠
+        pen = min(pen, ov)
+    return 0.0 if pen == 1e9 else max(0.0, pen)

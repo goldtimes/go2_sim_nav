@@ -23,7 +23,7 @@
 | 模块 | 提供 |
 |---|---|
 | `map_server` | 全局静态 2D 图 `/global_map/occupancy`（`nav_msgs/OccupancyGrid`，latched，未知已当空闲） |
-| `perception`(plan_env) | 局部 2D 图 `/grid_map/occupancy_2d`、膨胀图 `/grid_map/occupancy_inflate_2d`、ESDF `/grid_map/esdf_2d` |
+| `perception` | 局部 2D 图 `/grid_map/occupancy_2d`、膨胀图 `/grid_map/occupancy_inflate_2d`、ESDF `/grid_map/esdf_2d` |
 | `lightning` | 定位位姿 `/lightning/perception/pose`（map→lidar_link）、换图信号 `/lightning/map_state` |
 | `pnc_2d/scripts` | MPC/NMPC 参考实现（已验证横向误差 ~0.0000 m）+ `traj_utils`（进度投影、指标） |
 | `pnc_3d/octomap_global_planner` | 3D A* 的工程化写法参照（但**无抽象接口**，故 2D 版重新设计） |

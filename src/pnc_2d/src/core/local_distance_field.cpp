@@ -225,6 +225,42 @@ std::size_t LocalDistanceField::fuseForbidden(const ZoneSet &zones,
   return changed;
 }
 
+std::size_t LocalDistanceField::fuseObstacleCells(const CostMap2D &occ,
+                                                 int occupied_threshold,
+                                                 double band) {
+  if (!valid() || !occ.valid() || occupied_threshold <= 0)
+    return 0;
+  // 几何必须一致：本方法按**格下标**对齐障碍，几何不同就会张冠李戴。
+  // 调用方（local_planner_node）保证两者同源（都取同一帧局部图的几何），
+  // 这里只做防御性检查，**不做**重采样（那会把“保守”变成“静默错位”）。
+  if (occ.width() != width_ || occ.height() != height_ ||
+      std::fabs(occ.resolution() - resolution_) > 1e-9 ||
+      std::fabs(occ.originX() - origin_x_) > 1e-9 ||
+      std::fabs(occ.originY() - origin_y_) > 1e-9)
+    return 0;
+
+  // 用 ClearanceField 算“到最近致命格的距离”（Felzenszwalb EDT；局部窗毫秒级）。
+  // `lowerBoundM` 已经扣掉 √2/2·res ⇒ 取的是**保守下界**，方向与安全判定一致。
+  ClearanceField cf;
+  if (!cf.build(occ, occupied_threshold, false))
+    return 0;
+
+  std::size_t changed = 0;
+  for (int y = 0; y < height_; ++y) {
+    for (int x = 0; x < width_; ++x) {
+      const double target = cf.lowerBoundM(x, y);
+      if (target > band)
+        continue; // 远处的场一字未改（band 语义，同 fuseForbidden）
+      float &cell = d_[static_cast<std::size_t>(y) * width_ + x];
+      if (target < static_cast<double>(cell)) {
+        cell = static_cast<float>(target);
+        ++changed;
+      }
+    }
+  }
+  return changed;
+}
+
 double LocalDistanceField::bilinear(double gx, double gy) const {
   // gx/gy 是"以格中心为 0.5 偏移"的连续格坐标：gx = (wx - ox)/res - 0.5
   const int x0 = static_cast<int>(std::floor(gx));

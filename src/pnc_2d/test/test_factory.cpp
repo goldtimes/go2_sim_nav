@@ -97,15 +97,20 @@ TEST(Factory, LocalNameTableMatchesCreation) {
 
 // ---------------- 恢复行为 ----------------
 
-TEST(Factory, RecoveryTableHasReplanOnly) {
+TEST(Factory, RecoveryTableMatchesImplementations) {
   // 名字表必须与实际能造出来的东西一致（与上面局部/全局用例同一个套路，
   // 否则表里写了一个造不出来的名字，上层配了才发现）。
+  // 2026-09-29：新增 clear_map（清图，治"局部图脏了/幽灵障碍"）。
   const auto names = availableRecoveries();
-  ASSERT_EQ(names.size(), 1u) << "目前只应有 replan";
+  ASSERT_EQ(names.size(), 2u) << "应为 replan + clear_map";
   EXPECT_EQ(names[0], "replan");
+  EXPECT_EQ(names[1], "clear_map");
   for (const auto &n : names)
     EXPECT_NE(createRecoveryBehavior(n), nullptr)
         << "表里有 " << n << " 却造不出来";
+
+  // 别名（用户更可能写的名字）也要能建出来
+  EXPECT_NE(createRecoveryBehavior("clear_local_map"), nullptr);
 
   // 未注册名字仍然返回 nullptr（不静默回退）
   EXPECT_EQ(createRecoveryBehavior("clear_costmap"), nullptr);

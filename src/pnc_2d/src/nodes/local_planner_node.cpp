@@ -43,6 +43,7 @@
 #include "pnc_2d/core/goal_checker.hpp" // 到点判定（M5.1：判定只在这一处）
 #include "pnc_2d/core/local_distance_field.hpp"
 #include "pnc_2d/core/local_planner.hpp"
+#include "pnc_2d/core/map_fusion.hpp" // 全局图融合（局部 = 局部 ∪ 全局）
 #include "pnc_2d/core/map_zones.hpp"         // 区域层（禁行区/限速区）
 #include "pnc_2d/core/reference_profile.hpp" // 参考速度剖面（M4）
 #include "pnc_2d/core/route_graph.hpp" // distanceToPolyline（点到折线中心线的距离）
@@ -109,6 +110,11 @@ public:
     local_type_ = paramString("local.type", "none");
     frame_id_ = paramString("local.frame_id", "map");
     topic_odom_ = paramString("topics.odom", "/lightning/perception/pose");
+    // ★ 定位位姿的参考点（2026-09-29）：定位发的是**雷达**位姿（比车心前 0.22 m，
+    //   见 types.hpp shiftPoseToBaseCenter 的注释）。这里一次性换算到**车心**，
+    //   下游（footprint / 到点 / 净距 / MPC 初始状态）全部是车心语义。
+    pose_base_offset_x_ = paramDouble("pose.base_offset_x", 0.0);
+    pose_base_offset_y_ = paramDouble("pose.base_offset_y", 0.0);
     topic_cmd_vel_ = paramString("local.cmd_vel_topic", "/pnc_2d/cmd_vel");
     topic_status_ = paramString("topics.local_status", "/pnc_2d/local_status");
     // 局部图/距离场：P5 的 MPC 才需要，P4 只是把话题名配好（订阅见下面注释）
@@ -118,6 +124,24 @@ public:
     // 区域层（禁行区/限速区）：由 map_server latched 发布。没这个话题/没收到时
     // 行为与今天完全一致（向后兼容），收到后局部才真正遵守区域。
     topic_zones_ = paramString("topics.zones", "/global_map/zones");
+    // ★★ 全局静态图（融合用，2026-09-29 用户口径）：**“全局认为不能走 ⇒ 局部也
+    //   不能走”**。局部图来自实时感知（滑动窗 + 高度带投影 + 车体 footprint
+    //   抹空闲），全局图来自 PCD 离线投影；两者对同一块货柜/货架可能给出**相反**
+    //   结论（感知漏掉高处结构 ⇒ 以为能钻过去），而且感知只看得到它看过的地方
+    //   （滚动窗 + max_ray_length），窗外的/未观测的它一无所知。
+    //   融合语义：局部 = 局部 ∪ 全局，**只做“占据”方向**（不把未知变空闲，
+    //   也不把空闲变未知）。与禁行区（`burnForbidden`）完全同构。
+    topic_global_map_ =
+        paramString("topics.global_map", "/global_map/occupancy");
+    fuse_global_map_ = paramBool("local.fuse_global_map", true);
+    // 占据判定阈值：OccupancyGrid 约定 `>= 50` 即占据。全局图是 map_server 发的
+    // 100/0/-1（`unknown_as_free: true` ⇒ 实际没有 -1），50 与 100 同效；
+    // 留参数是为了换图源（其它发布者可能用 65/85 之类的中间值）。
+    fuse_global_map_thr_ = paramInt("local.fuse_global_map_threshold", 50);
+    // 距离场压低带宽 [m]：只改“距全局障碍 ≤ band”的格子；100/0/-1
+    // 不参与。band 至少要覆盖 MPC 的阈值（obstacle_hard 0.25 / safe 0.45）
+    // 加插值余量，1.5 已结有余。
+    fuse_global_map_band_ = paramDouble("local.fuse_global_map_band", 1.5);
 
     control_rate_ = paramDouble("local.control_rate", 20.0);
     goal_tolerance_ = paramDouble("local.goal_tolerance", 0.30);
@@ -133,9 +157,52 @@ public:
     //   但判定之后底盘还会滑行 ~9 cm（实测），残差被推出容差 ⇒ 会把一次成功的
     //   到点报成 FAILED。默认 true。
     goal_stateful_ = paramBool("local.goal_stateful", true);
-    // BLOCKED 要连续持续这么久才结束 action（把决定权交回状态机）：
-    // 瞬时遮挡（有人走过、点云抖一帧）不该让任务失败。
+    // ✗ 旧名字：`local.blocked_abort_s`（= BLOCKED 连续这么久就结束 action）。
+    //   语义已经变了（"1 s 就判死" → "有界等待"），所以换了新名字
+    //   `local.blocked_wait_s`。旧参数只在**显式配了吗**时还被读一次（当成
+    //   wait 值用），并 WARN 提醒改名 —— 免得老配置静默变成"等 6 s"。
+    //   （本节点开了 automatically_declare_parameters_from_overrides，所以
+    //   has_parameter() 能真区分"配了"与"没配"。）
+    const bool legacy_abort_set = has_parameter("local.blocked_abort_s");
     blocked_abort_s_ = paramDouble("local.blocked_abort_s", 1.0);
+    if (legacy_abort_set) {
+      RCLCPP_WARN(get_logger(),
+                  "[local] local.blocked_abort_s=%.2f 已废弃（语义不同：旧＝直接结束，"
+                  "新＝先等待）→ 本次仍按它当作 blocked_wait_s 使用；请改名为 "
+                  "local.blocked_wait_s",
+                  blocked_abort_s_);
+    }
+    // ★★ 2026-09-29（实测基线 S1~S4 后加）：被挡时先做**有界等待**，而不是 1 s
+    //   就结束 action。
+    //   为什么：全局图来自 PCD 离线图，**不包含后来出现的障碍** ⇒ 恢复行为
+    //   （重规划）算出来的还是同一条路 ⇒ 2 次恢复用尽后任务被判死，而
+    //   **障碍消失之后车也不会自己继续**（实测：S2 动态横穿、S4 撤障恢复两个
+    //   场景全是这个症状 —— 车停在离障碍 0.45 m 处、任务 FAILED，而障碍早就
+    //   走了）。
+    //   ⇒ 等一等能好的情况就别急着交回状态机：连续被挡在 `blocked_wait_s` 之内
+    //     保持 action 存活（车停住、状态照报 BLOCKED、反馈里有 blocked_for_s），
+    //     障碍一消失立刻恢复跟随；**超过才**交回状态机（保留原来的语义作兜底）。
+    //   ⚠ 跨层耦合：被挡期间管理器看到的是"长时间没推进"，它自己的
+    //     `sm.stuck_timeout`（默认 10 s）会触发 kStuck → 恢复 ⇒ 两者叠加时以
+    //     先到的为准。所以本值**必须明显小于** sm.stuck_timeout，否则"等待"
+    //     会被管理器的卡住判据抢先打断（那就是一次无谓的重规划）。下面对此有校验。
+    blocked_wait_s_ = paramDouble("local.blocked_wait_s",
+                                  legacy_abort_set ? blocked_abort_s_ : 6.0);
+    // "**等也没用**"的那一类：前方被挡点是**全局图**带来的障碍（感知没见到）、
+    // 或落在禁行区里 —— 静态的东西不会自己消失，白等只是占用任务时间 ⇒
+    // 只等很短（默认 1.0 s ≈ 旧行为）就交回状态机重规划/人工处理。
+    blocked_wait_global_s_ = paramDouble("local.blocked_wait_global_s", 1.0);
+    {
+      const double sm_stuck = paramDouble("sm.stuck_timeout", 10.0);
+      if (sm_stuck > 0.0 && blocked_wait_s_ >= sm_stuck) {
+        RCLCPP_WARN(
+            get_logger(),
+            "[local] local.blocked_wait_s=%.1f 不小于 sm.stuck_timeout=%.1f"
+            " ⇒ 等待会被管理器的「卡住」判据抢先打断（多一次无谓恢复）；"
+            "建议 blocked_wait_s ≤ %.1f",
+            blocked_wait_s_, sm_stuck, sm_stuck * 0.6);
+      }
+    }
     // 距上一个路径点小于该值就算"经过"，用来算进度
     pass_distance_ = paramDouble("local.pass_distance", 0.50);
     odom_timeout_ = paramDouble("local.odom_timeout", 1.0);
@@ -209,6 +276,14 @@ public:
         topic_zones_, rclcpp::QoS(1).transient_local(),
         std::bind(&LocalPlannerNode::onZones, this, std::placeholders::_1));
 
+    // 全局静态图：map_server latched 发布 ⇒ 必须 transient_local 订阅（volatile
+    // 收到不 latched 的历史样本）。它每帧都要用（烧图 + 压低距离场），但**只存本
+    // 体不预计算**：感知的局部窗每帧都在滑，缓存一份“重采样结果”必然会与当帧的
+    // 局部图几何错位（叠加滑窗缺陷的教训）。
+    sub_global_map_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
+        topic_global_map_, rclcpp::QoS(1).transient_local(),
+        std::bind(&LocalPlannerNode::onGlobalMap, this, std::placeholders::_1));
+
     pub_status_ = create_publisher<pnc_2d::msg::LocalStatus>(
         topic_status_, rclcpp::QoS(1).transient_local());
     // ⚠ 只在会真发速度时才创建发布者：NullLocalPlanner 不发 cmd_vel，
@@ -277,9 +352,10 @@ public:
                     ? topic_cmd_vel_.c_str()
                     : "(本算法不产生速度指令，未创建发布者)");
     RCLCPP_INFO(get_logger(),
-                "[local] 到达判定 ≤ %.2f m | 控制周期 %.1f Hz | BLOCKED 连续 "
-                "%.2f s 才结束 action",
-                goal_tolerance_, control_rate_, blocked_abort_s_);
+                "[local] 到达判定 ≤ %.2f m | 控制周期 %.1f Hz | 被挡：等待 "
+                "%.2f s（全局图/禁行区那类只等 %.2f s）后才交回状态机",
+                goal_tolerance_, control_rate_, blocked_wait_s_,
+                blocked_wait_global_s_);
     if (!planner_->producesCmdVel()) {
       RCLCPP_WARN(get_logger(),
                   "[local] ★ 当前是 '%s'（空实现）：链路可以跑通，但**不会输出 "
@@ -383,6 +459,9 @@ private:
     }
     pose_ = Pose2D{msg->pose.pose.position.x, msg->pose.pose.position.y,
                    yawFromQuaternion(msg->pose.pose.orientation)};
+    // 雷达位姿 → 车心（pose.base_offset_x > 0 = 雷达在车心前方）
+    shiftPoseToBaseCenter(pose_.x, pose_.y, pose_.yaw, pose_base_offset_x_,
+                          pose_base_offset_y_);
     last_odom_time_ = now();
     has_odom_ = true;
     // ★ 底盘速度反馈：MPC 的状态量含 v，而 v_cmd 在模型里受 "v_0 + a_max·dt"
@@ -493,10 +572,108 @@ private:
     }
   }
 
-  /// 局部膨胀图 → CostMap2D → 交给算法做硬判定
-  void onLocalMap(const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
+  /// 全局静态图（map_server latched 发布）：**只存不判**。
+  ///
+  /// 融合的“重采样”一律在使用点现算（见 `onLocalMap` / `onEsdf`），不在回调里
+  /// 预先投影成局部几何。原因：感知的局部窗每帧都在滑，缓存一份重采样结果必然与
+  /// 使用时刻的几何错位 —— 本仓库在感知 2D 层已经因此出过一次“整图错位”的 bug。
+  void onGlobalMap(const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
     auto map = std::make_shared<CostMap2D>();
     const auto &info = msg->info;
+    if (!map->set(
+            static_cast<int>(info.width), static_cast<int>(info.height),
+            info.resolution, info.origin.position.x, info.origin.position.y,
+            yawFromQuaternion(info.origin.orientation), msg->data,
+            msg->header.frame_id)) {
+      RCLCPP_ERROR(get_logger(), "[local] 全局图无效：%ux%u @ %.3f m",
+                   info.width, info.height, info.resolution);
+      return;
+    }
+    if (!frame_id_.empty() && !msg->header.frame_id.empty() &&
+        msg->header.frame_id != frame_id_ && !warned_global_frame_) {
+      warned_global_frame_ = true;
+      RCLCPP_WARN(get_logger(),
+                  "[local] 全局图 frame='%s' 与 local.frame_id='%s' 不一致"
+                  "（不做 TF 变换）",
+                  msg->header.frame_id.c_str(), frame_id_.c_str());
+    }
+    global_map_ = map;
+    if (!logged_global_map_) {
+      logged_global_map_ = true;
+      RCLCPP_INFO(get_logger(),
+                  "[local] 收到全局图 %dx%d @ %.3f m，origin (%.2f, %.2f)"
+                  "（融合开关 %s）",
+                  map->width(), map->height(), map->resolution(),
+                  map->originX(), map->originY(),
+                  fuse_global_map_ ? "开" : "关");
+    }
+  }
+
+  /// 被挡原因分类。**只影响"报什么原因"与"等多久"**，不影响安全判定
+  /// （安全判定始终是算法给的 BLOCKED + 那里一律发零速）。
+  struct BlockInfo {
+    std::string reason;
+    double wait_s{6.0};
+  };
+
+  /// 取参考路径上"车前方约 d 米"的一个世界点（用于判断前面是什么）。
+  /// 拿不到路径（<2 点）就沿车头方向外推 —— 这只是**报原因用的启发式**，
+  /// 不参与任何安全判定，所以允许粗糙。
+  bool pointAhead(double d, double & x, double & y) const {
+    if (plan_.size() >= 2 && pass_index_ < plan_.size()) {
+      double acc = 0.0;
+      for (std::size_t i = pass_index_; i + 1 < plan_.size(); ++i) {
+        acc += std::hypot(plan_[i + 1].x - plan_[i].x, plan_[i + 1].y - plan_[i].y);
+        if (acc >= d) {
+          x = plan_[i + 1].x;
+          y = plan_[i + 1].y;
+          return true;
+        }
+      }
+    }
+    x = pose_.x + d * std::cos(pose_.yaw);
+    y = pose_.y + d * std::sin(pose_.yaw);
+    return true;
+  }
+
+  static bool mapCellOccupied(const std::shared_ptr<CostMap2D> & m, double x,
+                              double y) {
+    if (!m || !m->valid())
+      return false;
+    int ix = 0, iy = 0;
+    if (!m->worldToGrid(x, y, ix, iy))
+      return false; // 图外不算（安全判定不靠这个）
+    return m->rawValue(ix, iy) >= 50;
+  }
+
+  BlockInfo classifyBlock(const std::string & planner_msg) const {
+    BlockInfo info;
+    info.wait_s = blocked_wait_s_; // 默认：值得等（感知真看到东西 → 人/车会走）
+    info.reason = "感知前方被挡" +
+                  (planner_msg.empty() ? std::string() : "：" + planner_msg);
+    double ax = 0.0, ay = 0.0;
+    pointAhead(kProbeAhead, ax, ay);
+    // ① 前方是禁行区（把"等也没用"这一类点名，免得日志里只看到含糊的"被挡"）
+    if (!zones_.empty() && zones_.forbiddenCount() > 0 &&
+        zones_.inForbidden(ax, ay)) {
+      info.reason = "前方是禁行区（" + zones_.forbiddenNameAt(ax, ay) +
+                    "）→ 停；禁行区不做绕行";
+      info.wait_s = blocked_wait_global_s_;
+      return info;
+    }
+    // ② 只有全局图说不能走（感知没见到）⇒ 静态的东西不会自己消失，等无用
+    if (mapCellOccupied(local_map_, ax, ay) &&
+        !mapCellOccupied(perception_only_map_, ax, ay)) {
+      info.reason = "全局图判定前方不可通行（感知未见到障碍）→ 等无用，"
+                    "交回状态机重规划/人工";
+      info.wait_s = blocked_wait_global_s_;
+    }
+    return info;
+  }
+
+  /// 局部膨胀图 → CostMap2D → 交给算法做硬判定
+  void onLocalMap(const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
+    auto map = std::make_shared<CostMap2D>();    const auto &info = msg->info;
     const double yaw = yawFromQuaternion(info.origin.orientation);
     if (!map->set(static_cast<int>(info.width), static_cast<int>(info.height),
                   info.resolution, info.origin.position.x,
@@ -514,6 +691,9 @@ private:
                   "不一致（不做 TF 变换）",
                   msg->header.frame_id.c_str(), frame_id_.c_str());
     }
+    // ★ 留一份**融合前**（只有感知）的副本：被挡时用它区分"感知真看见了障碍"
+    //   与"只有全局图说不能走"（后者等多久都没用）。代价只是一份 80×80 的拷贝。
+    perception_only_map_ = map;
     // 滑窗原点每帧都在变（这是正常的），所以**不要**因此告警，否则日志会被刷满。
     // 真正有意义的异常是分辨率/尺寸变了（第一帧不算变化）。
     const bool first_map = !has_local_map_;
@@ -540,6 +720,39 @@ private:
                        msg->header.frame_id)) {
           map = fused;
         }
+      }
+    }
+    // ★★ 全局图融合（每帧都要做，B1）：**局部 = 局部 ∪ 全局**（只做“占据”方向）。
+    //   为什么必须做：“全局认为不能走 ⇒ 局部也不能走”是用户 2026-09-29 定的
+    //   口径。不融的时候局部可以自己“抄近路”穿过全局说不可通行的区域，而且它
+    //   自己看不到矛盾（感知漏高处结构 / 窗外未知）。融进来后，车体轮廓与那些格
+    //   重叠会被**现有的 footprint 硬判定**直接判死，语义与全局一模一样。
+    //   ⚠ 全局图已经把 `map_server.inflate`（0.05）烧进去了 ⇒ 融进来的是“膨胀后的
+    //   不可通行区”。这是**刻意保留**的：它正是全局规划器自己的安全保证，不要反向
+    //   补偿（补偿就把“局部不得比全局宽松”又破坏了）。
+    if (fuse_global_map_ && global_map_ && global_map_->valid()) {
+      std::vector<int8_t> gmask;
+      const std::size_t projected = pnc_2d::projectOccupancy(
+          *global_map_, *map, fuse_global_map_thr_, gmask);
+      if (projected > 0) {
+        std::vector<int8_t> fused_data;
+        const std::size_t added = pnc_2d::fuseOccupancyMask(
+            *map, gmask, fuse_global_map_thr_, fused_data);
+        if (added > 0) {
+          auto fused = std::make_shared<CostMap2D>();
+          if (fused->set(map->width(), map->height(), map->resolution(),
+                         map->originX(), map->originY(), map->originYaw(),
+                         std::move(fused_data), msg->header.frame_id)) {
+            map = fused;
+          }
+        }
+        // 节流打印：`projected` = 全局在局部窗内占了多少格；`added` = 其中
+        // **感知没看见**的新障碍（= 融合的真实增益，为 0 说明局部本来就看得见）。
+        RCLCPP_INFO_THROTTLE(
+            get_logger(), *get_clock(), 5000,
+            "[local] 全局图融合（硬判定）：全局投影 %zu 格，其中 %zu 格是感知"
+            "没看见的新障碍",
+            projected, added);
       }
     }
     local_map_ = map;
@@ -640,6 +853,31 @@ private:
                            "[local] 禁行区融合进距离场：%zu 格（禁行区 %zu 个，"
                            "膨胀 %.3f m）",
                            n, zones_.forbiddenCount(), zones_local_inflate_);
+    }
+    // ★★ 全局图压低距离场（每帧，B2）：与硬判定（B1 烧图）**同源**。
+    //   不做这一步就会“硬说撞、软说很空旷”：MPC 的软代价/硬下界看不到全局障碍
+    //   ⇒ 它会一路贴到障碍跟前才被硬判定拦下（表现为突然急停/BLOCKED），而不是
+    //   提前绕开。
+    //   源**只取**全局图投影出来的那部分障碍（而不是“局部图 ∪ 全局”整张图）：
+    //   感知已经看见的障碍由感知的场负责，重复压低会无谓地改变已标定的权重行为。
+    //   几何一律取**当帧局部图**的（与上面建场用的是同一份），所以不会与场错位。
+    if (fuse_global_map_ && global_map_ && global_map_->valid() && local_map_) {
+      std::vector<int8_t> gmask;
+      if (pnc_2d::projectOccupancy(*global_map_, *local_map_,
+                                   fuse_global_map_thr_, gmask) > 0) {
+        auto gmap = std::make_shared<CostMap2D>();
+        if (gmap->set(local_map_->width(), local_map_->height(),
+                      local_map_->resolution(), local_map_->originX(),
+                      local_map_->originY(), local_map_->originYaw(),
+                      std::move(gmask), local_map_->frameId())) {
+          const std::size_t n = dist_field_.fuseObstacleCells(
+              *gmap, fuse_global_map_thr_, fuse_global_map_band_);
+          RCLCPP_INFO_THROTTLE(
+              get_logger(), *get_clock(), 5000,
+              "[local] 全局图压低距离场：%zu 格（带宽 %.2f m）", n,
+              fuse_global_map_band_);
+        }
+      }
     }
     planner_->setDistanceField(&dist_field_);
     if (!logged_esdf_) {
@@ -794,6 +1032,7 @@ private:
     profile_track_max_ = 0.0;
     profile_dev_over_ = 0;
     blocked_since_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+    logged_block_wait_ = false;
     start_time_ = now();
     last_pose_ = pose_;
     has_last_pose_ = true;
@@ -1060,11 +1299,27 @@ private:
       if (blocked_since_.nanoseconds() == 0)
         blocked_since_ = now();
       const double blocked_for = (now() - blocked_since_).seconds();
-      publishStatus(r.status, r.message, r);
-      publishFeedback(r, r.message);
-      if (blocked_for >= blocked_abort_s_) {
+      const BlockInfo info = classifyBlock(r.message);
+      // ★ 被挡期间**一律发零速**（不依赖"算法在 BLOCKED 时恰好给 0"）：上面刚
+      //   发过一次 r.cmd，这里立即覆盖。"停住等"必须是显式的，否则最后一条非零
+      //   指令会一直生效（而 finish() 发的零要等到等待超时才发生）。
+      if (pub_cmd_vel_) {
+        geometry_msgs::msg::Twist zero;
+        safePublish([&] { pub_cmd_vel_->publish(zero); });
+      }
+      publishStatus(r.status, info.reason, r);
+      publishFeedback(r, info.reason);
+      if (blocked_for >= info.wait_s) {
         finish(LocalStatus::kBlocked, false, true, false, r,
-               "连续被挡 " + std::to_string(blocked_for) + " s 仍不可绕");
+               info.reason + "；连续被挡 " + std::to_string(blocked_for) +
+                   " s（等待上限 " + std::to_string(info.wait_s) +
+                   " s）→ 交回状态机");
+      } else if (!logged_block_wait_) {
+        logged_block_wait_ = true;
+        RCLCPP_WARN(get_logger(),
+                    "[local] 被挡：%s → 停车等待至多 %.1f s"
+                    "（障碍消失会自动继续；超过才交回状态机）",
+                    info.reason.c_str(), info.wait_s);
       }
       return;
     }
@@ -1077,6 +1332,7 @@ private:
     case LocalStatus::kDegraded:
     default:
       blocked_since_ = rclcpp::Time(0, 0, RCL_ROS_TIME); // 障碍消失 → 计时清零
+      logged_block_wait_ = false;
       publishStatus(r.status, r.message, r);
       publishFeedback(r, r.message);
       // ★ 节点层的"到达"兜底：**不依赖算法自己报 kGoalReached**。
@@ -1355,6 +1611,7 @@ private:
     traveled_ = 0.0;
     finished_ = false;
     blocked_since_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+    logged_block_wait_ = false;
   }
 
   // ------------------------------------------------------------ 输出
@@ -1458,6 +1715,9 @@ private:
   std::string topic_local_map_;
   std::string topic_esdf_;
   std::string topic_zones_;
+  /// 定位位姿参考点 → 车心的平移（见构造里的注释与 types.hpp 的换算函数）
+  double pose_base_offset_x_{0.0};
+  double pose_base_offset_y_{0.0};
 
   double control_rate_{20.0};
   double goal_tolerance_{0.30};
@@ -1469,7 +1729,15 @@ private:
   bool was_reached_{false};
   /// 到点的**横向**容差 [m]（与沿向容差正交；见 endResidual / finishReached）
   double lateral_tolerance_{0.10};
-  double blocked_abort_s_{1.0};
+  double blocked_abort_s_{1.0}; /// 旧参数名（语义已变，见构造里的废弃说明）
+  double blocked_wait_s_{6.0};
+  /// "等也没用"那一类（全局图带来的障碍 / 禁行区）的等待上限
+  double blocked_wait_global_s_{1.0};
+  bool logged_block_wait_{false};
+  /// 判断"前方是什么"时的探测弧长 [m]（只用于报原因，粗一点没关系）
+  static constexpr double kProbeAhead = 0.5;
+  /// 融合**前**（只有感知）的图：被挡时用来区分"感知看到"与"只有全局图说不行"
+  std::shared_ptr<CostMap2D> perception_only_map_;
   double pass_distance_{0.50};
   double odom_timeout_{1.0};
   double esdf_timeout_{0.3};
@@ -1494,6 +1762,7 @@ private:
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr sub_local_map_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_esdf_;
   rclcpp::Subscription<pnc_2d::msg::ZoneArray>::SharedPtr sub_zones_;
+  rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr sub_global_map_;
   rclcpp::Publisher<pnc_2d::msg::LocalStatus>::SharedPtr pub_status_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pub_cmd_vel_;
   rclcpp_action::Server<FollowPath>::SharedPtr action_server_;
@@ -1533,6 +1802,15 @@ private:
   /// 变成"全局给路、局部在障碍里" ⇒ BLOCKED ⇒ 恢复重规划又因起点余量重叠失败
   /// ⇒ 任务死锁（2026-09-23 实测）。与 "topics.local_map 用未膨胀图" 完全同构。
   double zones_local_inflate_{0.0};
+  /// 全局静态图（map_server latched）：**只存本体**，融合的重采样在使用点现算
+  std::shared_ptr<CostMap2D> global_map_;
+  std::string topic_global_map_;
+  /// 是否把全局图的占据并进局部（见参数处的长注释；false = 旧行为，局部只看感知）
+  bool fuse_global_map_{true};
+  int fuse_global_map_thr_{50};
+  double fuse_global_map_band_{1.5};
+  bool logged_global_map_{false};
+  bool warned_global_frame_{false};
   /// 限速区前瞻用的减速度 [m/s²] 的**兜底值**（算法不报时用它）
   double brake_acc_param_{0.0};
   /// `effectiveBrakeAcc()` 的缓存（-1 = 还没算过），同时保证只 WARN 一次

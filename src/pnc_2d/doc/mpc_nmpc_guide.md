@@ -770,7 +770,7 @@ $$
 | 指令 | 自己的话题（如 `/pnc_2d/cmd_vel`） | 2D 底盘用 Twist；四足经步态层 |
 
 两条实现提示：
-- 若 MPC 与感知在**同一进程**（都编在 `plan_env` 里），直接调 `getDistance2D(x,y)` 查询 ESDF，
+- 若 MPC 与感知在**同一进程**（都编在 `perception` 包里），直接调 `getDistance2D(x,y)` 查询 ESDF，
   免去点云反解；此时必须把 `esdf2d_query_en: true`，否则无人订阅 ESDF 时会返回陈旧的 -1。
 - 若 MPC 是**独立节点**，订阅 `esdf_2d` 点云重建 80×80 的 2D 距离数组即可（很便宜），
   但要注意点云是**抽点**的（`esdf_pub_step`），查询前要按 `resolution*step` 对齐。

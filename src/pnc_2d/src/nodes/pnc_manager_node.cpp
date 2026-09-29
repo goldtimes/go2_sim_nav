@@ -64,6 +64,9 @@ public:
     frame_id_ = paramString("sm.frame_id", "map");
     topic_goal_ = paramString("topics.goal", "/goal_pose");
     topic_odom_ = paramString("topics.odom", "/lightning/perception/pose");
+    // ★ 定位位姿参考点 → 车心（0.22 = 雷达装在车心前方 0.22 m；0 = 位姿已是车心）
+    pose_base_offset_x_ = paramDouble("pose.base_offset_x", 0.0);
+    pose_base_offset_y_ = paramDouble("pose.base_offset_y", 0.0);
     topic_state_ = paramString("topics.state", "/pnc_2d/state");
     srv_global_plan_ =
         paramString("sm.global_plan_service", "/global_planner/plan_path");
@@ -73,6 +76,10 @@ public:
         paramString("sm.global_clear_service", "/global_planner/clear_path");
     srv_local_stop_ =
         paramString("sm.local_stop_service", "/local_planner/stop");
+    // 恢复行为 `clear_map` 要调的：**感知侧**的清图服务
+    // （perception_node 提供，参数名 `grid_map.clear_map_service`，默认 `clear_map`）。
+    srv_perception_clear_ =
+        paramString("sm.perception_clear_service", "/grid_map/clear_map");
 
     SmParams sp;
     sp.max_recoveries = paramInt("sm.max_recoveries", 2);
@@ -127,6 +134,9 @@ public:
     cli_plan_ = create_client<pnc_2d::srv::PlanPath>(srv_global_plan_);
     cli_clear_ = create_client<std_srvs::srv::Trigger>(srv_global_clear_);
     cli_stop_ = create_client<std_srvs::srv::Trigger>(srv_local_stop_);
+    // ★ 恢复行为 "clear_map" 用的：感知侧的清图服务（perception_node 提供）
+    cli_clear_local_ =
+        create_client<std_srvs::srv::Trigger>(srv_perception_clear_);
     cli_follow_ =
         rclcpp_action::create_client<FollowPath>(this, act_local_follow_);
 
@@ -183,6 +193,10 @@ private:
     pose_.x = msg->pose.pose.position.x;
     pose_.y = msg->pose.pose.position.y;
     pose_.yaw = yawFromQuaternion(msg->pose.pose.orientation);
+    // ★ 与另两个节点统一：把**雷达**位姿换算到车心（见 types.hpp）——卡住判据、
+    //   进度统计、跳变检测都应按车心算。
+    pnc_2d::shiftPoseToBaseCenter(pose_.x, pose_.y, pose_.yaw,
+                                  pose_base_offset_x_, pose_base_offset_y_);
 
     if (!has_odom_) {
       has_odom_ = true;
@@ -581,6 +595,22 @@ private:
     //   ① 将来的多步恢复行为（先后退再重规划）需要同一套"请求重规划"入口；
     //   ② 行为本身要能如实报"我确实请求了"，否则单测无法断言它做了什么。
     ctx.requestReplan = [this]() { replan_requested_ = true; };
+    // ★ 清图钩子（2026-09-29）：把"局部图是脏的"这类被挡交给感知侧的清图服务。
+    //   **不做阻塞等待**：管理器是单线程执行器，在回调里 spin-wait 会死锁
+    //   （与上面 cli_clear_/cli_stop_ 同一模式）：先看服务在不在，在就 async 发出去，
+    //   并把"服务不可用"这种真能导致无效清图的情况喊出来。
+    ctx.clearLocalCostMap = [this]() {
+      if (!cli_clear_local_->service_is_ready()) {
+        RCLCPP_WARN(get_logger(),
+                    "[sm] 清图：%s 不可用（感知没起 / 服务名不对）→ 本次清图无效",
+                    srv_perception_clear_.c_str());
+        return;
+      }
+      cli_clear_local_->async_send_request(
+          std::make_shared<std_srvs::srv::Trigger::Request>());
+      RCLCPP_WARN(get_logger(), "[sm] 清图：已请求 %s（异步，不等回应）",
+                  srv_perception_clear_.c_str());
+    };
     ctx.timeSinceLastPlan = [this]() {
       return (now() - last_plan_time_).seconds();
     };
@@ -642,8 +672,11 @@ private:
   // ------------------------------------------------------------ 成员
   std::string frame_id_;
   std::string topic_goal_, topic_odom_, topic_state_;
+  /// 定位位姿参考点 → 车心的平移（见构造里的注释与 types.hpp 的换算函数）
+  double pose_base_offset_x_{0.0};
+  double pose_base_offset_y_{0.0};
   std::string srv_global_plan_, act_local_follow_, srv_global_clear_,
-      srv_local_stop_;
+      srv_local_stop_, srv_perception_clear_;
   bool publish_plan_{true};
 
   double stuck_timeout_{10.0};
@@ -688,6 +721,8 @@ private:
   rclcpp::Client<pnc_2d::srv::PlanPath>::SharedPtr cli_plan_;
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr cli_clear_;
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr cli_stop_;
+  /// 感知清图服务（恢复行为 `clear_map` 用）
+  rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr cli_clear_local_;
   rclcpp_action::Client<FollowPath>::SharedPtr cli_follow_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srv_cancel_;
   rclcpp::TimerBase::SharedPtr timer_;

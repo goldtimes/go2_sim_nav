@@ -2,15 +2,18 @@
 
 可插拔的 2D 全局规划包：**ROS-free 规划库 + 薄 ROS 节点**。
 当前进度与后续阶段见 `doc/pnc2d_restructure_plan.md`（P1 目录分层 ✅、P2 路网 ✅）。
-架构与算法细节见 `doc/pnc2d_dev_plan.md`，MPC/NMPC 原理见 `doc/mpc_nmpc_guide.md`。
+架构与算法细节见 `doc/pnc2d_dev_plan.md`，MPC/NMPC 原理见 `doc/mpc_nmpc_guide.md`，
+**局部避障与恢复（绕 / 等 / 清）见 `doc/local_flexible_avoidance_plan.md`**。
 
 ```
 include/pnc_2d/core/     types / cost_map_2d / clearance_field / footprint_collision
                          route_graph（路网）/ map_zones（禁行·限速区）/ global_planner（抽象基类）/ factory
+                         local_distance_field / recovery_behavior / clear_map_recovery
 include/pnc_2d/global/   astar_planner（自由空间 A*）/ route_network_planner（沿路网走）
-src/nodes/               global_planner_node（ROS 薄壳：只做 IO/参数/frame 校验）
+include/pnc_2d/local/    mpc_local_planner / heading_shim_planner（转向装饰器）/ rolling_replan_shim（★ 绕行装饰器）
+src/nodes/               pnc_manager_node（状态机）/ global_planner_node / local_planner_node（薄壳）
 scripts/                 MPC/NMPC 离线原型（本包的算法验证工具）
-test/                    无 ROS 单测（A* / 路网 / 区域层，共 32 个用例）
+test/                    无 ROS 单测（18 个可执行 / 222 用例）+ e2e/ + sim/
 ```
 
 > **画线器在 `map_server`**：`src/map_server/scripts/route_editor.py`
@@ -182,15 +185,52 @@ ros2 launch pnc_2d pnc_2d.launch.py planner_type:=route_network local_type:=mpc
   ⇒ 只能直着走；要留“能绕”的空间（柱子）。同理，指标不能把首末点（车自己/目标）
   算进去，否则会把差异掩盖掉。
 
+**局部避障与恢复：绕 → 等 → 清（2026-09-29）**
+
+全局图是**离线 PCD**，`map_server` 只发布不更新 ⇒ **它永远不含后来出现的障碍**。
+“被挡 → 重规划”拿回的还是同一条路，恢复额度烧完任务就判死。所以在执行链路上加三层：
+
+```mermaid
+graph LR
+  R["rolling_replan"] --> H["heading_shim"] --> M["mpc"] --> C["cmd_vel"]
+  M -.->|BLOCKED| W["blocked_wait<br/>有界等待"] -.->|超时仍被挡| K["clear_map<br/>恢复：局部图作废"]
+```
+
+| 层 | 什么时候动 | 关键参数 | 不做 |
+|---|---|---|---|
+| ① 绕 `rolling_replan` | 沿参考路径前瞻发现**车心净距 < 触发阈** | `rolling.trigger_clearance_m` **0.45**、`lookahead_m` 1.60、`path_margin_m` 0.06 | 不改终点/全局路径；**不产生速度** |
+| ② 等 `blocked_wait` | 连续 `BLOCKED` 但未超时 | `local.blocked_wait_s` **8.0**（“等也没用”那类 → `blocked_wait_global_s` 1.0） | 不结束 action、不触发恢复；等待期间一律零速 |
+| ③ 清 `clear_map` | 进 `Recovering` | `sm.recovery.type: clear_map`、`sm.perception_clear_service` | 不清全局图 |
+
+```bash
+ros2 launch pnc_2d pnc_2d.launch.py local_type:=rolling_replan use_sim_time:=true \
+  extra_config:=$(ros2 pkg prefix pnc_2d)/share/pnc_2d/config/go2_run.yaml
+```
+
+⚠ **`local_type` 永远要显式传**：launch 默认值是 `none`（`NullLocalPlanner`，**不发任何速度**且不报错）。
+⚠ **`trigger_clearance_m` 别配成硬下界**：设 0.25（= `obstacle_hard_distance`）会变成
+“**贴上才绕**”——实测车心→盒面 0.151 m、轮廓穿透 **10.3 cm**；改 0.45 后穿透 **0.0 cm**。
+启动时会与 MPC 的 `obstacle_safe_distance / obstacle_hard_distance` 对账并在差得远时 WARN。
+⚠ 走廊（路网）模式**不绕行**：走廊是静态通行性承诺，绕行等于允许越界 ⇒ 直接 `BLOCKED`。
+⚠ `blocked_wait_s` 必须 ≤ `0.6 × sm.stuck_timeout`，否则“等待”会被管理器的“卡住”判据抢先打断。
+
+**诊断日志**：每成功绕行一次打一行
+`[rolling_replan] 绕行修补：冲突 @s=… 替换 […] → … m / 最大侧偏 … m / A* … 节点 / … ms`；
+被挡时 `local_status` 的反馈里有 `blocked_for_s`。
+
+细节（判据/窗口/终点不变量/放弃策略/清图代价与安全兜底/验收数据）见
+`doc/local_flexible_avoidance_plan.md`。
+
 **参数与片段（`config/` + `launch/`）**
 
-launch 会把**三份 yaml 按顺序合并**，**后面的覆盖前面的**：
+launch 会把**多份 yaml 按顺序合并**（总入口 + 算法片段；装饰器类型会有多个片段），
+**后面的覆盖前面的**：
 
 | 顺序 | 文件 | 内容 |
 |---|---|---|
 | 1 | `config/pnc_2d.yaml` | **总入口**：三个节点的公共参数——话题名、坐标系、代价语义（`common.*`）、车体轮廓（`footprint.*`）、路径有效期（`clear.*`）、局部控制参数（`local.*`）、区域在局部侧的额外膨胀（`zones.local_inflate`，**默认 0**）、状态机参数（`sm.*`），以及各类型的**默认值** |
 | 2 | `config/global_<算法>.yaml` | **全局算法片段**：自述 `planner.type` + 该算法私有参数（`astar` → `global_astar.yaml`，`route_network` → `route_network.yaml`） |
-| 3 | `config/local_<局部>.yaml` | **局部算法片段**：自述 `local.type`（`local_null.yaml` / `local_mpc.yaml`） |
+| 3 | `config/local_<局部>.yaml` | **局部算法片段**：自述 `local.type`（`local_null.yaml` / `local_mpc.yaml` / `local_heading_shim.yaml` / `local_rolling_replan.yaml`）。★ `rolling_replan` 是**装饰器**：launch 会把 `local_rolling_replan.yaml` + `local_heading_shim.yaml` + `local_mpc.yaml` **三份一起加载**（见 `pnc_2d.launch.py` 的 `LOCAL_FRAGMENT_BY_TYPE`） |
 | 4 | `extra_config:=<路径>` | 追加的自定义片段，优先级最高 |
 | 5 | `planner_type` / `local_type` | launch 参数，最终强制覆盖类型 |
 
@@ -438,19 +478,28 @@ cd ~/r41_ws && .venv/bin/python3 src/map_server/scripts/route_editor.py
 ```bash
 colcon test --packages-select pnc_2d --event-handlers console_direct+
 colcon test-result --test-result-base build/pnc_2d     # 期望 0 failures
-./build/pnc_2d/test_astar_planner                      # A*：15 用例
-./build/pnc_2d/test_route_network                      # 路网：16 用例
-./build/pnc_2d/test_map_zones                          # 区域层：10 用例
-./build/pnc_2d/test_clearance_field                    # 距离场(EDT)：5 用例
-./build/pnc_2d/test_distance_field                     # 局部 ESDF：8 用例
-./build/pnc_2d/test_mpc_local_planner                  # MPC：33 用例（含 1000 组走廊验收）
-./build/pnc_2d/test_mpc_qp_reference                   # QP 参考/KKT：8 用例
-./build/pnc_2d/test_factory                            # 工厂/局部接口/恢复行为：18 用例
-./build/pnc_2d/test_state_machine                      # 状态机：19 用例（穷举 66 组状态×事件）
+./build/pnc_2d/test_astar_planner            # A*：19 用例
+./build/pnc_2d/test_route_network            # 路网：16 用例
+./build/pnc_2d/test_map_zones                # 区域层：10 用例
+./build/pnc_2d/test_clearance_field          # 距离场(EDT)：5 用例
+./build/pnc_2d/test_clearance_gradient       # 距离场梯度：9 用例
+./build/pnc_2d/test_distance_field           # 局部 ESDF：8 用例
+./build/pnc_2d/test_map_fusion               # 局部图融合全局图：10 用例
+./build/pnc_2d/test_mpc_local_planner        # MPC：29 用例（含 1000 组走廊验收）
+./build/pnc_2d/test_mpc_qp_reference         # QP 参考/KKT：8 用例
+./build/pnc_2d/test_heading_shim_planner     # 转向装饰器：16 用例
+./build/pnc_2d/test_rolling_replan           # ★ 滚动重规划：4 用例（绕行/终点不变/节流/走廊不绕）
+./build/pnc_2d/test_reference_profile        # 速度剖面：8 用例
+./build/pnc_2d/test_upstream_profile         # 上游剖面接入：10 用例
+./build/pnc_2d/test_minco_optimizer          # MINCO 优化器：17 用例
+./build/pnc_2d/test_goal_checker             # 到点判定：10 用例
+./build/pnc_2d/test_clear_map_recovery       # ★ 清图恢复：5 用例
+./build/pnc_2d/test_factory                  # 工厂/局部接口/恢复行为：19 用例
+./build/pnc_2d/test_state_machine            # 状态机：19 用例（穷举 66 组状态×事件）
 ```
 
-合计 **132 个 gtest 用例**（9 个可执行文件）；`colcon test-result` 汇总为
-**142 tests, 0 errors, 0 failures**（132 个用例 + 9 个程序级记录 + 命令行参数记录）。
+合计 **222 个 gtest 用例**（**18 个可执行文件**）；`ctest --test-dir build/pnc_2d`
+汇总为 **18/18 通过**（`colcon test-result` 另给每个程序一条记录）。
 
 **② 端到端测试（ROS 图级别，`test/e2e/`）**
 
@@ -493,6 +542,7 @@ python3 src/pnc_2d/test/sim/test_route_lane.py      # 严格贴线（route_netwo
 | `test_route_lane.py` | 严格贴线（自带 `corridor_width=0` 临时通道）、**走廊逐点生效**、到点、无碰撞；`--turn <deg>` 强制通道与车头夹角 | **8/8**（含 60°/90° 角度差，以前一步不动）：**走廊生效期间贴线 0.048~0.049 m**、到点 0.015~0.019 m |
 | `test_zones.py` | **区域层三段验收**：① 禁行带横在路中间 ⇒ 不得进入且失败原因可诊断 ② **反证**：把带子挪到 8 m 外 ⇒ 同一目标要能到 ③ 限速区：进区前已 ≤ 限速 / 区内 ≤ 限速 / 出区后恢复 | **7/7**：净距 +0.46 m（没进区）、反证到点 0.011~0.037 m、进区前 0.161~0.174 / 区内 0.166 / 出区后 0.277（限速 0.15） |
 | `park_open.py` | 工具（不是用例）：把车开到全局图里**离障碍最远**的地方停下 —— 贴线验收要求车前有 3~6 m 净距 ≥0.55 m 的直线，而车常停在墙边 0.5 m 处 | 需要时先跑它，再跑 `test_route_lane.py` |
+| `test_avoidance.py` | **障碍绕行验收**（S1 静态挡路 / S2 动态横穿）：全程高频采样算**轮廓穿透**、最小净距、绕行侧偏、`BLOCKED` 拍数；障碍用**幽灵注入**（不依赖 sim 判碰盒） | **S1 通过**：穿透 **0.0 cm**、最小净距 0.274 m、到点 3.8 cm、最大侧偏 0.78 m、`BLOCKED` **0 拍**（调参前穿透 10.3 cm ⇒ 见 `doc/local_flexible_avoidance_plan.md` §8；S2 待复测） |
 
 指标一律用**高频位姿轨迹**自己算（不用 `local_status`、更不用 `twist`：低速噪声大、均值偏低），
 并用**独立重算的几何量**与控制器自报的 `cross_track` 对照。三点要知道：
@@ -526,10 +576,12 @@ python3 src/pnc_2d/test/sim/test_route_lane.py      # 严格贴线（route_netwo
 - **不碰** `nav2d`（官方 nav2 栈，与本包互不依赖）、`perception`、`lightning`、`map_server`（本包只订阅它的话题）。
 - `quadropted_controller`（步态/关节）是下游消费者，将在 P5 通过 `/pnc_2d/cmd_vel` 对接。
 - 路网文件与区域层由 `map_server` 加载/校验/发布；本包只消费。
-- **局部规划**：接口层（`LocalPlanner` / `RecoveryBehavior` / 三套工厂）、`NullLocalPlanner`
-  与 **MPC（`local_type:=mpc`，已接线可用）** 就位。`none` 声明 `producesCmdVel() == false`，
-  **不产生任何 `cmd_vel`**（起栈后不要期待车会动）；`mpc` 会真的发速度。
-  恢复行为（清图/后退/重规划）在 P6。
-- **恢复行为（P4 现状）**：`availableRecoveries()` 是**空的**。被挡/卡住会进 `Recovering` 并
-  如实报告“没有可用行为”→“失败”，但会顺手清掉局部跟随与全局旧路径。
-  这是刻意的：P6 之前不做恢复。
+- **局部规划**：`local.type` 可选 `none`（不发速度）/ `mpc` / `heading_shim`（转向装饰器）/
+  **`rolling_replan`（★ 滚动重规划，推荐）**。
+  ⚠ **`local_type` 必须显式传**：launch 默认 `none` ⇒ 忘了传就起一个 `NullLocalPlanner`，
+  表现为“不发车”而不是报错。`rolling_replan` 会自己再建 `heading_shim` → `mpc`。
+- **恢复行为**：已实现 `replan`（重规划）与 **`clear_map`（清局部图，2026-09-29 起为默认）**：
+  前者治“路径与当前局面不同源”，后者治“**局部图本身是脏的**”（幽灵障碍）。
+  恢复成功后都会**先重规划再跟随**。被挡期间还有一层 `blocked_wait` **有界等待**
+  （`local.blocked_wait_s`，默认 8.0 s）——感知看到的障碍多半会自己走，不必立刻烧恢复额度。
+  详见 `doc/local_flexible_avoidance_plan.md`。

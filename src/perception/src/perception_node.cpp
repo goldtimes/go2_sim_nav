@@ -23,8 +23,9 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/int32.hpp>
+#include <std_srvs/srv/trigger.hpp>
 
-#include <plan_env/grid_map.h>
+#include <perception/grid_map.h>
 
 namespace {
 
@@ -157,6 +158,32 @@ int main(int argc, char **argv) {
         default:
           break;
         }
+      });
+
+  // ==========================================================================
+  // 清图服务（2026-09-29，用户要求）—— 供 pnc_2d 的恢复行为调用
+  //   `ros2 launch pnc_2d ...` 里 `sm.recovery.type: clear_map` 时，恢复会调本服务。
+  //   动机（实测）：**动态障碍消失后感知图里会残留“幽灵障碍”**（用户报
+  //   “障碍物消失了，感知也没有清除障碍物”；表现为车对着空处一直报 BLOCKED），
+  //   另外定位跳变/障碍被顶走也会留下不同源的旧数据。
+  //   语义：把 3D 占据/膨胀、计数、raycast 缓存、占据索引**和 2D 层/距离场**
+  //   （resetAllMapData）全部作废；下一帧起按新观测重建。
+  //   ⚠ 2D 层会变成**未知(-1)**：导航侧未知按可通行处理，静态障碍由 map_server
+  //     的全局图融合兜底 ⇒ 不会因为清图而撞已知的墙/柱子。
+  // ==========================================================================
+  std::string clear_srv_name;
+  LoadParam(node, "grid_map.clear_map_service", clear_srv_name,
+            std::string("grid_map/clear_map"));
+  auto clear_srv = node->create_service<std_srvs::srv::Trigger>(
+      clear_srv_name,
+      [&grid_map, &node](
+          const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/,
+          std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+        grid_map->resetBuffer();
+        res->success = true;
+        res->message = "已清空局部 3D/2D 图与距离场（下一帧起按新观测重建）";
+        RCLCPP_WARN(node->get_logger(), "[perception] 清图服务：%s",
+                    res->message.c_str());
       });
 
   rclcpp::spin(node);

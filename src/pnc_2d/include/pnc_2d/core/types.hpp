@@ -164,6 +164,31 @@ struct PlanResult {
   }
 };
 
+/// ★ 把"定位给的参考点"换算到**车体中心**（导航里所有 footprint / 到点 /
+/// 净距判据都按车心算）。
+///
+/// 背景（2026-09-29 实测）：定位发的是 **雷达**位姿 ——
+/// `lightning-lm/src/core/system/loc_system.cc` 里
+/// `T_map_lidar = T_map_base · T_base_imu · T_imu_lidar`，`child_frame_id=`
+/// `lidar_link`；而雷达装在车心**前方 0.22 m**（URDF `velodyne_joint` =
+/// `extrinsic_base_imu_T = [0.22, 0, 0.09]`）。
+/// 不改定位（用户定的），就在**消费入口**换算：
+///     车心 = 雷达位置 − R(yaw) · (off_x, off_y)
+/// `off_x > 0` = 雷达在车心前方。**只平移，不改朝向**（本平台雷达与车体同向；
+/// 若换平台带安装偏航，这里也要一起加，目前未实现）。
+///
+/// 为什么不只改 footprint 的 offset：那样每个消费点都要各自记得减 0.22
+/// （footprint 碰撞、MPC 初始状态、到点判定、全局起点守卫……），漏一个就 silently
+/// 偏 22 cm。这里在**入口**一次性换算，下游全部是车心语义。
+inline void shiftPoseToBaseCenter(double &x, double &y, double yaw, double off_x,
+                                  double off_y) {
+  if (off_x == 0.0 && off_y == 0.0)
+    return;
+  const double c = std::cos(yaw), s = std::sin(yaw);
+  x -= c * off_x - s * off_y;
+  y -= s * off_x + c * off_y;
+}
+
 /// 栅格搜索窗口（闭区间，含边界）
 struct SearchWindow {
   int x0{0};

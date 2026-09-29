@@ -124,6 +124,24 @@ public:
   std::size_t fuseForbidden(const ZoneSet &zones, double inflate,
                             double band = 1.0);
 
+  /// 把**栅格形式的障碍**并进距离场（与 `fuseForbidden` 同构，源换成占据格）。
+  ///
+  /// 为什么需要它（与“烧图”配对，见 `core/map_fusion.hpp`）：硬判定用的是
+  /// 局部图 ∪ 全局图的占据格，而软引导用的是**感知的** ESDF —— 两者不同源时
+  /// 会出现“硬说撞、软说很空旷”：MPC 会一路贴到障碍跟前才被硬判定拦下
+  /// （表现是突然急停/BLOCKED），而不是提前绕开。并进来之后两套口径一致。
+  ///
+  /// 语义：`目标值 = 到最近被并入格的距离`（保守口径 `max(0, d − √2/2·res)`，
+  /// 由 `ClearanceField::lowerBoundM` 给），逐格取 `min(现有, 目标值)`；
+  /// **只动 `目标值 <= band` 的格子**。
+  ///
+  /// @param occ   与**本场同几何**的占据图（尺寸/分辨率/origin 都要一致；
+  ///              不满足直接返回 0，不做牵就）
+  /// @param band  只更新“距被并入障碍 ≤ band”的格子 [m]；远处的场一字未改
+  /// @return 被压低的格数
+  std::size_t fuseObstacleCells(const CostMap2D &occ, int occupied_threshold,
+                                double band = 1.5);
+
   // ---------------- 诊断（单测/日志用）----------------
   std::size_t sampleCells() const {
     return sample_cells_;

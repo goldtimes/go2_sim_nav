@@ -40,6 +40,11 @@ LOCAL_FRAGMENT_BY_TYPE = {
     #   主控制器就只能用库里的默认参数（v_max/w_max/q_* 全是代码默认值）——
     #   行为会惄惄变差，而且日志上看不出来（“参数都配了”）。
     'heading_shim': ('local_heading_shim.yaml', 'local_mpc.yaml'),
+    # ★ 装饰器套装饰器：rolling_replan → heading_shim → mpc ⇒ 三段都要加载
+    #   （只加载自己那段 ⇒ 主控制器的 v_max/w_max/q_* 全落回代码默认值，
+    #     行为惄惄变差且日志上看不出来）
+    'rolling_replan': ('local_rolling_replan.yaml', 'local_heading_shim.yaml',
+                       'local_mpc.yaml'),
 }
 # 全局节点的"手工目标"入口（**相对名**：根命名空间下是 /pnc_2d/manual_goal；
 # 加上 ns:=/e2e 就变 /e2e/pnc_2d/manual_goal，不会与另一套栈碰撞）

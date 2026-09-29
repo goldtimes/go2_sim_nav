@@ -3,8 +3,11 @@
 本文说明 `src/pnc/perception` 这个独立感知包的原理、接口、参数与已知坑。
 
 - 代码来源：SCAN-Planner-Ros2 的 `plan_env`（ZJU-FAST-Lab）
-- 抽取位置：`src/pnc/perception/`（**包名仍为 `plan_env`**，include 路径 `plan_env/...` 不变）
-- 原位置 `src/pnc/SCAN-Planner-Ros2/src/planner/plan_env/` 已加 `COLCON_IGNORE`，源码保留作参考
+- 抽取位置：`src/perception/`。**包名 = 目录名 = `perception`，include 路径
+  `perception/...`**（2026-09-29 从原名 `plan_env` 改过来：包名与目录名不一致会让
+  `colcon build --packages-select perception` **静默什么都不编译**，而错误串是大写
+  `ERROR`，按小写 grep 还会漏掉 —— 已真实踩过一次）
+- 原位置 `src/pnc_3d/SCAN-Planner-Ros2/src/planner/plan_env/` 已加 `COLCON_IGNORE`，源码保留作参考
 - `grid_map.cpp` / `raycast.cpp` **零改动**，只新增了 `perception_node.cpp`（入口）、配置和 launch
 
 抽取的动机：规划算法还没写，需要先把感知单独跑起来验证。
@@ -294,6 +297,36 @@ inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos, double yaw) {
 
 发布时间由 `vis_timer_`（50 ms）驱动。**没有订阅者时 `publishMap()` 会直接返回**（省 CPU），所以 RViz 必须先把 topic 加上，否则看不到任何输出。
 
+### 5.1 控制接口：清图服务（`std_srvs/Trigger`）
+
+| 服务 | 配置项 | 说明 |
+|---|---|---|
+| **`/grid_map/clear_map`** | `grid_map.clear_map_service`（相对名 `grid_map/clear_map`） | 清空局部图：`success=true` + 中文 `message`，并打一条 **`WARN`** 日志（清图是异常事件，必须留痕） |
+
+**它治什么**（2026-09-29 用户上报：“障碍物消失了，感知也没有清除障碍物”）：
+动态障碍离开后 2D/3D 图里会残留**幽灵障碍**，下游（车）对着空处一直报 `BLOCKED`。
+根因**不是**“感知不工作”——开阔地实测 ~1 s 就会把障碍清掉（占格 9 → 0，上游点云同步下降）；
+残留只发生在**没有射线穿过**的位置：被挪动/瞬移的物体、移出 FOV 的物体、滑动窗外回卷的格。
+
+**实现**：`GridMap::resetBuffer()` ——
+3D 占据 / 膨胀 / 命中计数 / raycast 缓存 / 占据索引 **和 2D 层与距离场**全部作废，
+下一帧起按新观测重建。
+
+**调用方**：`pnc_2d` 的恢复行为（`sm.recovery.type: clear_map`）；
+那边的 `sm.perception_clear_service` **必须与本服务名完全一致**。
+
+⚠ **名字不要写成裸 `clear_map`**：相对名只拼**命名空间**、不拼节点名 ⇒ 会变成全局
+`/clear_map`，很容易与别人的服务撞名（2026-09-29 实测踩过）。前缀故意与
+`grid_map/occupancy_2d` 那一族保持一致。
+
+⚠ **清图后短暂“失明”是预期行为**：2D 层变**未知(-1)**，在“未知按可通行”的口径下
+局部图会在 0.2~0.5 s 内“什么都看不见”。安全性靠下游把 `map_server` 的**全局静态图**
+融进硬判定图兜底（`pnc_2d` 的 `local.fuse_global_map`）⇒ 不会因为清图而撞已知的墙/柱子。
+
+```bash
+ros2 service call /grid_map/clear_map std_srvs/srv/Trigger "{}"
+```
+
 ---
 
 ## 6. 已知坑
@@ -362,7 +395,7 @@ if (md_.has_ray_pose_ && pos(2) > md_.ray_pos_(2) + mp_.vis_height_)
 - `body_pose` 可以不订阅，不影响栅格（见 3.4）
 - `grid_map/depth_cloud` 的 `header.stamp` 用的是 `node_->now()` 而不是点云自带的时间戳，做时间对齐时要注意
 - `showglobalmap.rviz` 里写的 `/lightning/current_scan_cloud` 是**错的话题名**，实际是 `/lightning/current_scan`
-- 移动包路径后必须先 `rm -rf build/plan_env install/plan_env`，否则 CMake 报 `source ... does not match the source used to generate cache`
+- 移动包路径后必须先 `rm -rf build/<旧包名> install/<旧包名>`，否则 CMake 报 `source ... does not match the source used to generate cache`（2026-09-29 改名时就是删的 `build/plan_env install/plan_env`）
 
 ---
 
@@ -375,7 +408,7 @@ if (md_.has_ray_pose_ && pos(2) > md_.ray_pos_(2) + mp_.vis_height_)
 ros2 launch lightning r41_online_loc.launch.py
 
 # 终端 2：感知
-ros2 launch plan_env perception.launch.py
+ros2 launch perception perception.launch.py
 
 # 终端 3：RViz（用自己的视图）
 rviz2 -d ~/r41_ws/src/slam/lightning-lm/config/showbodypc.rviz
@@ -386,7 +419,7 @@ rviz2 -d ~/r41_ws/src/slam/lightning-lm/config/showbodypc.rviz
 可覆盖的参数：
 
 ```bash
-ros2 launch plan_env perception.launch.py \
+ros2 launch perception perception.launch.py \
     config:=/path/to/perception.yaml \
     cloud_topic:=/lightning/perception/cloud \
     pose_topic:=/lightning/perception/pose
@@ -419,26 +452,29 @@ qos = QoSProfile(depth=5, history=HistoryPolicy.KEEP_LAST,
 
 ## 8. 后续工作
 
-- [ ] 规划器接入：读 `occupancy_buffer_inflate_`（内存直读，或另开话题）
+- [x] 规划器接入：`pnc_2d` 通过话题消费（`grid_map/occupancy_inflate_2d` 做硬判定 +
+  `grid_map/esdf_2d` 做避障软代价，2026-08 起）。内存直读（`occupancy_buffer_inflate_`）
+  **未做**，当前是“**话题即接口**”（跨进程，不需要锁内存）
+- [x] 清图服务：`grid_map/clear_map`（`std_srvs/Trigger` → `resetBuffer()`，2026-09-29，见 §5.1）
 - [ ] 感知精度评估：把 `grid_map/occupancy` 与离线建图结果对比
 - [ ] RK3588 部署：实测 CPU / 内存占用（参考 `lightning-lm/doc/mapping_threading_refactor.md` 的统计方法）
-- [ ] 决定是否与 SCAN-Planner 合流：目前 `plan_manage` / `path_searching` / `bspline_opt` 通过 `find_package(plan_env)` 仍指向本包，写规划算法时可直接复用
+- [ ] 决定是否与 SCAN-Planner 合流：目前 SCAN-Planner 的 `plan_manage` / `path_searching` / `bspline_opt` 通过 `find_package(plan_env)` 指向**它自己的** `plan_env`（整棵 `src/pnc_3d` 已 `COLCON_IGNORE` 不参与构建）；本包改名 `perception` 后与本仓库其它包无构建依赖
 
 ---
 
 ## 附：文件清单
 
 ```
-src/pnc/perception/                # 包名 plan_env
+src/perception/                    # 包名 = 目录名 = perception
 ├── package.xml                    # 原样 + launch / launch_ros exec_depend
 ├── CMakeLists.txt                 # 原样 + perception_node 目标 + install config/launch
-├── include/plan_env/
+├── include/perception/
 │   ├── grid_map.h                 # 原样
 │   └── raycast.h                  # 原样
 ├── src/
 │   ├── grid_map.cpp               # 原样，零改动
 │   ├── raycast.cpp                # 原样，零改动
-│   └── perception_node.cpp        # 新增：入口 + 接口契约自检
+│   └── perception_node.cpp        # 新增：入口 + 接口契约自检 + 清图服务（§5.1）
 ├── config/
 │   ├── perception.yaml            # 新增：由 planner.yaml 的 grid_map 段派生
 │   └── perception.rviz            # 新增：QoS 已修正的感知专用视图

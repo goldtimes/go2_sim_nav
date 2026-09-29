@@ -67,15 +67,18 @@ add_library(pnc_2d_planner
   src/core/goal_checker.cpp
   src/core/route_graph.cpp
   src/core/map_zones.cpp
+  src/core/map_fusion.cpp
   src/core/local_distance_field.cpp
   src/core/global_planner.cpp
   src/core/replan_recovery.cpp
+  src/core/clear_map_recovery.cpp
   src/core/factory.cpp
   src/global/astar_planner.cpp
   src/global/route_network_planner.cpp
   src/local/null_local_planner.cpp
   src/local/mpc_local_planner.cpp
   src/local/heading_shim_planner.cpp
+  src/local/rolling_replan_shim.cpp
   src/traj/minco_optimizer.cpp
   src/sm/manager_sm.cpp
 )
@@ -191,6 +194,12 @@ if(BUILD_TESTING)
   target_link_libraries(test_route_network pnc_2d_planner)
   ament_add_gtest(test_map_zones test/test_map_zones.cpp)
   target_link_libraries(test_map_zones pnc_2d_planner)
+  ament_add_gtest(test_map_fusion test/test_map_fusion.cpp)
+  target_link_libraries(test_map_fusion pnc_2d_planner)
+  ament_add_gtest(test_clear_map_recovery test/test_clear_map_recovery.cpp)
+  target_link_libraries(test_clear_map_recovery pnc_2d_planner)
+  ament_add_gtest(test_rolling_replan test/test_rolling_replan.cpp)
+  target_link_libraries(test_rolling_replan pnc_2d_planner)
   ament_add_gtest(test_clearance_field test/test_clearance_field.cpp)
   target_link_libraries(test_clearance_field pnc_2d_planner)
   ament_add_gtest(test_factory test/test_factory.cpp)

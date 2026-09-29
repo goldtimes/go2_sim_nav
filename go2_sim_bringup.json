@@ -25,7 +25,7 @@
         {
           "shell_command": [
             "sleep 8",
-            "ros2 launch plan_env perception.launch.py "
+            "ros2 launch perception perception.launch.py "
           ]
         },
         {
@@ -54,7 +54,7 @@
         {
           "shell_command": [
             "# 定位模式rviz",
-            "ros2 launch pnc_2d global_planner.launch.py"
+            "ros2 launch pnc_2d pnc_2d.launch.py   planner_type:=astar local_type:=heading_shim  use_sim_time:=true     extra_config:=$(ros2 pkg prefix pnc_2d)/share/pnc_2d/config/go2_run.yaml"
           ]
         },
         {

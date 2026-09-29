@@ -55,6 +55,13 @@ def self_diagnose(p, obstacle, sx, sy):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dist", type=float, default=4.0, help="目标距起点 [m]")
+    ap.add_argument("--goal-yaw", default="along",
+                    help="终点**朝向**怎么定：\n"
+                         "  along（默认）= 指向终点（≈ 行驶方向，测不出朝向问题）\n"
+                         "  perp / perp-       = 行驶方向 +90° / −90°（验收“到点后原地\n"
+                         "                       对正目标朝向”：2026-09-29 用户报“终点朝向\n"
+                         "                       没对准”就是这种目标）\n"
+                         "  数值（如 90）     = 绝对朝向 [°]（地图系）")
     ap.add_argument("--csv", default="")
     ap.add_argument("--timeout", type=float, default=60.0)
     ap.add_argument("--keep-log", action="store_true")
@@ -86,14 +93,31 @@ def main():
             print("找不到可走的直线目标：车可能被围住了，先手动挪一下")
             return 2
 
+        def goal_yaw(gx, gy):
+            """终点朝向：默认指向终点；--goal-yaw 可以故意错开行驶方向。"""
+            along = math.atan2(gy - sy, gx - sx)
+            spec = str(args.goal_yaw).strip().lower()
+            if spec in ("", "along"):
+                return along
+            if spec in ("perp", "perp+", "+90"):
+                return sc.wrap_pi(along + math.pi / 2)
+            if spec in ("perp-", "-90"):
+                return sc.wrap_pi(along - math.pi / 2)
+            try:
+                return math.radians(float(spec))
+            except ValueError:
+                print(f"--goal-yaw {args.goal_yaw} 看不懂，按 along 处理")
+                return along
+
         # ★ 几何够空 ≠ 全局可达（大障碍另一侧／目标处 footprint 摆不下）。这是全局
         #   规划器的职责，不该当成本次“局部跟踪”验收的失败 ⇒ 换下一个候选重试。
         deadline = time.time() + args.timeout
         chosen = None
         for i, (gx, gy, gd, dmin, ang) in enumerate(cands[:6]):
-            gyaw = math.atan2(gy - sy, gx - sx)
+            gyaw = goal_yaw(gx, gy)
             print(f"候选[{i}] 目标 ({gx:.2f}, {gy:.2f})：方向 {ang}°，距离 "
-                  f"{gd:.2f} m，直线最小净距 {dmin:.2f} m")
+                  f"{gd:.2f} m，直线最小净距 {dmin:.2f} m，终点朝向 "
+                  f"{math.degrees(gyaw):.1f}°（--goal-yaw {args.goal_yaw}）")
             p.begin()
             p.send_goal(gx, gy, gyaw)
             t0 = time.time()
@@ -105,8 +129,9 @@ def main():
                     break
             if "FAILED" not in p.state_seen:
                 chosen = (gx, gy, gyaw)
-                print(f"→ 候选[{i}] 进入跟随（朝向 "
-                      f"{math.degrees(gyaw):.1f}°，与行驶方向一致）")
+                print(f"→ 候选[{i}] 进入跟随（终点朝向 "
+                      f"{math.degrees(gyaw):.1f}°"
+                      f"{'' if abs(sc.wrap_pi(gyaw - math.atan2(gy - sy, gx - sx))) < 1e-6 else '（与行驶方向差 %.0f°）' % math.degrees(abs(sc.wrap_pi(gyaw - math.atan2(gy - sy, gx - sx))))}）")
                 break
             print(f"→ 候选[{i}] 全局规划 FAILED（{p.last_sm_msg}），换下一个")
         if chosen is None:
@@ -208,6 +233,14 @@ def main():
         yaw_err = abs(sc.wrap_pi(fyaw - gyaw))
         print(f"末朝向误差      {math.degrees(yaw_err):.2f}°（目标 {math.degrees(gyaw):.1f}°"
               f" / 实际 {math.degrees(fyaw):.1f}°，容差 {GOAL_YAW_TOL_DEG:.0f}°）")
+        if GOAL_YAW_TOL_DEG <= 0.0 and math.degrees(yaw_err) > 10.0:
+            # ★ 2026-09-29 用户报"终点朝向没对准"时的情况：算法**根本不判朝向**
+            #   （`local.type` 不是 heading_shim ⇒ goalYawTolerance() 恒 0），
+            #   节点一进位置容差就报到点，机头停在哪算哪。这**不是**控制器问题，
+            #   是配置问题 —— 必须显式说出来，否则会去改错的东西。
+            print(f"     ⚠ 当前 local.type 不判朝向（goalYawTolerance=0）⇒ 终点朝向"
+                  f"没有契约、不会原地对正。要用对正就跑 "
+                  f"`local_type:=heading_shim`（或让 go2_run.yaml 的 local.type 生效）。")
         print(f"横向误差(全程)  max {max(off_all):.3f} m")
         print(f"横向误差(稳态)  max {max(abs(o) for o in off_st):.3f} m | "
               f"均值偏置 {sum(off_st) / len(off_st):+.3f} m")
@@ -246,10 +279,20 @@ def main():
             f"节点判定容差 沿向 {GOAL_TOL_M:.3f} / 横向 {LAT_TOL_M:.3f} m")
         chk("[A2] 末速 ≈ 0（位姿差分，不看噪声 twist）", v_end <= 0.05,
             f"{v_end:.3f} m/s")
-        # ★ 末期朝向也算“到达”的一部分：位置对、机头不对不算完成（差速可以原地对正）
-        chk(f"[A3] 末朝向偏差 ≤ {GOAL_YAW_TOL_DEG:.0f}°（到点后原地对正目标朝向）",
-            math.degrees(yaw_err) <= GOAL_YAW_TOL_DEG + 0.5,
-            f"{math.degrees(yaw_err):.2f}°（容差 {GOAL_YAW_TOL_DEG:.0f}°）")
+        # ★ 末期朝向也算"到达"的一部分：位置对、机头不对不算完成（差速可以原地对正）。
+        #   2026-09-29：容差**由算法自报**（`goalYawTolerance()`）—— 只有 heading_shim
+        #   报 10°；纯 mpc 报 0 = "我不判朝向"。这时不能拿 0+0.5 去卡（那等于拿
+        #   一个不存在的契约判失败），而是按**任务要求**（≤10°）判，并把"这是配置
+        #   问题、要跑 heading_shim"说出来。
+        if GOAL_YAW_TOL_DEG > 0.0:
+            chk(f"[A3] 末朝向偏差 ≤ {GOAL_YAW_TOL_DEG:.0f}°（到点后原地对正目标朝向）",
+                math.degrees(yaw_err) <= GOAL_YAW_TOL_DEG + 0.5,
+                f"{math.degrees(yaw_err):.2f}°（容差 {GOAL_YAW_TOL_DEG:.0f}°）")
+        else:
+            chk("[A3] 末朝向偏差 ≤ 10°（该配置不判朝向 ⇒ 按任务口径判）",
+                math.degrees(yaw_err) <= 10.0,
+                f"{math.degrees(yaw_err):.2f}° —— 当前算法报了 goalYawTolerance=0，"
+                f"换 `local_type:=heading_shim` 才有对正契约")
         chk("[B1] 稳态横向误差 ≤ 0.10 m", max(abs(o) for o in off_st) <= 0.10,
             f"max {max(abs(o) for o in off_st):.3f} m，"
             f"均值 {sum(off_st) / len(off_st):+.3f} m")

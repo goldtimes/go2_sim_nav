@@ -62,6 +62,17 @@ perception_node:
     # 定位阶段（换图/失败 -> 清空栅格，否则旧地图体素会变成“幽灵障碍”）。
     # 换定位源时记得改这里，否则此机制静默失效。
     grid_map.topic_map_state: "lightning/map_state"
+    # ★ 清图服务名（std_srvs/Trigger）。名字前缀故意与其它感知话题一致
+    #   （`grid_map/occupancy_2d` 那一族）⇒ 全名 **/grid_map/clear_map**。
+    #   ⚠ 不要写成裸 `clear_map`：相对名只拼**命名空间**、不拼节点名 ⇒ 那样会变成
+    #     全局的 /clear_map，很容易与别人的服务撞名（2026-09-29 实测过）。
+    #   调用方：pnc_2d 的恢复行为 `sm.recovery.type: clear_map`
+    #   （那边参数 `sm.perception_clear_service` 必须与此一致）。
+    #   动机（2026-09-29 用户报"障碍物消失了，感知也没有清除障碍物"）：
+    #   动态障碍离开后 2D/3D 图里会残留"幽灵障碍"，车对着空处一直 BLOCKED。
+    #   服务做的事 = `GridMap::resetBuffer()`（3D 占据/膨脆/计数/raycast 缓存/占据
+    #   索引 + 2D 层与距离场全部作废），下一帧起按新观测重建。
+    grid_map.clear_map_service: "grid_map/clear_map"
     # lightning/perception/cloud 已经是 map 系点云 -> 坐标直接当世界系用。
     # 若置 false，点云会被当作 sensor 系再经 ray_q/ray_pos 变换一次，栅格必然错位。
     grid_map.cloud_is_world: true
@@ -79,11 +90,18 @@ perception_node:
     # ⚠ 判定按"格与矩形相交"（矩形外扩半格 = resolution/2，当前 0.10m 时即 5cm）：
     #   直接填**真实机体尺寸**即可，不用自己加余量，也不会沿边缘漏一圈。
     grid_map.footprint_clear_enable: true
-    grid_map.footprint_length: 0.70   # 机体系 x：前后（m）  ← Go2
+    grid_map.footprint_length: 0.78   # 机体系 x：前后（m） ← Go2 实测外廓（见下）
     grid_map.footprint_width: 0.40    # 机体系 y：左右（m）
     # 雷达不在机体几何中心时，用这两个把矩形挪正（机体系，m）：
     #   例：雷达装机体前 0.29m 处 → offset_x: -0.29
-    grid_map.footprint_offset_x: 0.0
+    # ★★ 2026-09-29 实测取值：本平台雷达就在车心**前方 0.22 m**
+    #   （URDF `velodyne_joint` = lightning `extrinsic_base_imu_T` = [0.22,0,0.09]），
+    #   而 pnc_2d 的用脚形状是“长 0.78、中心相对**车心**偏 −0.038”（它已在入口把
+    #   雷达位姿换算成车心）⇒ 这里换成雷达基准就是 −0.22−0.038 = **−0.258**。
+    #   不改的代价（实测）：车头 0.40 m 内每帧被抹成空闲，而车体真实前沿在
+    #   车心 +0.332 ⇒ 整个车头都在盲区里（S2 里车顶进箱子、被撞飞就是这个）。
+    #   ⚠ 与 pnc_2d `footprint.*` 必须逐项对齐，改一边就要改另一边。
+    grid_map.footprint_offset_x: -0.258
     grid_map.footprint_offset_y: 0.0
     grid_map.footprint_yaw_offset_deg: 0.0
     grid_map.footprint_clear_as_unknown: false  # true = 抹成未知(-1)，默认抹成空闲(0)
@@ -175,11 +193,25 @@ perception_node:
     # ⚠ 下沿必须**高于地面**，否则地面被投影成障碍、整张 2D 图会全黑。
     #   仿真里雷达起点离地约 0.36m → 地面在 map 系 z≈-0.36；
     #   取 -0.20（离地 0.16m）既能排掉地面，又留了 SLAM 高度漂移的余量。
-    #   上沿 1.20 覆盖墙体/桌子，排除天花板与树枝。
+    # ★★ 上沿 1.20 → **2.00**（2026-09-29 用户决定）：现场有**货柜/货架**——
+    #   "下面能过、上面是障碍物"。1.20 会把货柜 1.2m 以上的部分**整块滤掉**
+    #   ⇒ 2D 层只剩几根立柱 ⇒ 局部规划器以为能从中钻过去，而全局图（PCD 投影、
+    #   不含高度过滤）说那里不能走 ⇒ **两套图给相反结论**、局部比全局宽松。
+    #   原理（口径必须记住）：**2D 导航下"可通行"由整套图一致决定**，局部层不得
+    #   比全局层宽松；抬高上沿让感知把"车过不去的高处结构"也投成障碍。
+    # ⚠ 两个已知边界（改之前先知道）：
+    #   ① **被 3D 窗口裁剪**：`sliding_map_size_z 4.0` 以雷达为中心（±2.0m），
+    #      所以有效上沿 ≈ 雷达 z + 2.0 —— 2.00 的顶上几厘米会被裁掉（可忽略；
+    #      真要完整 2.0m 需把 sliding_map_size_z 提到 ≥4.4）。
+    #   ② **反向风险（尚未实测）**：抬高上沿会让 2D 层**更严格**，天花板/横梁/
+    #      夹层/扶手都可能被投成障碍 ⇒ 可能出现"全局能走、局部堵死"。这一侧
+    #      只能用仿真/实车验证（当前仿真未运行，**未验证**）。
+    #   ③ 上沿不能无限抬：越接近/超过雷达高度，就越容易把**上方悬空结构**变成
+    #      假障碍。定值的正确依据是"整机包络高度（含负载）+ 余量"。
     # proj_relative_to_sensor=true 时下面的值变成"相对当前传感器高度上/下多少米"（上下楼梯时更稳）。
     grid_map.proj_relative_to_sensor: false
     grid_map.proj_z_min: -0.20
-    grid_map.proj_z_max: 1.20
+    grid_map.proj_z_max: 2.00
 
     # ---- 2D ESDF ----
     grid_map.esdf_max_dist: 3.0              # 距离截断（米）：限带宽也限算力

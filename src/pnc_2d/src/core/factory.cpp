@@ -1,11 +1,13 @@
 #include "pnc_2d/core/factory.hpp"
 
+#include "pnc_2d/core/clear_map_recovery.hpp"
 #include "pnc_2d/core/replan_recovery.hpp"
 #include "pnc_2d/global/astar_planner.hpp"
 #include "pnc_2d/global/route_network_planner.hpp"
 #include "pnc_2d/local/heading_shim_planner.hpp"
 #include "pnc_2d/local/mpc_local_planner.hpp"
 #include "pnc_2d/local/null_local_planner.hpp"
+#include "pnc_2d/local/rolling_replan_shim.hpp"
 #include "pnc_2d/traj/minco_optimizer.hpp"
 
 namespace pnc_2d {
@@ -35,23 +37,31 @@ std::unique_ptr<LocalPlanner> createLocalPlanner(const std::string &type) {
   // 装饰器：内部自己建主控制器（`shim.primary`，默认 mpc）
   if (type == "heading_shim")
     return std::make_unique<HeadingShimPlanner>();
+  // 装饰器：滚动式局部重规划（`rolling.primary`，默认 heading_shim）
+  if (type == "rolling_replan")
+    return std::make_unique<RollingReplanShimPlanner>();
   return nullptr;
 }
 
 std::vector<std::string> availableLocalPlanners() {
   // "none": yaml 里更自然的写法，映射到同一个 NullLocalPlanner
-  return {"none", "null", "mpc", "heading_shim"};
+  return {"none", "null", "mpc", "heading_shim", "rolling_replan"};
 }
 
 std::unique_ptr<RecoveryBehavior>
 createRecoveryBehavior(const std::string &type) {
   if (type == "replan")
     return std::make_unique<ReplanRecoveryBehavior>();
-  // 其它类型（清图 / 后退 / 旋转…）以后再加：接口已立着（P3 起）。
+  // 清图（2026-09-29）：治"局部图是脏的"（幽灵障碍 / 旧观测残留）
+  if (type == "clear_map" || type == "clear_local_map")
+    return std::make_unique<ClearMapRecoveryBehavior>();
+  // 其它类型（后退 / 旋转…）以后再加：接口已立着（P3 起）。
   return nullptr;
 }
 
-std::vector<std::string> availableRecoveries() { return {"replan"}; }
+std::vector<std::string> availableRecoveries() {
+  return {"replan", "clear_map"};
+}
 
 std::unique_ptr<TrajectoryOptimizer>
 createTrajectoryOptimizer(const std::string &type) {

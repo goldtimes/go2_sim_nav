@@ -2,7 +2,7 @@
 
 只依赖定位（lightning）的输出，不依赖任何规划器：
 
-    ros2 launch plan_env perception.launch.py
+    ros2 launch perception perception.launch.py
 
 输入话题（由 launch 参数写入 grid_map.topic_* 参数；优先级：launch 参数 >
 perception.yaml 里的同名参数 > 代码默认值）：
@@ -24,7 +24,7 @@ from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
-    pkg_share = FindPackageShare('plan_env')
+    pkg_share = FindPackageShare('perception')
     default_config = PathJoinSubstitution([pkg_share, 'config', 'perception.yaml'])
     default_rviz = PathJoinSubstitution([pkg_share, 'config', 'perception.rviz'])
 
@@ -65,7 +65,7 @@ def generate_launch_description():
     )
 
     perception_node = Node(
-        package='plan_env',
+        package='perception',
         executable='perception_node',
         name='perception_node',
         output='screen',

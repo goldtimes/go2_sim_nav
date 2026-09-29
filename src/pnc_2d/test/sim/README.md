@@ -13,7 +13,12 @@ python3 src/pnc_2d/test/sim/test_drive_goal.py          # 自由空间直线（a
 python3 src/pnc_2d/test/sim/test_route_lane.py          # 严格贴线（route_network + mpc）
 python3 src/pnc_2d/test/sim/test_zones.py               # 区域层：禁行带/限速区
 python3 src/pnc_2d/test/sim/park_open.py                # 工具：把车开到空地上（贴线验收前置）
+python3 src/pnc_2d/test/sim/test_avoidance.py --scenarios S1,S2,S3,S4   # 局部避障（需先起仿真）
+PNC2D_LOCAL_TYPE=rolling_replan python3 src/pnc_2d/test/sim/test_avoidance.py --scenarios S1  # ★ 绕行验收
 ```
+
+⚠ 一律用**系统解释器**（`/usr/bin/python3`）：仓库的 `.venv` 是 Python 3.14，与
+Humble 的 rclpy 不兼容（两个新脚本里有护栏会直接告诉你）。
 
 | 脚本 | 覆盖 | 实测（2026-09-23） |
 |---|---|---|
@@ -21,6 +26,8 @@ python3 src/pnc_2d/test/sim/park_open.py                # 工具：把车开到�
 | `test_route_lane.py` | 严格贴线（`corridor_width=0`）、走廊逐点生效、到点、无碰撞；`--turn <deg>` 可强制通道与车头的夹角 | **8/8**（含 **60°/90° 角度差**，以前一步不动）：走廊生效期间贴线 **0.048~0.049 m**、到点 0.015~0.028 m |
 | `test_zones.py` | **区域层三段**（自画区域）：① 禁行带横在路中间 ⇒ 不得进入 + 原因可诊断 ② **反证**：带子挪到 8 m 外 ⇒ 同一目标能到 ③ 限速区：进区前 / 区内 / 出区后 | **7/7**：净距 +0.46 m、反证到点 0.011~0.037 m、进区前 0.161~0.174 / 区内 0.166 / 出区后 0.277 m/s（限速 0.15） |
 | `park_open.py` | 工具：按发布的全局图找"离障碍最远"的空地并开过去（切比雪夫腐蚀，不依赖 scipy） | 车常停在墙边 0.5 m 处 ⇒ 贴线验收怎么也挑不出通道，先跑它 |
+| `test_avoidance.py` | **局部避障四场景**：S1 静态堵中段（应绕过去）/ S2 动态横穿 / S3 宽箱堵死（应**如实 BLOCKED**且不硬顶）/ S4 撤障恢复；指标：到点误差、**轮廓穿透**、**对障碍的最小净距**、BLOCKED 拍数/时长与原因、侧向偏离（“有没有真绕”）、最长停滞 | **基线① 2026-09-29（`heading_shim`）**：S1 **FAIL**（BLOCKED 3.5 s → 恢复用尽 → **FAILED**；净距 0.449 m、侧偏 0.11 m）· S2 **FAIL** · S3 **PASS 3/3**（净距 1.858 m）· S4 **FAIL** ⇒ 根因：没有“绕”的能力。<br>**基线②※ `rolling_replan`（2026-09-29）**：S1 **PASS 3/3** —— 穿透 **0.0 cm**、最小净距 0.274 m、到点 3.8 cm、侧偏 0.78 m、`BLOCKED` **0 拍**；同场景在 `rolling.trigger_clearance_m=0.25`（错误地取成硬下界）时穿透 **10.3 cm** ⇒ 触发阈必须提前。<br>⚠ S2/S4 在 `rolling_replan` 下**尚未复测**；S2 必须 `--speed 0.3` |
+| `obstacle_inject.py` | 工具：造障碍 —— `--mode gazebo`（真生成盒子、走完整链路，**最终验收口径**）/ `--mode cloud`（在 LIO 输出点云上叠加合成点，绕开物理与 LIO ⇒ 确定性、秒级复现；需 `cloud_topic:=/perception_test/cloud`）。尺寸/高度的三条约束写在文件头 | ⚠ **gazebo 模式必须先起 gz 服务桥**（`test_avoidance.py` 会自动起；手工用见文件头）。实测 Fortress 这套环境 `ign service --req` 走不通（`ign msg -i ign.msgs.Pose` 都报消息工厂未加载），而 ROS 侧默认没桥这三个服务 |
 
 ⚠ **贴线误差只能在“走廊生效期间”考核**：hybrid 路径的前段是自由入口段（先把车
 带到车道上并对正），那段的外摆是必然的（走廊是硬约束，从车道外收敛实测不可行）。

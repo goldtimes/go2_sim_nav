@@ -46,6 +46,20 @@
     #   E2E 测试就是这么做的：ns:=/e2e + extra_config 把外部 IO 指到 /t/*。
     topics.map: "/global_map/occupancy"          # 外部：map_server 发布（latched）
     topics.odom: "/lightning/perception/pose"    # 外部：定位（Odometry, map -> lidar_link）
+    # ★★ 位姿参考点补偿（2026-09-29 实测后加，三节点必须一致）
+    #   定位发的 `lightning/perception/pose` 是**雷达**位姿：
+    #     loc_system.cc: T_map_lidar = T_map_base·T_base_imu·T_imu_lidar，
+    #                    child_frame_id = "lidar_link"
+    #   而雷达装在车心**前方 0.22 m**（URDF velodyne_joint = lightning 配置
+    #   go2_gazebo_sim.yaml 的 extrinsic_base_imu_T = [0.22, 0, 0.09]）。
+    #   导航里所有判据（footprint 碰撞、到点、净距、MPC 初始状态、卡住/进度）
+    #   都该按**车心**算 ⇒ 在消费入口一次性平移过去：
+    #       车心 = 雷达位置 − R(yaw)·(off_x, off_y)
+    #   实测不补偿的代价：车头真实余量只剩 1.8 cm（footprint 却以为有 0.238 m），
+    #   车尾最后 0.28 m 完全没保护（S2 里“FOLLOWING 下顶进箱子”就是这么来的）。
+    #   **0 = 位姿已经是车心**（换平台/定位改成发 base_link 后就改回 0）。
+    pose.base_offset_x: 0.22
+    pose.base_offset_y: 0.0
     topics.goal: "/goal_pose"                    # 外部：RViz "2D Goal Pose"（三节点模式下由 manager 独占）
     topics.path: "pnc_2d/global_path"            # 自家：输出几何路径
     topics.markers: "pnc_2d/plan_markers"        # 自家：起终点箭头 + 起点处车体轮廓
@@ -89,9 +103,18 @@
     # ==================================================================
     # 只查致命格、不看膨胀梯度：安全性由 footprint 保证，舒适性由软代价保证。
     footprint.enable: true
-    footprint.length: 0.70             # 机体系 x：前后（m）← Go2
+    # ★★ 2026-09-29 按实测外廓改（量法：scripts/measure_go2_extent.py，实时 TF + mesh）
+    #   这台 Go2 站立时的真实外廓（车体系）：x ∈ [−0.407, +0.332]、y ∈ ±0.163
+    #   （前 +0.33 = 躯干前脸，后 −0.41 = 后腿/脚往后摆）⇒ **车体不以原点为中心**。
+    #   旧值 0.70×0.40 + offset 0（对称）会得到：车头只剩 1.8 cm 余量、
+    #   **车尾 5.7 cm 露在 footprint 之外**（后腿完全没被保护）。
+    #   现在：前后各留 ~2 cm ⇒ 长 0.78、中心偏 −0.038（覆盖 [−0.428, +0.352]）。
+    #   ⚠ 与 perception 的 `grid_map.footprint_*`（同一台车、同一套语义）必须对齐：
+    #     那边参考点是**雷达**，所以 offset_x = −0.22 − 0.038 = **−0.258**、
+    #     length 同样是 0.78。改一边必须改另一边。
+    footprint.length: 0.78             # 机体系 x：前后（m）← Go2 实测外廓
     footprint.width: 0.40              # 机体系 y：左右（m）
-    footprint.offset_x: 0.0            # 参考点不在矩形中心时用
+    footprint.offset_x: -0.038         # 矩形中心相对**车心**的偏移（前后不对称）
     footprint.offset_y: 0.0
     footprint.safe_margin: 0.05        # 四边各外扩（m）
     footprint.check_edges: true        # 边扫掠（四角轨迹 + 中心线），防"擦角"
@@ -109,6 +132,9 @@
 
     # ---------------- 接口话题 ----------------
     topics.odom: "/lightning/perception/pose"          # 外部：与全局节点同一个位姿源
+    # 位姿参考点补偿：与全局/状态机一致（长注释见本文件第一段）
+    pose.base_offset_x: 0.22
+    pose.base_offset_y: 0.0
     # 局部图：**未膨胀**的那张（grid_map/occupancy_2d）。
     # ⚠ 2026-09-23 从 occupancy_inflate_2d 换过来的（用户改）：感知的膨胀图是
     #   按 `double_cylinder_radius: 0.25` 膨胀的，叠上车体半宽 0.30 后要求
@@ -121,6 +147,18 @@
     #   （perception `build2DESDF()` 用 occ2d_），解后还有真实净距复核。
     topics.local_map: "/grid_map/occupancy_2d"
     topics.esdf: "/grid_map/esdf_2d"                    # 外部：距离场（PointXYZI 点云）
+    # ★★ 全局静态图（**融合用**，2026-09-29 用户口径）。
+    #   口径：**2D 导航下"能不能过"必须由整套图一致决定，局部不得比全局宽松** ——
+    #   "全局认为不能走 ⇒ 局部也不能走"。
+    #   为什么必须融：局部图来自实时感知（滑动窗 + 高度带投影 + 车体 footprint
+    #   抹空闲），全局图来自 PCD 离线投影。两者对同一块货柜可能给出**相反**结论
+    #   （感知高度带上沿原来就 1.20 m，会把货柜 1.2 m 以上的部分整块滤掉 ⇒
+    #    只剩立柱 ⇒ 局部以为能钻过去），而且感知只看得到它看过的地方。
+    #   融进来后，车体轮廓与"全局不可通行"的格子重叠会被**现有 footprint 硬判定**
+    #   直接判死，语义与全局一模一样（同禁行区的 burnForbidden）。
+    #   ⚠ 保留 `map_server.inflate`（0.05）的膨胀：那正是全局规划器自己的安全保证，
+    #     不要反向补偿（补了就又把"局部不得比全局宽松"破坏了）。
+    topics.global_map: "/global_map/occupancy"        # 外部：map_server latched 发布
     topics.local_status: "pnc_2d/local_status"          # 自家：局部状态（latched）
 
     # ---------------- 区域在**局部侧**的额外膨胀 ----------------
@@ -134,6 +172,23 @@
     #   2026-09-23 实测：车离禁行区 Z1 边界 0.283 m，两边都要求 0.30 m（差 1.7 cm）。
     #   语义上这与 `topics.local_map` 用**未膨胀**图完全同构：局部看真实几何。
     zones.local_inflate: 0.0
+
+    # ---------------- 全局图融合（局部 = 局部 ∪ 全局）----------------
+    # ★★ 默认 **true**：这是用户 2026-09-29 定的不变量（"全局认为不能走 ⇒ 局部
+    #   也不能走"）。false = 旧行为（局部只看感知），仅用于 A/B 对照。
+    #   两个作用点（每帧都做，各自几何取**当帧**局部图）：
+    #     ① 硬判定图：占据方向取并 ⇒ footprint 检查会拦住"全局不可通行"的格；
+    #     ② 距离场：按 `到全局障碍的几何距离` 逐格取 min ⇒ MPC 的软代价/硬下界
+    #        与①同源（不做②就会出现"硬说撞、软说很空旷"⇒ 贴到跟前急停）。
+    #   ⚠ 副作用（已知、方向保守）：局部障碍边界比原来最多外扩一个局部格（0.10 m）；
+    #     距离场在全局障碍附近多扣了 `map_server.inflate`（0.05 m）。
+    #     ⇒ 若出现"全局能走、局部堵死"，先看日志里这两个数：
+    #        "全局图融合（硬判定）：全局投影 N 格，其中 M 格是感知没看见的新障碍"
+    local.fuse_global_map: true
+    # 占据判定阈值（OccupancyGrid 约定 >= 50 即占据；map_server 发 100/0/-1）
+    local.fuse_global_map_threshold: 50
+    # 距离场压低带宽 [m]：只改"距全局障碍 ≤ band"的格子
+    local.fuse_global_map_band: 1.5
 
     # ---------------- 控制 ----------------
     # cmd_vel 的**唯一 owner 是局部节点**（谁控车谁发速度），状态机不插手，
@@ -179,9 +234,30 @@
                                        # 否则未覆盖格子会被低估成"有障碍"）
     local.esdf_fill_radius: 2           # 点云→栅格的邻域填充半径 [格]
                                        # （感知采样步长默认 2 格 = 0.2 m，至少要填 1 圈）
-    # 被挡要**连续**持续这么久才结束跟随（把决定权交回状态机）：
-    # 瞬时遮挡（有人走过、点云抖一帧）不该让任务失败。
-    local.blocked_abort_s: 1.0
+    # ---------------- 被挡时的**有界等待**（2026-09-29 实测基线 S1~S4 后加）------
+    # 旧行为：BLOCKED 连续 1 s 就结束 action、把决定权交回状态机。实测发现这
+    # **不可逆地判死任务**：全局图（PCD 离线图）里**没有后来出现的障碍** ⇒ 恢复
+    # 行为（重规划）算出来还是同一条路 ⇒ 2 次恢复用尽 → FAILED，而**障碍消失后
+    # 车也不会自己继续**（S2 横穿、S4 撤障两个场景都是这个症状）。
+    # 新行为：连续被挡期间**保持 action 存活**（车停住 + 明确发零速 + 状态照报
+    # BLOCKED、反馈里有 blocked_for_s），障碍一消失立刻恢复跟随；**超时才**交回
+    # 状态机（保留旧语义作兜底）。
+    #   容差时长 ≈ (sm.max_recoveries + 1) × blocked_wait_s。
+    #   ★ 2026-09-29 实测后从 6.0 提到 **8.0**：把动态障碍降到 0.3 m/s（用户要求，
+    #     否则箱子会把车撞飞）后，一次横穿的**遮挡时长**从 ~3.7 s 涨到 ~10 s，
+    #     6 s 的窗口会直接超时 ⇒ 任务 FAILED。仿真时间基准，屏幕上的墙钟时长
+    #     还要除以 RTF（`scripts/sim_rtf.py` 可量）。
+    local.blocked_wait_s: 8.0
+    # "等也没用"的那一类：被挡点是**全局图**带来的障碍（感知没见到）或落在
+    # 禁行区里 —— 静态的东西不会自己消失，白等只占任务时间 ⇒ 只等很短就交回
+    # 状态机（≈ 旧行为）。判据见 `classifyBlock()`。
+    local.blocked_wait_global_s: 1.0
+    # ⚠ 跨层耦合：等待期间管理器看到的是"长时间没推进"，它自己的 sm.stuck_timeout
+    #   （默认 10 s）会触发 kStuck → 恢复 ⇒ 两者叠加时**以先到的为准**。所以
+    #   blocked_wait_s **必须明显小于** sm.stuck_timeout，否则"等待"会被管理器的
+    #   卡住判据抢先打断（那就是一次无谓的重规划）。节点启动时会校验并 WARN。
+    # ✗ 旧参数名 `local.blocked_abort_s`（语义＝"直接结束"）已废弃：只有**显式配置**
+    #   时才会被读到（当作 blocked_wait_s 用），并打 WARN 提示改名。
 
     # ---------------- 限速区前瞻用的减速度（兜底，一般不用配）----------------
     # 前瞻距离 = 从"可能达到的最大速度"按减速度 a 刹停的距离 + 0.3 m 余量
@@ -204,6 +280,9 @@
     # ---------------- 接口话题 ----------------
     topics.goal: "/goal_pose"                    # 外部：RViz "2D Goal Pose"（本节点独占消费）
     topics.odom: "/lightning/perception/pose"    # 外部：定位
+    # 位姿参考点补偿：与全局/局部一致（长注释见本文件第一段）
+    pose.base_offset_x: 0.22
+    pose.base_offset_y: 0.0
     topics.state: "pnc_2d/state"                 # 自家：状态机状态（latched）
 
     # ---------------- 与另两个节点的 IPC ----------------
@@ -213,6 +292,11 @@
     sm.global_clear_service: "global_planner/clear_path"
     sm.local_follow_action: "local_planner/follow_path"
     sm.local_stop_service: "local_planner/stop"
+    # ★ 恢复行为 `clear_map` 要调的：**感知侧**的清图服务。
+    #   名字 = `grid_map.clear_map_service`（默认 `grid_map/clear_map`）⇒ 全名
+    #   `/grid_map/clear_map`（与 occupancy_2d 那族话题同一个前缀）。
+    #   它把局部 3D 占据/2D 层/距离场整个作废，下一帧起按新观测重建。
+    sm.perception_clear_service: "/grid_map/clear_map"
 
     # ---------------- 状态机上限 ----------------
     # 一次任务内允许的恢复尝试次数。**恢复成功也不清零** —— 这就是
@@ -225,7 +309,7 @@
     # ---------------- 卡住/跳变判据 ----------------
     # 用**自车位移**判断卡住（不依赖局部反馈）：参照点挪动超过
     # stuck_min_progress 就重新计时，否则超过 stuck_timeout 发 Stuck 事件。
-    sm.stuck_timeout: 10.0             # [s]
+    sm.stuck_timeout: 25.0             # [s]
     sm.stuck_min_progress: 0.20        # [m]
     # 两帧位姿之间位移超过该值 → 认为定位跳变（正常步态不可能），
     # 基于旧位姿的路径不再可信 → 触发重规划。0 = 关闭该检测。
@@ -237,20 +321,34 @@
     sm.heartbeat_hz: 5.0               # 心跳周期（卡住检测 + 状态话题刷新）
 
     # ---------------- 恢复行为（P5.4 起真正接上）----------------
-    # 被挡/卡住时执行什么。可选项见 availableRecoveries()；目前只有 "replan"：
-    # "用**当前**地图重新规划一次" —— 本仓库里被挡绝大多数是"路径与当前局面不同源"
-    # （地图/区域刚改、定位跳变、动态障碍占道），正确处置就是重规划，而不是让车
-    # 在原地做动作。配成未知名字会在启动时 WARN 并且被挡即判失败。
+    # 被挡/卡住时执行什么。可选项见 availableRecoveries()：
+    #   · "replan"    ：只"用**当前**地图重新规划一次"。治"路径与当前局面不同源"
+    #                    （地图/区域刚改、定位跳变、动态障碍占道）。
+    #   · "clear_map" ：★ 2026-09-29 新增，并**改为默认**。先让感知把局部图整个
+    #                    清空（调用 `/grid_map/clear_map`），再由状态机重规划
+    #                    （`Recovering→Planning` 是转移表规定的，行为不用自己请求）。
+    #                    治"局部图**本身**是脏的"：
+    #                      ★ 动态障碍离开后感知图残留"幽灵障碍"——用户 2026-09-29
+    #                        原话："障碍物消失了，感知也没有清除障碍物"；表现是车
+    #                        对着空处一直 BLOCKED，单靠 replan 永远出不来。
+    #                      · 障碍被车顶走 / 定位跳变后旧观测留在滑窗里；
+    #                      · 上层逻辑（区域刚开放）改过而局部图还记着旧占格。
+    #   ⚠ 清图的代价（必须知道）：2D 层变**未知**，在"未知按可通行"的配置下局部图
+    #     会短暂地"什么都看不见"（~0.2~0.5 s 内被新点云重建）。静态障碍的安全由
+    #     **全局图融合**（`local.fuse_global_map`）兜底 ⇒ 不会因为清图去撞已知的墙。
+    #   配成未知名字会在启动时 WARN 并且被挡即判失败。
     #
     # ★ 这里以前是**空的实现**，后果比想象严重：进入 RECOVERING 后没人跑恢复、
     #   也没有事件把它推出去 ⇒ 状态机永久卡在 RECOVERING，任务既不会完成也不会
     #   失败，而且 RECOVERING **不接受新目标**（实测：仿真里被挡一次后，后续目标
     #   全被静默拒绝，只能重启节点）。
-    sm.recovery.type: "replan"
+    sm.recovery.type: "clear_map"
     # 重规划防抖 [s]：距上次成功规划不到该间隔就**如实报恢复失败**（0 = 关闭，
     # 默认）。默认关的理由：额度上限 max_recoveries 已经收住了"挡住→恢复→再挡"，
     # 第二道闸只会把"规划后 0.3 s 才出现的动态障碍"这类**真可恢复**的情况直接判失败。
     replan.min_interval_s: 0.0
+    # 清图防抖 [s]（同一口径；用**墙钟**判，因为清图是 I/O 动作）。默认 0 = 关闭。
+    clear_map.min_interval_s: 0.0
 
 
     # ---------------------------------------------------------------- 轨迹优化（P6 后端 / MINCO）

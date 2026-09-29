@@ -86,6 +86,9 @@ public:
     frame_id_ = paramString("planner.frame_id", "map");
     topic_map_ = paramString("topics.map", "/global_map/occupancy");
     topic_odom_ = paramString("topics.odom", "/lightning/perception/pose");
+    // ★ 定位位姿参考点 → 车心（0.22 = 雷达装在车心前方 0.22 m；0 = 位姿已是车心）
+    pose_base_offset_x_ = paramDouble("pose.base_offset_x", 0.0);
+    pose_base_offset_y_ = paramDouble("pose.base_offset_y", 0.0);
     topic_goal_ = paramString("topics.goal", "/goal_pose");
     topic_path_ = paramString("topics.path", "/pnc_2d/global_path");
     topic_markers_ = paramString("topics.markers", "/pnc_2d/plan_markers");
@@ -474,6 +477,10 @@ private:
     start_.y = msg->pose.pose.position.y;
     start_.yaw = yawFromQuaternion(msg->pose.pose.orientation);
     start_.has_yaw = true;
+    // ★ 定位给的是**雷达**位姿（比车心前 0.22 m）⇒ 在这里一次性换算到车心，
+    //   否则起点守卫/终点判定的 footprint 都整体前偏（见 types.hpp）。
+    pnc_2d::shiftPoseToBaseCenter(start_.x, start_.y, start_.yaw,
+                                  pose_base_offset_x_, pose_base_offset_y_);
     odom_frame_ = msg->header.frame_id;
     has_odom_ = true;
 
@@ -1641,6 +1648,9 @@ private:
   std::string frame_id_;
   std::string topic_map_;
   std::string topic_odom_;
+  /// 定位位姿参考点 → 车心的平移（见构造里的注释与 types.hpp 的换算函数）
+  double pose_base_offset_x_{0.0};
+  double pose_base_offset_y_{0.0};
   std::string topic_goal_;
   std::string topic_path_;
   std::string topic_markers_;

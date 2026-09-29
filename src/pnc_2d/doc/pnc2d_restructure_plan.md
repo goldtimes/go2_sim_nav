@@ -403,8 +403,8 @@ zones:                              # ★区域层（可选）
 > **参考实现（2026-09-22 修订）**：以 **`/home/gmd/SLAM-PNC/PNC` 的 `MpcController`** 为准
 > （阿克曼 + `(a,δ)` + 稀疏 OSQP），按差速底盘映射成 `(a,ω)`；
 > 本仓库 `scripts/mpc.py` **不再作参考**（仅保留原型）。
-> **P5.0 工具链 ✅ / P5.1 库层 + 单测 ✅（2026-09-22，实测见 `mpc_local_planner_plan.md` §5.1）**，
-> P5.3 节点接线 / P5.4 仿真 E2E 待做。
+> **P5.0 工具链 ✅ / P5.1 库层 + 单测 ✅（2026-09-22，实测见 `mpc_local_planner_plan.md` §5.1）/
+> P5.3 节点接线 ✅ / P5.4 仿真 E2E ✅（2026-09-23）**。
 
 - **算法**：单套 **MPC**（差分驱动、`N=15 @ dt=0.1 s`、控制 `[v, ω]`），求解器 **OSQP**（已装 0.6.2 + 热启动）。
 - **两套 profile，数据驱动切换**：`setCorridor()` 非空 ⇒ `route`（走廊横向偏差**硬约束**，`corridor_width=0` 即严格贴线，遇障 `BLOCKED` 停车）；否则 `free`（跟踪全局路径 + 距离场软代价避障）。
@@ -414,9 +414,13 @@ zones:                              # ★区域层（可选）
 - **不做**：动态障碍速度/轨迹估计（v1 反应式，接口先预留）、pure_pursuit 兜底、MINCO/SFC。
 - 备注：`scripts/mpc.py` / `nmpc.py` 继续作**离线基准**，用于验证 C++ 实现数值一致。
 
-### P6（可选）重规划管理器 / 恢复行为 / pluginlib（原 P5）
-- 地图版本号 + episode/seq 隔离、卡住检测、失败兜底、恢复行为具体实现；
-- 算法多了再考虑 pluginlib 动态挂载。
+### P6 恢复行为 ✅ **已完成（2026-09-29）**（原 P5）
+- 恢复行为具体实现：`replan`（重规划）+ **`clear_map`（清局部图，默认）**；
+  另有“绕 / 等”两层柔性处置：`rolling_replan`（滚动就地绕行）与 `blocked_wait`（有界等待）。
+  **方案、参数、实测与踩坑见 `local_flexible_avoidance_plan.md`。**
+- 地图版本号 + episode/seq 隔离 ✅（IPC 已带 seq）、卡住检测 ✅（`sm.stuck_timeout`）、
+  失败兜底 ✅（`sm.max_recoveries` ⇒ `Failed`）；
+- pluginlib 动态挂载：**未做**（算法多了再说）。
 
 ---
 

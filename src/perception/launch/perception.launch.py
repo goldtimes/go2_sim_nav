@@ -35,8 +35,17 @@ def generate_launch_description():
     )
     cloud_arg = DeclareLaunchArgument(
         'cloud_topic',
-        default_value='/lightning/perception/cloud',
-        description='map 系点云话题 -> grid_map.topic_cloud',
+        # ★ 2026-09-30：默认从降采样版切到**未降采样**版（见 doc/dense_cloud_plan.md）。
+        #   原因：`filter_size_scan: 0.2` 降采样后射线密度不足，raycast 会出现大量
+        #   “该被射线穿过、却没有射线”的体素 ⇒ 动态物体走后留下清不掉的幽灵格。
+        #   实测：cloud_full 9280 点 vs cloud 4160 点（2 m 处射线间隔 5.7°→2.0°，
+        #   而一个 0.1 m 体素占 2.9°）。
+        #   ⚠⚠ **优先级**：launch 参数 > yaml —— 下面用 LaunchConfiguration 写进
+        #     `grid_map.topic_cloud`，所以**只改 perception.yaml 不生效**（踩过）。
+        #   回退：把 default_value 改回 '/lightning/perception/cloud'，或启动时传
+        #     `cloud_topic:=/lightning/perception/cloud`。
+        default_value='/lightning/perception/cloud_full',
+        description='map 系点云话题 -> grid_map.topic_cloud（⚠ 优先级高于 yaml）',
     )
     pose_arg = DeclareLaunchArgument(
         'pose_topic',

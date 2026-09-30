@@ -208,11 +208,12 @@ struct MappingParameters {
   bool verify_occ_idx_;
 
   /* ---------- 占据体素“时效衰减”（decay）----------
-   * 治的是：运动物体离开后，它曾占据过的体素**再也收不到 miss** ⇒ 永远 occupied。
-   * 根因是“写 occupied 容易、清 free 难”：清 free 需要一条射线**恰好穿过**
-   * 这个 0.1 m 体素，而点云是降采样过的（`filter_size_scan 0.2` ⇒ 2 m 处
-   * 相邻射线间隔 ≈5.7°，一个体素只占 ≈2.9°）⇒ 大量体素不在任何射线路径上。
-   * 实测：残留体素 17/17 个都有“从未被 DDA 穿过”的体素（见
+   * 治的是：运动物体离开后，它曾占据过的体素**再也收不到 miss** ⇒ 永远
+   * occupied。 根因是“写 occupied 容易、清 free 难”：清 free
+   * 需要一条射线**恰好穿过** 这个 0.1 m
+   * 体素，而点云是降采样过的（`filter_size_scan 0.2` ⇒ 2 m 处 相邻射线间隔
+   * ≈5.7°，一个体素只占 ≈2.9°）⇒ 大量体素不在任何射线路径上。 实测：残留体素
+   * 17/17 个都有“从未被 DDA 穿过”的体素（见
    * test/sim/obstacle_sweep_probe.py）。
    *
    * 做法：给每个体素记“最后一次被**命中**的时刻”，超过 `decay_timeout_s` 就把
@@ -222,9 +223,16 @@ struct MappingParameters {
    *   **每帧都有回波 ⇒ 每帧被命中** ⇒ 永不超时 ⇒ 不会被误清。
    */
   bool decay_enable_;
-  double decay_timeout_s_;  ///< 超过这么久没被命中就开始淡 [s]
-  double decay_rate_;       ///< 每帧减多少 log-odds（≈ p_miss 量级）
-  double decay_max_dist_;   ///< 只对离传感器这么近的体素衰减 [m]（≤0 = 不限）
+  double decay_timeout_s_; ///< 超过这么久没被命中就开始淡 [s]
+  double decay_rate_;      ///< 每帧减多少 log-odds（≈ p_miss 量级）
+  double decay_max_dist_;  ///< 只对离传感器这么近的体素衰减 [m]（≤0 = 不限）
+
+  /* ---------- 仅测试用：点云重复份数（性能标定）----------
+   * 把同一帧点云重复 N 次，用来**在不改上游的前提下模拟“更密的点云”**，
+   * 标定 raycast 的耗时曲线（为“多发一路未降采样点云”的决策提供数据）。
+   * ⚠ 生产配置必须保持 1。支持 `ros2 param set` 在线扫（每帧实时读）。
+   */
+  int test_dup_cloud_;
 };
 
 // intermediate mapping data for fusion
@@ -276,8 +284,8 @@ struct MappingData {
   int32_t raycast_num_;
   queue<Eigen::Vector3i> cache_voxel_;
 
-  /* 每个体素“最后一次被命中”的时刻 [s]（steady_clock 相对 decay_epoch 的秒数）。
-     超时衰减用，见 MappingParameters 里 decay_* 那段的注释。
+  /* 每个体素“最后一次被命中”的时刻 [s]（steady_clock 相对 decay_epoch
+     的秒数）。 超时衰减用，见 MappingParameters 里 decay_* 那段的注释。
      不随滑动窗口维护：addr↔世界格 是环形映射，滑动时清掉的那条 slab 会在
      updateSlidingMap() 里被重置为 0；新进入的格本来是未知（不能衰减），
      一旦变 occupied 必然是刚被命中过（时间戳已刷新）⇒ 陈旧值无害。 */

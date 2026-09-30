@@ -122,6 +122,24 @@ class LaserMapping {
 
     CloudPtr GetScanUndist() const;
     CloudPtr GetScanDownWorld() const;
+    /**
+     * **未降采样**点云的 world 版（供感知使用，2026-09-30 新增）。
+     *
+     * 为什么需要它：`GetScanDownWorld()` 发的是 `scan_down_body_`（已经过
+     * `filter_size_scan` 降采样）⇒ 射线密度不够，下游 raycast 会出现大量
+     * “该被射线穿过、却没有射线”的体素（实测 17/17 残留格都有这种体素，见
+     * perception/doc/perception_gridmap.md §3.6）。本函数返回同帧的**未降采样**版本：
+     * 仿真实测 10240 点 vs 降采样后 3255 点（×3.15）⇒ 2 m 处射线间隔 5.7°→1.8°。
+     *
+     * 关键性质（这也是“为什么不让下游自己去订原始点云”的原因）：
+     * 它在 `MapIncremental()` 里用**同一个** `PointBodyToWorld` / **同一个**
+     * `state_point_` 生成，所以与 `scan_down_world_`、与发布的位姿**天然同帧对齐**，
+     * 且**已经去畸变**（`scan_undistort_` 来自 `p_imu_->Process`）。
+     *
+     * ⚠ 返回的是**深拷贝**：`scan_undist_world_` 是每帧复用的成员，发布在另一个
+     * 线程里，不拷就可能拿到被下一帧覆盖的内容。
+     */
+    CloudPtr GetScanUndistWorld() const;
     CloudPtr GetProjCloud();
 
     /// 获取最新的点云
@@ -276,7 +294,9 @@ class LaserMapping {
     CloudPtr scan_undistort_{new PointCloudType()};   // scan after undistortion
     CloudPtr scan_down_body_{new PointCloudType()};   // downsampled scan in body
     CloudPtr scan_down_world_{new PointCloudType()};  // downsampled scan in world
-    pcl::VoxelGrid<PointType> voxel_scan_;            // voxel filter for current scan
+    /// ★ 未降采样的 world 版（给感知用，见 GetScanUndistWorld 的注释）
+    CloudPtr scan_undist_world_{new PointCloudType()};
+    pcl::VoxelGrid<PointType> voxel_scan_;  // voxel filter for current scan
 
     /// 点面相关
     std::vector<PointVector> nearest_points_;              // nearest points of current scan

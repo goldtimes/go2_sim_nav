@@ -39,7 +39,14 @@ fasterlio:
   skip_lidar_num: 0 # 点云的跳帧情况
   # 仿真单帧 640×16 = 10240 点；取 2 抽样后约 5k 点/帧（再扣除 inf/NaN 与盲区）。
   # 真实雷达用 6，是因为帧点数远多于仿真。想让 LIO 更准可以改 1（CPU 翻倍）。
-  point_filter_num: 2 # 点云采样参数
+  # ★ 2026-09-30：从 2 改成 1。原因：下游 perception 的 raycast 需要足够密的射线
+  #   （间隔要小于一个 0.1 m 体素在 2 m 处的张角 2.9°），抽点会让射线间隔翻倍
+  #   ⇒ 动态物体走后留下清不掉的幽灵格（见 perception/doc/dense_cloud_plan.md）。
+  #   实测：抽点 2 → scan_undistort_ 4640 点；改成 1 → 应回到 10240 点。
+  #   ⚠ 只影响 scan_undistort_（去畸变输入）的点数；LIO 匹配用的 scan_down_body_
+  #   仍经 filter_size_scan: 0.2 体素降采样 ⇒ **匹配点数基本不变**，代价只是
+  #   去畸变逐点计算量 ×2.2。若 LIO 耗时明显上升，改回 2 即可（一行回退）。
+  point_filter_num: 1 # 点云采样参数
   max_iteration: 3 # 最大迭代次数
   filter_size_scan: 0.2 # 对scan进行的降采样（LIO 前端用）
   filter_size_map: 0.3

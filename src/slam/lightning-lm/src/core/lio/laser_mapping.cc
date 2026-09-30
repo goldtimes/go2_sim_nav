@@ -641,6 +641,15 @@ bool LaserMapping::SyncPackages() {
 }
 
 void LaserMapping::MapIncremental() {
+    /* ★ 未降采样点云的 world 版（给感知用，2026-09-30）。
+       放在这里而不是发布侧：这里 `state_point_` 与下面填 `scan_down_world_` 用的
+       是**同一个值** ⇒ 两份云严格同帧、同系、同姿态，不引入任何错位。
+       无条件生成：10240 点的变换 ≈0.1 ms，对 LIO 循环可忽略；发布与否由上层决定。 */
+    scan_undist_world_->resize(scan_undistort_->size());
+    for (size_t i = 0; i < scan_undistort_->size(); ++i) {
+        PointBodyToWorld(scan_undistort_->points[i], scan_undist_world_->points[i]);
+    }
+
     PointVector points_to_add;
     PointVector point_no_need_downsample;
 
@@ -925,6 +934,12 @@ CloudPtr LaserMapping::GetScanUndist() const {
 CloudPtr LaserMapping::GetScanDownWorld() const {
     std::lock_guard<std::mutex> lock(mtx_state_);
     return scan_down_world_;
+}
+
+CloudPtr LaserMapping::GetScanUndistWorld() const {
+    std::lock_guard<std::mutex> lock(mtx_state_);
+    /* 深拷贝：成员每帧复用，而发布在另一个线程 —— 不拷会拿到被下一帧覆盖的内容 */
+    return std::make_shared<PointCloudType>(*scan_undist_world_);
 }
 
 std::vector<Keyframe::Ptr> LaserMapping::GetAllKeyframes() {

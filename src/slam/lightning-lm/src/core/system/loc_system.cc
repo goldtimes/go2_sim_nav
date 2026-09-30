@@ -212,10 +212,16 @@ bool LocSystem::Init(const std::string &yaml_path, const std::string &map_path_o
     if (yaml.GetValue<bool>("system", "enable_perception_pub", false)) {
         perception_cloud_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("lightning/perception/cloud",
                                                                                        rclcpp::SensorDataQoS());
+        /// ★ 未降采样版（2026-09-30）：同帧、同姿态、**不经 filter_size_scan 降采样**。
+        /// 仿真实测 10240 点 vs 降采样后 3255 点（×3.15）⇒ 2 m 处射线间隔 5.7°→1.8°。
+        /// 与上面那路共用 enable_perception_pub 开关（不需要就把订阅端去掉/换个话题）。
+        perception_cloud_full_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>(
+            "lightning/perception/cloud_full", rclcpp::SensorDataQoS());
         perception_pose_pub_ =
             node_->create_publisher<nav_msgs::msg::Odometry>("lightning/perception/pose", rclcpp::SensorDataQoS());
         LLOG_INFO(logging::kLocSys,
-                  "perception topics enabled: lightning/perception/cloud (map-frame cloud) + "
+                  "perception topics enabled: lightning/perception/cloud (map, downsampled) + "
+                  "lightning/perception/cloud_full (map, un-downsampled) + "
                   "lightning/perception/pose (map-frame lidar pose)");
     }
 
@@ -721,6 +727,22 @@ void LocSystem::PublishDebugAndRviz(const builtin_interfaces::msg::Time &stamp) 
                 cloud_msg.header.frame_id = "map";
                 cloud_msg.header.stamp = stamp;
                 perception_cloud_pub_->publish(cloud_msg);
+            }
+        }
+        if (perception_cloud_full_pub_ != nullptr) {
+            /* ★ 未降采样版：与上面那份**同帧同姿态**（都在 MapIncremental 里用同一个
+               state_point_ 生成），只是不做 filter_size_scan 降采样。 */
+            auto lio = loc_->GetLIO();
+            auto scan_full = lio ? lio->GetScanUndistWorld() : nullptr;
+            if (scan_full && !scan_full->empty()) {
+                CloudPtr scan_map(new PointCloudType());
+                pcl::transformPointCloud(*scan_full, *scan_map, T_map_odom.matrix().cast<float>());
+
+                sensor_msgs::msg::PointCloud2 cloud_msg;
+                pcl::toROSMsg(*scan_map, cloud_msg);
+                cloud_msg.header.frame_id = "map";
+                cloud_msg.header.stamp = stamp;
+                perception_cloud_full_pub_->publish(cloud_msg);
             }
         }
     }

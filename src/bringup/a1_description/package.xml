@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>a1_description</name>
+  <version>0.1.0</version>
+  <description>
+    Unitree A1 四足机器人描述包（URDF/xacro + meshes + Gazebo Classic 11 插件配置）。
+    由 legbot_3D_Nav (ROS 1 Noetic) 的 a1_description 移植到 ROS 2 Humble，
+    控制链路由 gazebo_ros_control/transmission 改为 gazebo_ros2_control/ros2_control。
+  </description>
+
+  <maintainer email="todo@todo.todo">r41_ws</maintainer>
+  <license>BSD-3-Clause</license>
+  <author>Unitree Robotics</author>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>urdf</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>joint_state_publisher</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+
+  <!-- Gazebo Classic + ROS 2 -->
+  <exec_depend>gazebo_ros</exec_depend>
+  <exec_depend>gazebo_ros2_control</exec_depend>
+  <exec_depend>controller_manager</exec_depend>
+  <exec_depend>ros2_controllers</exec_depend>
+  <exec_depend>gazebo_msgs</exec_depend>
+
+  <!-- Livox MID360 仿真插件与消息 -->
+  <exec_depend>ros2_livox_simulation</exec_depend>
+  <exec_depend>livox_ros_driver2</exec_depend>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+    <!-- 让 Gazebo 能解析 package://a1_description/meshes/*.dae
+         （配合 gazebo_ros 的 spawn_entity.py -package_to_model 使用） -->
+    <gazebo_ros gazebo_model_path="${prefix}/.."/>
+  </export>
+</package>

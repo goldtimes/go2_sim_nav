@@ -1,0 +1,444 @@
+<?xml version="1.0"?>
+<!--
+  Unitree A1 —— Gazebo Classic 11 + ROS 2 Humble 的 Gazebo 描述。
+
+  由 legbot_3D_Nav (ROS 1 Noetic + Gazebo Classic 11) 的
+  a1_description/xacro/gazebo.xacro 移植而来。插件对应关系：
+
+    ROS 1                                        ROS 2 (本文件)
+    libgazebo_ros_control.so + <transmission> -> liba1_joint_pd_plugin.so (带力矩钳位的 PD)
+    libgazebo_ros_p3d.so      (<bodyName>)    -> libgazebo_ros_p3d.so      (<body_name>)
+    libgazebo_ros_imu_sensor.so (<topicName>) -> libgazebo_ros_imu_sensor.so (<ros><remapping>)
+    libgazebo_ros_force.so    (<bodyName>)    -> libgazebo_ros_force.so    (<link_name>)
+    liblivox_laser_simulation.so              -> libros2_livox.so (ros2_livox_simulation 包)
+    libunitreeFootContactPlugin.so            -> libgazebo_ros_bumper.so
+    libunitreeDrawForcePlugin.so              -> 丢弃（纯可视化）
+
+  依赖 robot.xacro 中由 xacro:arg robot_name 派生的属性 robot_ns。
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+    <xacro:property name="M_PI" value="3.1415926"/>
+
+    <!-- ==================================================================
+         0. 保留固定关节，禁止 URDF→SDF 期间把固定关节子链接打包合并。
+
+         sdformat 默认会把 fixed joint 的子 link 合并进父 link，A1 的
+         base/trunk、imu_link、laser_livox、livox_imu_link、*_foot 全是固定关节，
+         不保留的话模型只剩 12 个腿关节 link，下面按名字引用链接的插件
+         （p3d / force / IMU / 雷达）都会报 "link does not exist"。
+         ================================================================== -->
+    <xacro:macro name="a1_preserve_fixed_joint" params="joint">
+        <gazebo reference="${joint}">
+            <preserveFixedJoint>true</preserveFixedJoint>
+        </gazebo>
+    </xacro:macro>
+
+    <!-- ⚠️ 不要保留 floating_base（base→trunk）：
+         base 是上游用来当根节点的 1mm 哑链接，自身没有惯性量，
+         保留它会让整个 URDF→SDF 转换失败（模型连一个 link 都不剩）。
+         让它照常合并进 trunk 即可：物理上 base 就是躯干本体。 -->
+    <xacro:a1_preserve_fixed_joint joint="imu_joint"/>
+    <xacro:a1_preserve_fixed_joint joint="laser_livox_joint"/>
+    <xacro:a1_preserve_fixed_joint joint="livox_imu_joint"/>
+    <xacro:a1_preserve_fixed_joint joint="FL_foot_fixed"/>
+    <xacro:a1_preserve_fixed_joint joint="FR_foot_fixed"/>
+    <xacro:a1_preserve_fixed_joint joint="RL_foot_fixed"/>
+    <xacro:a1_preserve_fixed_joint joint="RR_foot_fixed"/>
+
+    <!-- ==================================================================
+         1. 关节驱动：a1_gazebo_plugins 的带力矩钳位 PD 插件
+            （替代上游 ROS 1 的 gazebo_ros_control + transmission）
+
+            刻意不用 gazebo_ros2_control：它的硬件插件只导出 position 命令接口，
+            位置控制必须配 pid_gains，而 PID 输出会**不钳位**地写进 ODE 关节。
+            A1 关节上限 33.5 N·m，kp=300 配 1.8 rad 误差 = 540 N·m，
+            实测机器人一落地就被自己的关节甩飞几十米。
+            上游 unitree_legged_control/UnitreeJointController 是带钳位的 PD，
+            所以从来没这个问题——本插件就是它的等价实现。
+            增益取自上游 a1_description/config/robot_control.yaml。
+         ================================================================== -->
+    <gazebo>
+        <plugin name="a1_joint_pd" filename="liba1_joint_pd_plugin.so">
+            <ros>
+                <namespace>/${robot_ns}</namespace>
+            </ros>
+            <command_topic>joint_group_controller/commands</command_topic>
+            <joint_state_topic>joint_states</joint_state_topic>
+            <update_rate>500</update_rate>
+            <tau_max>33.5</tau_max>
+            <joints>
+                <joint name="FL_hip_joint"   kp="100.0" kd="20.0"/>
+                <joint name="FL_thigh_joint" kp="300.0" kd="40.0"/>
+                <joint name="FL_calf_joint"  kp="300.0" kd="40.0"/>
+                <joint name="FR_hip_joint"   kp="100.0" kd="20.0"/>
+                <joint name="FR_thigh_joint" kp="300.0" kd="40.0"/>
+                <joint name="FR_calf_joint"  kp="300.0" kd="40.0"/>
+                <joint name="RL_hip_joint"   kp="100.0" kd="20.0"/>
+                <joint name="RL_thigh_joint" kp="300.0" kd="40.0"/>
+                <joint name="RL_calf_joint"  kp="300.0" kd="40.0"/>
+                <joint name="RR_hip_joint"   kp="100.0" kd="20.0"/>
+                <joint name="RR_thigh_joint" kp="300.0" kd="40.0"/>
+                <joint name="RR_calf_joint"  kp="300.0" kd="40.0"/>
+            </joints>
+        </plugin>
+    </gazebo>
+
+    <!-- ==================================================================
+         2. IMU：躯干 IMU + Livox MID360 内置 IMU
+         ================================================================== -->
+    <gazebo reference="imu_link">
+        <gravity>true</gravity>
+        <sensor name="imu_sensor" type="imu">
+            <always_on>true</always_on>
+            <update_rate>1000</update_rate>
+            <visualize>false</visualize>
+            <pose>0 0 0 0 0 0</pose>
+            <plugin name="imu_plugin" filename="libgazebo_ros_imu_sensor.so">
+                <initial_orientation_as_reference>false</initial_orientation_as_reference>
+                <ros>
+                    <namespace>/${robot_ns}</namespace>
+                    <remapping>~/out:=imu</remapping>
+                </ros>
+            </plugin>
+        </sensor>
+    </gazebo>
+
+    <gazebo reference="livox_imu_link">
+        <gravity>true</gravity>
+        <sensor name="livox_imu_sensor" type="imu">
+            <always_on>true</always_on>
+            <update_rate>1000</update_rate>
+            <visualize>false</visualize>
+            <pose>0 0 0 0 0 0</pose>
+            <plugin name="livox_imu_plugin" filename="libgazebo_ros_imu_sensor.so">
+                <initial_orientation_as_reference>false</initial_orientation_as_reference>
+                <ros>
+                    <namespace>/${robot_ns}</namespace>
+                    <remapping>~/out:=livox/imu</remapping>
+                </ros>
+            </plugin>
+        </sensor>
+    </gazebo>
+
+    <!-- ==================================================================
+         3. 真值位姿（p3d）—— 代替 state_from_gazebo 的仿真真值
+         ================================================================== -->
+    <!-- 说明：上游还有一个 p3d_base_trunk（body=base, frame=trunk），
+         但 trunk 在 URDF→SDF 时会被合并进 base（见图上方说明），
+         frame_name=trunk 在 Gazebo 里必然报 "does not exist"，故去掉。
+         躯干真值用下面的 base_w（世界系）即可。 -->
+
+    <gazebo>
+        <plugin name="p3d_base_w" filename="libgazebo_ros_p3d.so">
+            <ros>
+                <namespace>/${robot_ns}</namespace>
+                <remapping>odom:=ground_truth/base_w</remapping>
+            </ros>
+            <body_name>base</body_name>
+            <frame_name>world</frame_name>
+            <update_rate>100</update_rate>
+        </plugin>
+    </gazebo>
+
+    <gazebo>
+        <plugin name="p3d_FL_foot" filename="libgazebo_ros_p3d.so">
+            <ros>
+                <namespace>/${robot_ns}</namespace>
+                <remapping>odom:=ground_truth/FL_foot</remapping>
+            </ros>
+            <body_name>FL_foot</body_name>
+            <frame_name>base</frame_name>
+            <update_rate>100</update_rate>
+        </plugin>
+    </gazebo>
+
+    <gazebo>
+        <plugin name="p3d_FR_foot" filename="libgazebo_ros_p3d.so">
+            <ros>
+                <namespace>/${robot_ns}</namespace>
+                <remapping>odom:=ground_truth/FR_foot</remapping>
+            </ros>
+            <body_name>FR_foot</body_name>
+            <frame_name>base</frame_name>
+            <update_rate>100</update_rate>
+        </plugin>
+    </gazebo>
+
+    <gazebo>
+        <plugin name="p3d_RL_foot" filename="libgazebo_ros_p3d.so">
+            <ros>
+                <namespace>/${robot_ns}</namespace>
+                <remapping>odom:=ground_truth/RL_foot</remapping>
+            </ros>
+            <body_name>RL_foot</body_name>
+            <frame_name>base</frame_name>
+            <update_rate>100</update_rate>
+        </plugin>
+    </gazebo>
+
+    <gazebo>
+        <plugin name="p3d_RR_foot" filename="libgazebo_ros_p3d.so">
+            <ros>
+                <namespace>/${robot_ns}</namespace>
+                <remapping>odom:=ground_truth/RR_foot</remapping>
+            </ros>
+            <body_name>RR_foot</body_name>
+            <frame_name>base</frame_name>
+            <update_rate>100</update_rate>
+        </plugin>
+    </gazebo>
+
+    <!-- ==================================================================
+         4. 外力施加接口（替代 ROS 1 的 gazebo_ros_force）
+         ================================================================== -->
+    <gazebo>
+        <plugin name="gazebo_ros_force" filename="libgazebo_ros_force.so">
+            <ros>
+                <namespace>/${robot_ns}</namespace>
+                <remapping>gazebo_ros_force:=apply_force/trunk</remapping>
+            </ros>
+            <link_name>base</link_name>
+            <force_frame>world</force_frame>
+        </plugin>
+    </gazebo>
+
+    <!-- ==================================================================
+         5. Livox MID360 激光雷达
+            发布 livox_ros_driver2/msg/CustomMsg 到 /<robot_ns>/livox/lidar
+            （插件来自系统包 ros2_livox_simulation）
+         ================================================================== -->
+    <gazebo reference="laser_livox">
+        <sensor type="ray" name="laser_livox">
+            <pose>0 0 0 0 0 0</pose>
+            <visualize>false</visualize>
+            <update_rate>10</update_rate>
+            <plugin name="livox_laser_plugin" filename="libros2_livox.so">
+                <ray>
+                    <scan>
+                        <horizontal>
+                            <samples>100</samples>
+                            <resolution>1</resolution>
+                            <min_angle>0</min_angle>
+                            <max_angle>${2*M_PI}</max_angle>
+                        </horizontal>
+                        <vertical>
+                            <samples>360</samples>
+                            <resolution>1</resolution>
+                            <min_angle>${-5.22/180*M_PI}</min_angle>
+                            <max_angle>${57.22/180*M_PI}</max_angle>
+                        </vertical>
+                    </scan>
+                    <range>
+                        <min>0.1</min>
+                        <max>40</max>
+                        <resolution>0.01</resolution>
+                    </range>
+                    <noise>
+                        <type>gaussian</type>
+                        <mean>0.0</mean>
+                        <stddev>0.005</stddev>
+                    </noise>
+                </ray>
+                <visualize>false</visualize>
+                <samples>24000</samples>
+                <downsample>1</downsample>
+                <csv_file_name>$(find a1_description)/scan_mode/mid360.csv</csv_file_name>
+                <topic>/${robot_ns}/livox/lidar</topic>
+            </plugin>
+        </sensor>
+    </gazebo>
+
+    <!-- ==================================================================
+         6. 足端接触力（替代 ROS 1 的 libunitreeFootContactPlugin）
+            发布 gazebo_msgs/msg/ContactsState 到 /<robot_ns>/contact/<FOOT>
+         ================================================================== -->
+    <gazebo reference="FL_foot">
+        <sensor type="contact" name="FL_foot_contact">
+            <update_rate>100</update_rate>
+            <plugin name="FL_foot_contact_plugin" filename="libgazebo_ros_bumper.so">
+                <ros>
+                    <namespace>/${robot_ns}</namespace>
+                    <remapping>bumper_states:=contact/FL_foot</remapping>
+                </ros>
+                <frame_name>FL_foot</frame_name>
+            </plugin>
+        </sensor>
+    </gazebo>
+
+    <gazebo reference="FR_foot">
+        <sensor type="contact" name="FR_foot_contact">
+            <update_rate>100</update_rate>
+            <plugin name="FR_foot_contact_plugin" filename="libgazebo_ros_bumper.so">
+                <ros>
+                    <namespace>/${robot_ns}</namespace>
+                    <remapping>bumper_states:=contact/FR_foot</remapping>
+                </ros>
+                <frame_name>FR_foot</frame_name>
+            </plugin>
+        </sensor>
+    </gazebo>
+
+    <gazebo reference="RL_foot">
+        <sensor type="contact" name="RL_foot_contact">
+            <update_rate>100</update_rate>
+            <plugin name="RL_foot_contact_plugin" filename="libgazebo_ros_bumper.so">
+                <ros>
+                    <namespace>/${robot_ns}</namespace>
+                    <remapping>bumper_states:=contact/RL_foot</remapping>
+                </ros>
+                <frame_name>RL_foot</frame_name>
+            </plugin>
+        </sensor>
+    </gazebo>
+
+    <gazebo reference="RR_foot">
+        <sensor type="contact" name="RR_foot_contact">
+            <update_rate>100</update_rate>
+            <plugin name="RR_foot_contact_plugin" filename="libgazebo_ros_bumper.so">
+                <ros>
+                    <namespace>/${robot_ns}</namespace>
+                    <remapping>bumper_states:=contact/RR_foot</remapping>
+                </ros>
+                <frame_name>RR_foot</frame_name>
+            </plugin>
+        </sensor>
+    </gazebo>
+
+    <!-- ==================================================================
+         7. 材质与接触参数（与 ROS 1 版一致）
+         ================================================================== -->
+    <gazebo reference="base">
+        <material>Gazebo/Green</material>
+        <turnGravityOff>false</turnGravityOff>
+    </gazebo>
+
+    <gazebo reference="base">
+        <!-- trunk 被合并进 base，接触/摩擦参数写在这里 -->
+        <mu1>0.2</mu1>
+        <mu2>0.2</mu2>
+        <kp value="10000.0"/>
+        <kd value="1.0"/>
+    </gazebo>
+
+    <!-- stick_link 只在 rolloverProtection=true 时才存在，此处不生成 -->
+
+    <gazebo reference="imu_link">
+        <mu1>0.2</mu1>
+        <mu2>0.2</mu2>
+        <material>Gazebo/Red</material>
+    </gazebo>
+
+    <!-- FL leg -->
+    <gazebo reference="FL_hip">
+        <mu1>0.2</mu1>
+        <mu2>0.2</mu2>
+        <material>Gazebo/DarkGrey</material>
+    </gazebo>
+    <gazebo reference="FL_thigh">
+        <mu1>0.2</mu1>
+        <mu2>0.2</mu2>
+        <self_collide>0</self_collide>
+        <material>Gazebo/DarkGrey</material>
+        <kp value="10000.0"/>
+        <kd value="1.0"/>
+    </gazebo>
+    <gazebo reference="FL_calf">
+        <mu1>0.2</mu1>
+        <mu2>0.2</mu2>
+        <self_collide>0</self_collide>
+    </gazebo>
+    <gazebo reference="FL_foot">
+        <mu1>0.6</mu1>
+        <mu2>0.6</mu2>
+        <self_collide>0</self_collide>
+        <material>Gazebo/DarkGrey</material>
+        <kp value="10000.0"/>
+        <kd value="1.0"/>
+    </gazebo>
+
+    <!-- FR leg -->
+    <gazebo reference="FR_hip">
+        <mu1>0.2</mu1>
+        <mu2>0.2</mu2>
+        <material>Gazebo/DarkGrey</material>
+    </gazebo>
+    <gazebo reference="FR_thigh">
+        <mu1>0.2</mu1>
+        <mu2>0.2</mu2>
+        <self_collide>0</self_collide>
+        <material>Gazebo/DarkGrey</material>
+        <kp value="10000.0"/>
+        <kd value="1.0"/>
+    </gazebo>
+    <gazebo reference="FR_calf">
+        <mu1>0.2</mu1>
+        <mu2>0.2</mu2>
+        <self_collide>0</self_collide>
+    </gazebo>
+    <gazebo reference="FR_foot">
+        <mu1>0.6</mu1>
+        <mu2>0.6</mu2>
+        <self_collide>0</self_collide>
+        <material>Gazebo/DarkGrey</material>
+        <kp value="10000.0"/>
+        <kd value="1.0"/>
+    </gazebo>
+
+    <!-- RL leg -->
+    <gazebo reference="RL_hip">
+        <mu1>0.2</mu1>
+        <mu2>0.2</mu2>
+        <material>Gazebo/DarkGrey</material>
+    </gazebo>
+    <gazebo reference="RL_thigh">
+        <mu1>0.2</mu1>
+        <mu2>0.2</mu2>
+        <self_collide>0</self_collide>
+        <material>Gazebo/DarkGrey</material>
+        <kp value="10000.0"/>
+        <kd value="1.0"/>
+    </gazebo>
+    <gazebo reference="RL_calf">
+        <mu1>0.2</mu1>
+        <mu2>0.2</mu2>
+        <self_collide>0</self_collide>
+    </gazebo>
+    <gazebo reference="RL_foot">
+        <mu1>0.6</mu1>
+        <mu2>0.6</mu2>
+        <self_collide>0</self_collide>
+        <material>Gazebo/DarkGrey</material>
+        <kp value="10000.0"/>
+        <kd value="1.0"/>
+    </gazebo>
+
+    <!-- RR leg -->
+    <gazebo reference="RR_hip">
+        <mu1>0.2</mu1>
+        <mu2>0.2</mu2>
+        <material>Gazebo/DarkGrey</material>
+    </gazebo>
+    <gazebo reference="RR_thigh">
+        <mu1>0.2</mu1>
+        <mu2>0.2</mu2>
+        <self_collide>0</self_collide>
+        <material>Gazebo/DarkGrey</material>
+        <kp value="10000.0"/>
+        <kd value="1.0"/>
+    </gazebo>
+    <gazebo reference="RR_calf">
+        <mu1>0.2</mu1>
+        <mu2>0.2</mu2>
+        <self_collide>0</self_collide>
+    </gazebo>
+    <gazebo reference="RR_foot">
+        <mu1>0.6</mu1>
+        <mu2>0.6</mu2>
+        <self_collide>0</self_collide>
+        <material>Gazebo/DarkGrey</material>
+        <kp value="10000.0"/>
+        <kd value="1.0"/>
+    </gazebo>
+
+</robot>

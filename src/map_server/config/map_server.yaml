@@ -19,8 +19,11 @@ map_server:
 
     # ---- 输出 ----
     # 静态图用 latched(transient_local) 发布：载图/换图时发一次。
-    # RViz 的 Map 显示项默认 Durability=Volatile，收不到历史样本 → 由
-    # republish_on_new_subscriber 看门狗在“有新订阅者”时补发一次（稳态零流量）。
+    # RViz 的 Map / PointCloud2 显示项默认 Durability=Volatile，收不到历史样本 →
+    # 由 republish_on_new_subscriber 看门狗在“有新订阅者”时补发一次（稳态零流量）。
+    # ⚠ 看门狗登记的是**本节点发布的全部 latched 话题**（occupancy/metadata/
+    #   cloud/routes/zones），各自独立计数。2026-09-30 之前只登记了 occupancy，
+    #   于是“只订点云的 Volatile 订阅者”永远等不到补发（点云空白）。
     # 老做法是每秒重发一张图（实测 186349 格 ≈ 182 KB ≈ 1.5 Mbit/s + 每秒唤醒所有下游），已改成默认关闭。
     frame_id: "map"
     topic_occupancy: "global_map/occupancy"     # nav_msgs/OccupancyGrid
@@ -47,16 +50,18 @@ map_server:
     # 使到离墙 0 的地方。给图加几 cm 余量后，"点在图上"就自带余量。
     # 与 zones.inflate 是**两件事**：后者是禁行区的膨胀量，这里是真障碍的。
     #
-    # ⚠ 它与规划器的 `footprint.safe_margin`（pnc_2d 里也有一个同名项）**叠加**：
-    #   两个都开时，规划器实际要求的余量 ≈ 两者之和。启动日志会把两者都打出来，
-    #   避免历史上踩过的"同一件事算了两次"那种盲区。只要一份余量就把其中一个置 0。
+    # ⚠ 它与规划器自己的安全边（`pnc_2d/config/pnc_2d.yaml` 里的
+    #   `footprint.safe_margin`）**叠加**：两个都开时，规划器实际要求的余量 ≈
+    #   两者之和。启动日志会把两者都打出来，避免历史上踩过的"同一件事算了两
+    #   次"那种盲区。只要一份余量就把其中一个置 0。
+    #   （2026-09-30：本节点自己的 `footprint.*` 参数已删除，只保留这个数值引用）
     # ⚠ 只在**载图 / 重载**时生效（与禁行区烧入同一时机）。运行期改：
     #     ros2 param set /map_server inflate 0.08
     #     ros2 service call /global_map/load_map nav2_msgs/srv/LoadMap \
     #         "{map_url: /home/gmd/rcs/maps/go2_sim_factory}"
     # ★ 2026-09-23 用户要求：留几 cm。取 5 cm —— 与 zones.inflate 同量级，
     #   最窄通道（实测路网最紧处净距 ≈0.60 m，车体外接圆 0.40 m）仍有余量。
-    inflate: 0.05
+    inflate: 0.00
 
     # ---- 运行时换图服务 ----
     srv_load_map: "global_map/load_map"         # nav2_msgs/LoadMap
@@ -66,21 +71,18 @@ map_server:
     # ==================================================================
     # 与 map.yaml 同目录的 routes.yaml（换图四件套同源）。
     # ⚠ 站点没有这个文件时只打一句 INFO，**不会报错**（很多站点还没画路网）。
-    # 本节点不做规划，但会用地图 + 车体轮廓逐条校验“这条通道车能不能过”，
-    # 过不去的通道在 RViz 里标红（避免画得漂亮但车过不去）。
+    # 本节点不做规划，也**不做通行性校验**（2026-09-30 起）：载图只负责加载/发布
+    # 与可视化，通道能不能过由 `route_network_planner` 在载图后自己判。
     publish_routes: true                        # false = 不加载也不发可视化
     routes_file: ""                             # 空 = <地图目录>/routes.yaml
     topic_routes: "global_map/routes"           # visualization_msgs/MarkerArray（latched）
 
-    # 车体轮廓与代价语义（与 pnc_2d 同名，仅用于路网可行性校验；必须与规划器一致）
-    footprint.enable: true
-    footprint.length: 0.70
-    footprint.width: 0.40
-    footprint.offset_x: 0.0
-    footprint.offset_y: 0.0
-    footprint.safe_margin: 0.05
-    footprint.check_edges: true
-    footprint.fast_path: true
+    # 2026-09-30：【已移除】车体轮廓 `footprint.*` 与 `common.hard_threshold`
+    #   曾经的用途是“载图时校验路网通道车体能不能过”。该职责已按用户要求交回
+    #   规划器（`route_network_planner` 自己算 `e.feasible` + `reject_infeasible`）
+    #   ⇒ 本节点不再声明这些参数（历史上三处数值不一致就是从这里开始的）。
+    #   ⚠ 车体几何现在是**单一来源**：`pnc_2d/config/pnc_2d.yaml` 的 `footprint.*`
+    #     （perception 的 `grid_map.footprint_*` 必须与它对齐）。
     common.hard_threshold: 80
     common.unknown_as_occupied: true
 
@@ -113,17 +115,28 @@ map_server:
     zones.inflate: 0.05
 
     # ==================================================================
-    # 3D 地图（M3 接口；本期只接线，不实现内容）
+    # 3D 地图（global.pcd；2026-09-30 已实现）
     # ==================================================================
     # 设计：3D 地图与 2D 在**同一个地图目录**（global.pcd），跟着同一个 load_map
     # 服务一起加载 → 不会出现"换图三件套不同源". 所以不需要额外的服务类型。
     # 打开 publish_3d 后：
     #   · 启动时创建话题 topic_cloud_3d（latched，与 2D 同为 transient_local）
     #   · 载图成功才发布；载入失败只 WARN（不连累 2D），require_3d=true 时才报错中止
-    #   · PCD 解析尚未实现 → 现在会看到 WARN，且话题上无数据
-    publish_3d: false
+    #   · 解码用 PCL 的 io（支持 binary_compressed/LZF），只保留 xyz；
+    #     cloud_voxel_leaf > 0 时先做体素降采样（每体素取质心）
+    # ★ 2026-09-30：打开 3D 地图发布（用户要求"加载 2d 和 3d 地图，且只发布一次"）。
+    #   "只发一次"在代码侧已经成立，不要被下面两个参数误导：
+    #     · `republish_interval: 0.0` ⇒ **无周期重发**（周期定时器根本不创建）；
+    #     · `republish_on_new_subscriber: true` ⇒ 仅当**出现新订阅者**时补发一次
+    #       （稳态零流量；这是为了兼容 Volatile 订阅者，不是"重复发布"）。
+    #   所以 2D 与 3D 都是：载图/换图时发一次（latched/transient_local）+ 按需补发。
+    #   点云**不累积**：每次载图重建 cloud_msg_，publishCloud3D() 只发这一份。
+    publish_3d: true
     pcd_file: ""                     # 空 = <map_dir>/global.pcd；也可直接给 .pcd 路径
     topic_cloud_3d: "global_map/cloud"   # sensor_msgs/PointCloud2
     cloud_frame_id: "map"            # 默认与 frame_id 一致；点云常来自别的源，可单独指定
-    cloud_voxel_leaf: 0.0            # 预留：发布前体素降采样（m，0 = 不降采样）
-    require_3d: false               # true = 3D 加载失败时整次 load_map 报错
+    cloud_voxel_leaf: 0.0            # 发布前体素降采样（m，0 = 不降采样，一个点不丢）
+    require_3d: true               # true = 3D 加载失败时整次 load_map 报错
+                                   # ★ 2026-09-30：解析已实现（PCL），所以打开它：
+                                   #   以前是桩 + false ⇒ 失败只 WARN，静默“没有 3D”
+                                   #   很难被发现（就被误导过一轮）。

@@ -174,6 +174,9 @@ void GridMap::initMap(rclcpp::Node *node) {
   load_parameter(node_, "grid_map.decay_timeout_s", mp_.decay_timeout_s_, 5.0);
   load_parameter(node_, "grid_map.decay_rate", mp_.decay_rate_, 0.3);
   load_parameter(node_, "grid_map.decay_max_dist", mp_.decay_max_dist_, -1.0);
+  /* 仅测试用：点云重复份数（性能标定，生产恒为
+   * 1）。每帧实时读，故支持在线扫。*/
+  load_parameter(node_, "grid_map.test_dup_cloud", mp_.test_dup_cloud_, 1);
   if (mp_.decay_rate_ < 0.0)
     mp_.decay_rate_ = 0.0;
   if (mp_.decay_timeout_s_ < 0.0)
@@ -1028,8 +1031,9 @@ void GridMap::raycastProcess() {
 
   md_.raycast_num_ += 1;
 
-  /* 本帧时刻（秒，相对首次调用）。setCacheOccupancy 会把它写进被命中体素的时间戳，
-     decayStaleOccupancy 再拿它判超时 —— 同一帧内必须一致。 */
+  /* 本帧时刻（秒，相对首次调用）。setCacheOccupancy
+     会把它写进被命中体素的时间戳， decayStaleOccupancy 再拿它判超时 ——
+     同一帧内必须一致。 */
   {
     static const auto epoch = std::chrono::steady_clock::now();
     md_.decay_now_s_ = static_cast<float>(
@@ -1451,33 +1455,47 @@ void GridMap::cloudCallback(
 
   md_.proj_points_cnt = 0;
 
-  for (size_t i = 0; i < latest_cloud.points.size(); ++i) {
-    const pcl::PointXYZ &pt = latest_cloud.points[i];
-    if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z))
-      continue;
-
-    Eigen::Vector3d pt_world;
-    if (mp_.cloud_is_world_) {
-      pt_world = Eigen::Vector3d(pt.x, pt.y, pt.z);
-    } else {
-      const Eigen::Vector3d pt_sensor(pt.x, pt.y, pt.z);
-      pt_world = sensor_r * pt_sensor + ray_pos;
-    }
-    const Eigen::Vector3d devi = pt_world - ray_pos;
-    const double ray_length = devi.norm();
-    const bool in_local_range = fabs(devi(0)) <= mp_.local_update_range_(0) &&
-                                fabs(devi(1)) <= mp_.local_update_range_(1) &&
-                                fabs(devi(2)) <= mp_.local_update_range_(2);
-    if (!in_local_range && ray_length <= mp_.max_ray_length_)
-      continue;
-
-    if (md_.proj_points_cnt >= static_cast<int>(md_.proj_points_.size()))
-      md_.proj_points_.push_back(pt_world);
-    else
-      md_.proj_points_[md_.proj_points_cnt] = pt_world;
-
-    md_.proj_points_cnt++;
+  /* ★ 性能标定（P0，2026-09-30）：把同一帧点云重复 dup 次，模拟“更密的点云”。
+     用途：为“让 lightning 多发一路未降采样点云（≈10240 点，当前 3255）”的决策
+     标定 raycast 的耗时曲线。**每帧实时读** ⇒ 可用
+     `ros2 param set /perception_node grid_map.test_dup_cloud 4` 在线扫点数。
+     ⚠ 生产配置必须保持 1（默认），否则等于人为造假障碍（重复点写同一体素）。 */
+  int dup = 1;
+  {
+    const auto p = node_->get_parameter("grid_map.test_dup_cloud");
+    if (p.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER)
+      dup = static_cast<int>(p.as_int());
+    dup = std::max(1, std::min(dup, 20));
   }
+
+  for (int d = 0; d < dup; ++d)
+    for (size_t i = 0; i < latest_cloud.points.size(); ++i) {
+      const pcl::PointXYZ &pt = latest_cloud.points[i];
+      if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z))
+        continue;
+
+      Eigen::Vector3d pt_world;
+      if (mp_.cloud_is_world_) {
+        pt_world = Eigen::Vector3d(pt.x, pt.y, pt.z);
+      } else {
+        const Eigen::Vector3d pt_sensor(pt.x, pt.y, pt.z);
+        pt_world = sensor_r * pt_sensor + ray_pos;
+      }
+      const Eigen::Vector3d devi = pt_world - ray_pos;
+      const double ray_length = devi.norm();
+      const bool in_local_range = fabs(devi(0)) <= mp_.local_update_range_(0) &&
+                                  fabs(devi(1)) <= mp_.local_update_range_(1) &&
+                                  fabs(devi(2)) <= mp_.local_update_range_(2);
+      if (!in_local_range && ray_length <= mp_.max_ray_length_)
+        continue;
+
+      if (md_.proj_points_cnt >= static_cast<int>(md_.proj_points_.size()))
+        md_.proj_points_.push_back(pt_world);
+      else
+        md_.proj_points_[md_.proj_points_cnt] = pt_world;
+
+      md_.proj_points_cnt++;
+    }
 
   if (md_.proj_points_cnt == 0) {
     note_ms();

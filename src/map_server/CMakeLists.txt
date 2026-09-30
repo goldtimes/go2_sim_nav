@@ -16,6 +16,10 @@ find_package(nav2_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(yaml-cpp REQUIRED)
+# PCD 解码（2026-09-30）：实测地图是 `DATA binary_compressed`（LZF），
+# 用 PCL 的 io 库读可一次覆盖 ascii / binary / binary_compressed。
+# 只给 `map_io` 用；头文件不暴露 PCL 类型，map_server_node 不受影响。
+find_package(PCL REQUIRED COMPONENTS common io)
 # 路网：复用 pnc_2d 的 RouteGraph（ROS-free 数据结构 + yaml 读写）
 # 依赖方向：map_server（资产）→ pnc_2d（库）；只用到数据层，不用规划器
 find_package(pnc_2d REQUIRED)
@@ -25,8 +29,9 @@ add_library(map_io src/map_io.cpp)
 target_include_directories(map_io PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
-  ${YAML_CPP_INCLUDE_DIR})
-target_link_libraries(map_io PUBLIC ${YAML_CPP_LIBRARIES})
+  ${YAML_CPP_INCLUDE_DIR}
+  ${PCL_INCLUDE_DIRS})
+target_link_libraries(map_io PUBLIC ${YAML_CPP_LIBRARIES} ${PCL_LIBRARIES})
 
 # ---- 节点 ----
 add_executable(map_server_node src/map_server_node.cpp)

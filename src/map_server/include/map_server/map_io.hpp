@@ -67,9 +67,10 @@ bool loadPgm(const std::string &pgm_path, int &w, int &h,
 bool loadOccupancyMap(const std::string &dir_or_yaml, OccupancyMap &out,
                       std::string &err);
 
-/* ======================= 3D 地图（M3 接口）=======================
- * 只定义数据形态与入口：同一个地图目录下的 global.pcd。
- * 本期不实现解析（loadPcd 会明确返回"未实现"，不静默当空图）。
+/* ======================= 3D 地图（PCD）=======================
+ * 同一个地图目录下的 global.pcd。
+ * 2026-09-30 已实现（PCL 的 io 库，支持 ascii/binary/binary_compressed）：
+ * 只保留 xyz，intensity/time 丢掉。
  */
 struct PointCloud3D {
   std::vector<float> xyz; ///< 3*N，x,y,z 交错
@@ -80,8 +81,11 @@ struct PointCloud3D {
 std::string resolvePcd(const std::string &dir_or_pcd);
 
 /**
- * 读取 PCD。**M3 待实现**：目前只做"文件是否存在"+ PCD 头合法性校验，
- * 然后返回 false 并在 err 里明说"PCD 解析未实现"（便于 M3 时在这里填内容）。
+ * 读取 PCD 并把 x,y,z 填进 `out.xyz`（3*N，交错）。
+ * 实现：`pcl::io::loadPCDFile<pcl::PointXYZ>`（自带 binary_compressed 的 LZF
+ * 解压）。 失败时返回 false 并在 `err` 里说明（文件不存在 / 不是合法 PCD / PCL
+ * 读取失败）。 ⚠ 调用方（map_server_node）自行决定失败是否致命：默认只
+ * WARN，`require_3d` 才中止。
  */
 bool loadPcd(const std::string &pcd_path, PointCloud3D &out, std::string &err);
 

@@ -33,7 +33,7 @@
 |---|---|---|
 | 发布 | `global_map/occupancy` | `nav_msgs/OccupancyGrid`，QoS **transient_local** depth 1 |
 | 发布 | `global_map/metadata` | `nav_msgs/MapMetaData`（`publish_metadata` 控制） |
-| 发布 | `global_map/cloud` | `sensor_msgs/PointCloud2`（**M3 接口，仅 `publish_3d: true` 时创建**；内容待实现） |
+| 发布 | `global_map/cloud` | `sensor_msgs/PointCloud2`（**仅 `publish_3d: true` 时创建**；latched，xyz float32） |
 | 服务 | `global_map/load_map` | `nav2_msgs/srv/LoadMap`，`map_url` 收**站点目录**或 **yaml 路径**（也接受 `file://` 前缀） |
 
 ### 参数（`config/map_server.yaml`）
@@ -54,21 +54,30 @@
 | `topic_routes` | `global_map/routes` | 路网 + 区域可视化（`MarkerArray`，latched） |
 | `zones.burn_into_map` | `true` | 把**禁行区**烧进发布的全局图（全栈生效） |
 | `zones.inflate` | `-1.0` | 禁行区膨胀量 [m]；<0 = 自动用车体外接圆半径 |
-| `footprint.*` / `common.hard_threshold` / `common.unknown_as_occupied` | 同 pnc_2d | **仅用于路网可行性校验**，必须与规划器一致 |
+| `publish_3d` / `pcd_file` / `cloud_voxel_leaf` / `require_3d` | 见下 | 3D 点云（同目录 `global.pcd`） |
+
+> **2026-09-30：车体轮廓 `footprint.*` 已从本节点移除**（以及 `common.hard_threshold`
+> 里的 `common.unknown_as_occupied` 之外的部分）。原因：它们唯一的作用是“路网可行性
+> 校验”，而该职责已交给 `route_network_planner`。车体几何现在是**单一来源** ——
+> `pnc_2d/config/pnc_2d.yaml` 的 `footprint.*`（perception 的 `grid_map.footprint_*`
+> 必须与它对齐）。历史上三处数值不一致就是从这里开始的。
 
 #### 路网（`routes.yaml`）：**可选资产**
 
-本节点把路网当作与地图同级的**站点资产**管起来：加载、按站点切换、逐条校验、可视化。
+本节点把路网当作与地图同级的**站点资产**管起来：加载、按站点切换、可视化。
 
 - 文件位置：与 `map.yaml` 同目录（换图四件套同源）；
 - **没有这个文件很正常**：只打一句 `该站点没有路网文件（路网是可选的，跳过）`，
   **不影响地图发布、不报错**；
 - 文件坏了 / 格式不对：`WARN` 说明原因，仍然不影响地图发布；
 - 加载成功后会：
-  1. 用**刚发布的地图** + 车体轮廓（`footprint.*`）逐条通道做碰撞校验，
-     过不去的通道在 RViz 里**标红**并 `WARN` 列出 `A→B, B→C` 这样的通道名；
-  2. 发布 `global_map/routes`（latched）：节点（按语义着色 + 名字标签）、
-     通道（可行青蓝 / 不可行红色）、单向箭头。
+  1. 发布 `global_map/routes`（latched）：节点（按语义着色 + 名字标签）、
+     通道（可行青蓝 / 不可行红色）、单向箭头 —— 颜色直接取 `routes.yaml` 里每条边的
+     `feasible`（**默认 true**），本节点**不自己算**；
+  2. 逐条打印 `routes_.warnings()`（格式问题、孤立点等）。
+> **本节点不做通行性校验**（2026-09-30 起）：不再用地图 + 车体轮廓逐条通道碰撞检查，
+> 也就**不会**再在 RViz 里把不可行通道标红。真正的校验在 `route_network_planner`
+> （它自己算 `e.feasible` 并有 `route_network.reject_infeasible` 开关 + 计数）。
 - 换站点（`load_map` 服务）时会**一并重载路网**，并把上一个站点多出来的标记发 `DELETE` 清掉。
 
 通道默认**双向**；需要单向时给该条边加 `one_way: true`。
@@ -120,7 +129,7 @@ cd ~/r41_ws
 |---|---|---|
 | `--map-dir` | `/home/gmd/rcs/maps/go2_sim_factory` | 站点地图目录（含 `map.yaml` + `map.pgm`） |
 | `--routes` | `<map-dir>/routes.yaml` | 输出文件；**已存在则先载入**，可继续编辑 |
-| `--lane-length` / `--lane-width` / `--margin` | `0.70` / `0.40` / `0.05` | 车体尺寸，用于通行性检查。**必须与 `map_server` 的 `footprint.*`（及规划器）一致**，否则会出现“编辑器说通得过、map_server 说过不去” |
+| `--lane-length` / `--lane-width` / `--margin` | `0.70` / `0.40` / `0.05` | 车体尺寸，**仅编辑器本地**做通行性/禁行区自检用。建议与 `pnc_2d/config/pnc_2d.yaml` 的 `footprint.*` 对齐，免得“编辑器说通得过、规划器说通不过” |
 | `--snap` | `0.30` | 点到已有节点的吸附半径 [m]，用于把通道接到一起 |
 | `--zone-inflate` | `-1`（自动） | 检查禁行区时给区域加多少膨胀 [m]；`<0` = 自动用车体**外接圆半径**（Go2 是 0.472 m）。**必须与 map_server 的 `zones.inflate` 一致**，否则会出现“编辑器说通得过、map_server 说过不去”；想缩小膨胀（例如用内切半径 `0.25`）两边一起改 |
 
@@ -199,7 +208,7 @@ cd ~/r41_ws
 
 0. **孤立点**：没被任何通道引用的点会单独列出来（不算错误，提醒你别忘了连）；
 1. **通行性**：用车体矩形（含 margin）沿每条通道逐位姿扫一遍，**并把禁行区按车体外接圆半径膨胀一并计入**
-   （与本节点同口径）→ 过不去的通道**标红**并在终端列出；
+   （**编辑器本地自检**，与 map_server 无关；map_server 已不做校验）→ 过不去的通道**标红**并在终端列出；
 2. **连通性**：路网被切成几块会列出每块的节点名 —— 断开的路网会让规划器“只能在同一块里找通路”，
    这是最隐蔽的错误；
 3. **重复通道**：同起止点出现多次会提示（多半是重复画了一遍）。
@@ -237,16 +246,16 @@ cd ~/r41_ws
 > 的规划节点发布在 `/pnc_2d/plan_markers`（只有它知道这次走了哪几条通道）。
 > RViz 里各加一个 MarkerArray 显示项即可，不会重复画。
 
-### 3D 地图参数（M3 接口，本期只接线）
+### 3D 地图参数
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `publish_3d` | `false` | 打开则创建 `topic_cloud_3d`（latched，与 2D 同为 transient_local） |
+| `publish_3d` | `true`（本项目） | 打开则创建 `topic_cloud_3d`（latched，与 2D 同为 transient_local） |
 | `pcd_file` | `""` | 空 = `<map_dir>/global.pcd`；也可直接给 `.pcd` 路径 |
-| `topic_cloud_3d` | `global_map/cloud` | `sensor_msgs/PointCloud2` |
+| `topic_cloud_3d` | `global_map/cloud` | `sensor_msgs/PointCloud2`（xyz float32） |
 | `cloud_frame_id` | = `frame_id` | 点云常来自别的源，可单独指定 |
-| `cloud_voxel_leaf` | `0.0` | 预留：发布前体素降采样（m） |
-| `require_3d` | `false` | true = 3D 加载失败时整个 `load_map` 报错；否则只 WARN（不连累 2D） |
+| `cloud_voxel_leaf` | `0.0` | 发布前体素降采样（m）；`0` = 一个点不丢 |
+| `require_3d` | `true`（本项目） | true = 3D 加载失败时整个 `load_map` 报错；否则只 WARN（不连累 2D） |
 
 #### 重发策略：默认“发一次 + 按需补发”（不再每秒重发）
 
@@ -262,9 +271,18 @@ Map 显示项默认 `Durability=Volatile`**，而 Volatile 订阅端**不会**�
 | **默认：看门狗按需补发** | ✓ | **0** |
 | 周期重发（`republish_interval: 1.0`，旧行为） | ✓ | 一张图/秒（本项目 186349 格 ≈ 182 KB ≈ 1.5 Mbit/s），且**每秒唤醒所有下游节点** |
 
-默认策略是第二种：**载图/换图时发一次**（latched），此后每 0.5 s 只做一次“订阅者数量是否变多”
-的整数比较；一旦变多、且其中有 Volatile 订阅者，就补发一次（全是 `transient_local` 的订阅者
-已经自动收到历史样本，不补发）。
+默认策略是第二种：**载图/换图时发一次**（latched），此后每 0.5 s 对**每个 latched
+话题**只做一次“订阅者数量是否变多”的整数比较；一旦变多、且其中有 Volatile 订阅者，
+就**对该话题**补发一次（全是 `transient_local` 的订阅者已经自动收到历史样本，不补发）。
+
+登记的话题（`latch_watchers_`）：`global_map/occupancy`（含 metadata）、
+`global_map/cloud`（`publish_3d` 时）、`global_map/routes`、`global_map/zones`。
+
+> ★ **2026-09-30 修的 bug**：以前看门狗**只盯 `global_map/occupancy`**，于是“只订了点云
+> 的 Volatile 订阅者”（RViz 的 PointCloud2 显示项默认就是 Volatile）**永远等不到补发** ——
+> 现象是“2D 图能看到、点云空白”，而且 `ros2 topic echo`（默认 Volatile 时）也收不到。
+> 修后上面 4 个话题各自计数，实测 `ros2 topic echo --qos-durability volatile` 能拿到
+> `global_map/cloud` 的 171590 点。
 
 实现约束：Humble 的 `rclcpp::PublisherEventCallbacks` **没有 `matched` 回调**（Iron 之后才有），
 所以只能用轻量轮询，不能用“订阅者匹配事件”。已知局限：若“一个订阅者离开、另一个同时进来”
@@ -281,53 +299,63 @@ Map 显示项默认 `Durability=Volatile`**，而 Volatile 订阅端**不会**�
   同一个 Volatile 订阅者 6 s 内收到 7 条（≈ 1.27 MB / 6 s 的无谓流量）
 ```
 
-## 3D 地图接口（M3：**已接线，未实现内容**）
+## 3D 地图（PCD）
 
 ### 设计决定
 
 3D 地图（`global.pcd`）与 2D 地图**同一个目录**，跟着**同一个 `load_map` 服务**一起加载
 （切站点时不可能只切一半），因此**不需要额外的服务类型**。
 
-### 已经就绪的部分
+### 实现（2026-09-30 完成）
 
-- `publish_3d: true` 时创建 `global_map/cloud`（latched）→ 话题在图上可见、可被订阅
-- 路径解析：`pcd_file` 优先，否则 `<地图目录>/global.pcd`
-- PCD **头部校验 + 自省**（VERSION/DATA 行、x/y/z 字段、点数），报错分三种：
-  文件不存在 / 不是合法 PCD / 缺 xyz 字段
-- 载入失败默认只 WARN（不连累 2D），`require_3d: true` 时才让整次 `load_map` 失败
-- 发布路径（latched + 周期重发）与服务接入已写好
+- 路径解析：`pcd_file` 优先，否则 `<地图目录>/global.pcd`；
+- **解码用 PCL 的 io 库**（`pcl::io::loadPCDFile<pcl::PointXYZ>`）—— 自带
+  `ascii` / `binary` / `binary_compressed`（LZF）三种格式，不用自己写解压：
 
-### 唯一待填的地方（M3 内容）
+  ```
+  VERSION 0.7
+  FIELDS x y z intensity time      # 多了 intensity(4B float) 与 time(8B double)
+  SIZE   4 4 4 4 8
+  POINTS 171590
+  DATA  binary_compressed          # ← LZF 压缩
+  ```
 
-`src/map_io.cpp::loadPcd()` 里标了 `---- M3 待实现 ----`：把点**解码**进 `out.xyz`，
-然后在 `map_server_node.cpp::loadCloud3D()` 里把 `xyz` 填进 `PointCloud2` 并置
-`has_cloud_3d_ = true`（发布器/latched/重发/服务接入都已就绪，填完即生效）。
+  ⚠ **PCL 的 `#include` 必须在 `map_io.cpp` 的**文件顶部**（`namespace map_server`
+  **之外**）。放进命名空间里会把 boost/std 等系统头一起包进去，编译会炸成一堆
+  `'::mpl_' has not been declared` / `did you mean 'map_server::std'?`（已踩过一次）。
+- `intensity` / `time` **丢掉**，只留 xyz（发布格式固定 xyz float32，`point_step=12`）；
+- `map_server_node.cpp::loadCloud3D()` 里构造 `PointCloud2` 并置 `has_cloud_3d_ = true`；
+  `cloud_voxel_leaf > 0` 时先做体素降采样（每体素取**质心**）；
+- 发布路径与服务接入与 2D 共用（latched + 按需补发 + `load_map` 重载）；
+- 载入失败默认只 WARN（不连累 2D），`require_3d: true` 时才让整次 `load_map` 失败。
 
-**实测这些地图的 PCD 格式**（实现时要知道）：
+### 实测（`go2_sim_factory`）
 
 ```
-VERSION 0.7
-FIELDS x y z intensity time      # 多了 intensity(4B float) 与 time(8B double)
-SIZE   4 4 4 4 8
-POINTS 171590
-DATA  binary_compressed          # ← LZF 压缩，需解压（PCL 的 io::loadPCDFile 支持）
+[map_server] 3D 接口：已创建发布器 global_map/cloud（latched）| pcd=<map_dir>/global.pcd
+             | frame=map | voxel_leaf=0.00 | require_3d=1
+[map_server] 3D 地图已加载 /home/gmd/rcs/maps/go2_sim_factory/global.pcd
+             （171590 点 → 171590 点，voxel_leaf 0.000）| frame map | 耗时 12.9 ms
 ```
 
-即：光有 ascii/binary 不够，**这个文件是 `binary_compressed`**。最省事的做法是直接依赖
-`pcl_io`（`pcl::io::loadPCDFile`）而不是自己写 LZF。
-
-### 怎么验证接口（当前）
+### 怎么验证
 
 ```bash
-# 打开接口
-ros2 run map_server map_server_node --ros-args \
-  --params-file src/map_server/config/map_server.yaml -p publish_3d:=true
-# 期望：日志有“3D 接口：已创建发布器 …” + “⚠ M3 载入/发布逻辑尚未实现”
-#       + “3D 地图未加载（不影响 2D）：PCD 解析未实现（M3 待做）：… 171590 点 …”
-ros2 topic info /global_map/cloud      # Publisher count: 1，但无数据
-ros2 topic hz /global_map/cloud        # 无输出（确实不发）
-# 关掉开关（默认）则连话题都不存在
+ros2 launch map_server map_server.launch.py        # 或 ros2 run … -p publish_3d:=true
+ros2 topic info -v /global_map/cloud | grep -i durability   # TRANSIENT_LOCAL
+ros2 topic echo --once --field width /global_map/cloud      # 171590（看门狗会补发）
+ros2 topic echo --once --qos-durability transient_local \
+                --qos-reliability reliable --field width /global_map/cloud
 ```
+
+⚠ 若两种都超时，先看 `ros2 topic info -v`：
+
+- **发布端无数据**（`Publisher count: 1` 但两次都没值）：看日志是不是只有
+  “3D 接口：已创建发布器” 而**没有**“3D 地图已加载…（N 点）”；
+- **QoS 不兼容**：`--qos-reliability` / `--qos-durability` **只能整组给**，
+  单独给一个会让 ros2cli 造出一个与发布端不匹配的 profile（踩过：
+  `--qos-reliability reliable` 单独用会静默收不到）。要么一个都不给（走发现到的
+  QoS），要么两个都给。
 
 ## 使用
 
@@ -419,9 +447,9 @@ unknown_as_free: false  → 占据 12041 / 空闲      0 / 未知 174308   （�
 
 ```
 src/map_server/
-  include/map_server/map_io.hpp    # 加载库接口（yaml + pgm → OccupancyGrid 语义）
-  src/map_io.cpp                   # PGM(P5/P2) 解析 + trinary 阈值 + 行序翻转
-  src/map_server_node.cpp          # 节点：发布 + 换图服务
+  include/map_server/map_io.hpp    # 加载库接口（yaml + pgm → OccupancyGrid 语义；PCD → xyz）
+  src/map_io.cpp                   # PGM(P5/P2) 解析 + trinary 阈值 + 行序翻转 + PCD 解码(PCL)
+  src/map_server_node.cpp          # 节点：发布 + 换图服务 + PointCloud2 构造
   config/map_server.yaml
   launch/map_server.launch.py
   scripts/compare_maps.py          # 与官方 nav2_map_server 逐格比对
@@ -429,7 +457,6 @@ src/map_server/
 
 ## TODO（后续）
 
-- [x] M3 **接口**：参数/话题/服务接入/路径解析/头部校验与报错（本期完成，话题已可见但无数据）
-- [ ] M3 **内容**：`loadPcd()` 解码（注意 `binary_compressed`）+ 填 `PointCloud2`
+- [x] M3：PCD 解码（`binary_compressed`，用 PCL）+ 填 `PointCloud2`（2026-09-30 完成）
 - [ ] 地图服务端保存（把 perception 累积的局部 2D 层存回 `pgm/yaml`）
 - [ ] 与 `lightning/map_state` 联动自动换图

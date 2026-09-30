@@ -217,6 +217,14 @@ class LocSystem {
     /// 因此这里统一发 map 系，下游无需再换算。
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr perception_cloud_pub_ = nullptr;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr perception_pose_pub_ = nullptr;
+    /**
+     * ★ 未降采样点云的 map 系版本（`lightning/perception/cloud_full`，2026-09-30）。
+     * 与 `perception_cloud_pub_` **共用** `enable_perception_pub` 开关。
+     * 为什么要多这一路：`filter_size_scan` 降采样让射线密度不足，下游 raycast 会出现
+     * 大量“该被射线穿过、却没有射线”的体素 ⇒ 动态物体走后留下清不掉的幽灵格
+     * （见 perception/doc/perception_gridmap.md §3.6 与 dense_cloud_plan.md）。
+     */
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr perception_cloud_full_pub_ = nullptr;
     rclcpp::Service<srv::SavePath>::SharedPtr savepath_service_ = nullptr;
 
     /// ===== 运行时换图 =====

@@ -1,5 +1,18 @@
 #include "map_server/map_io.hpp"
 
+/* 2026-09-30：PCD 解码用 PCL 的 io 库（自带 ascii / binary /
+   binary_compressed，不必自己写 LZF 解压）。
+
+   ⚠★ 必须放在**文件顶部**（`namespace map_server` **之外**）：
+     放进命名空间里会把 boost/std 等系统头一起包进去，编译会炸成一堆
+     `'::mpl_' has not been declared` / `did you mean 'map_server::std'?`
+     （已踩过一次，绝不要再往里放）。
+
+   ★ 只有本 .cpp 用 PCL ⇒ 头文件保持无 PCL 依赖（`PointCloud3D::xyz` 仍是
+     `std::vector<float>`），调用方（map_server_node）不受影响。 */
+#include <pcl/io/pcd_io.h>
+#include <pcl/point_types.h>
+
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
@@ -309,18 +322,36 @@ bool loadPcd(const std::string &pcd_path, PointCloud3D &out, std::string &err) {
     err = "PCD 缺少 x/y/z 字段（FIELDS =" + fields + "）: " + pcd_path;
     return false;
   }
-  out.n_points = points; // 供日志/调用方参考（下面的"内容"还没实现）
-
-  /* ---- M3 待实现：把点解码进 out.xyz ----
-     需要处理 DATA=ascii / binary / binary_compressed（后者是
-     LZF，本文件就是它）。 建议：先支持 ascii+binary，binary_compressed 用 LZF
-     解压（可参考 PCL 的 io::loadPCDFile 或直接依赖 pcl_io）。解完把 xyz 填进
-     sensor_msgs/PointCloud2 （发布器/latched/周期重发/服务接入都已就绪，见
-     map_server_node.cpp）。 */
-  err = "PCD 解析未实现（M3 待做）：" + pcd_path + " | " +
-        std::to_string(points) + " 点 | FIELDS =" + fields +
-        " | DATA =" + data_fmt;
-  return false;
+  /* ---- 解码点云（2026-09-30 实现）----
+     用 `pcl::io::loadPCDFile<pcl::PointXYZ>` 一次读入：它内部处理 ascii /
+     binary / binary_compressed（LZF）三种格式，不必自己解压。
+     这里只负责“文件 → out.xyz”；帧号、降采样（cloud_voxel_leaf）、发布都在
+     map_server_node 里做。
+     ⚠ 用 PointXYZ 而不是 PointXYZI：只要地图带 x/y/z 就能读，
+       不因缺少 intensity 而失败（有些站点导出的 PCD 没有该字段）。 */
+  pcl::PointCloud<pcl::PointXYZ> cloud;
+  if (pcl::io::loadPCDFile<pcl::PointXYZ>(pcd_path, cloud) != 0) {
+    err = "PCL 读取 PCD 失败: " + pcd_path;
+    return false;
+  }
+  /* 头部自省：DATA 格式 + 点数与头部声明**对不上**时报出来。
+     为什么要它：载入失败/截断时 PCL 可能返回一部分点而不报错，
+     "地图少了半边"这种问题不该靠肉眼在 RViz 里发现。 */
+  if (points > 0 && cloud.size() != points) {
+    err = "PCD 点数与头部不符（头部 " + std::to_string(points) + "，实读 " +
+          std::to_string(cloud.size()) + "，DATA " + data_fmt +
+          "）: " + pcd_path;
+    return false;
+  }
+  out.xyz.resize(cloud.size() * 3);
+  for (size_t i = 0; i < cloud.size(); ++i) {
+    out.xyz[3 * i + 0] = cloud[i].x;
+    out.xyz[3 * i + 1] = cloud[i].y;
+    out.xyz[3 * i + 2] = cloud[i].z;
+  }
+  out.n_points = cloud.size();
+  (void)data_fmt; // 只用于上面的报错信息（正常路径下用不到）
+  return true;
 }
 
 std::size_t dilateOccupied(std::vector<int8_t> &data, int width, int height,

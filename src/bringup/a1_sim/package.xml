@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>a1_sim</name>
+  <version>0.1.0</version>
+  <description>
+    Unitree A1 在 Gazebo Classic 11 中的仿真启动包。
+    世界（多层建筑 Building）与机器人来自 legbot_3D_Nav（ROS 1 Noetic），
+    这里提供 ROS 2 Humble 下的启动入口。机器人模型见 a1_description 包。
+  </description>
+
+  <maintainer email="todo@todo.todo">r41_ws</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>ros2launch</exec_depend>
+  <exec_depend>gazebo_ros</exec_depend>
+  <exec_depend>gazebo_ros2_control</exec_depend>
+  <exec_depend>controller_manager</exec_depend>
+  <exec_depend>ros2_controllers</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>a1_description</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+    <!-- Gazebo 通过 GAZEBO_MODEL_PATH 找 world 里引用的 model://Building。
+         gazebo_ros 的 gzserver.launch.py 会自动收集这些导出并注入环境变量。 -->
+    <gazebo_ros gazebo_model_path="${prefix}/models"/>
+    <gazebo_ros gazebo_media_path="${prefix}/models"/>
+  </export>
+</package>

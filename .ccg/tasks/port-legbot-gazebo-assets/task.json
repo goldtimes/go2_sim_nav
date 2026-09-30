@@ -1,0 +1,12 @@
+{
+  "id": "port-legbot-gazebo-assets",
+  "title": "把 legbot_3D_Nav 的 Gazebo 世界模型与 Unitree A1 机器人移植到 src/bringup",
+  "status": "in_progress",
+  "complexity": "L",
+  "risk": "medium",
+  "domain": "simulation",
+  "currentPhase": "review",
+  "nextAction": "等待用户启动仿真做验收。已知未完成项：A1 无平衡控制器，落地后翻倒（需移植上游 junior_ctrl RL 策略或另写步态控制器）",
+  "createdAt": "2026-09-30T00:00:00Z",
+  "branch": "main"
+}

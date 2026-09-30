@@ -107,11 +107,17 @@ f = fullscreen, p = pan, backspace = back) are disabled so they cannot clash.
 
 On save three checks run with the vehicle rectangle (0.70 x 0.40 + 0.05 margin
 by default) and problems are printed plus highlighted in the window:
-  1. passability of every lane (including inflated forbidden zones, the same rule
-     map_server uses when burning zones into the global map);
+  1. passability of every lane (including inflated forbidden zones, using
+     --zone-inflate; keep it equal to the planner's own zone inflation);
   2. connectivity -- a split network is the most hidden mistake, each component
      is listed;
   3. duplicate lanes (same from/to pair).
+
+NOTE (2026-09-30): map_server no longer checks lane passability itself -- the
+real check lives in pnc_2d's route_network_planner. These editor-side checks are
+an authoring aid only, so keep --lane-*/--margin in line with
+pnc_2d/config/pnc_2d.yaml (footprint.*) to avoid "the editor says OK but the
+planner refuses".
 """
 
 
@@ -964,16 +970,18 @@ def main() -> int:
                     help="station map directory (map.yaml + map.pgm)")
     ap.add_argument("--routes", default="",
                     help="output file (default <map-dir>/routes.yaml)")
-    ap.add_argument("--lane-length", type=float, default=0.70, help="vehicle length [m]")
-    ap.add_argument("--lane-width", type=float, default=0.40, help="vehicle width [m]")
+    ap.add_argument("--lane-length", type=float, default=0.70,
+                    help="vehicle length [m]; keep in line with the planner")
+    ap.add_argument("--lane-width", type=float, default=0.40,
+                    help="vehicle width [m]; keep in line with the planner")
     ap.add_argument("--margin", type=float, default=0.05, help="safety margin [m]")
     ap.add_argument("--snap", type=float, default=0.30,
                     help="reuse an existing point within this radius [m]")
     ap.add_argument("--zone-inflate", type=float, default=0.05,
                     help="forbidden-zone inflation [m]; <0 = auto (vehicle "
                          "circumscribed radius). Keep it equal to map_server's "
-                         "zones.inflate, otherwise the editor and map_server "
-                         "disagree")
+                         "zones.inflate and pnc_2d's zone inflation, otherwise "
+                         "the editor and the planner disagree")
     args = ap.parse_args()
 
     routes = args.routes or os.path.join(args.map_dir, "routes.yaml")
@@ -984,7 +992,8 @@ def main() -> int:
           f"y[{editor.grid.y0:.2f},{editor.grid.y1:.2f}]")
     print(f"[out] {routes}")
     print(f"[zones] forbidden zones are inflated by {editor.zone_inflate:.3f} m "
-          f"in the passability check (map_server zones.inflate must match)")
+          f"in the passability check (authoring aid only; map_server does no "
+          f"passability check, the planner does)")
     editor.run()
     return 0
 

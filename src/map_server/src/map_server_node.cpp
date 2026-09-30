@@ -4,7 +4,8 @@
 //   M1 加载 nav2 标准 2D 栅格（map.yaml + map.pgm），以 latched QoS 发布
 //   M2 运行时通过 LoadMap 服务切换站点（传目录或 yaml 路径）
 //
-// 3D 点云（同目录的 global.pcd）只留接口，本期不实现。
+// 3D 点云（同目录的 global.pcd）会一并加载并以 latched 发一次（2026-09-30
+// 完成： PCL 解码 binary_compressed + 可选体素降采样）。
 //
 // 与 perception 的分工：perception 发**动态局部**图（grid_map/occupancy_2d），
 // 本节点发**静态全局**图（global_map/occupancy）；两者各自独立发布，
@@ -13,11 +14,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <nav2_msgs/srv/load_map.hpp>
@@ -26,6 +30,7 @@
 #include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 
 #include <map>
@@ -74,9 +79,11 @@ public:
        为什么要它：全局图是共享资产，消费它的模块不都会做朝向感知的车体扫掠
        检查 —— RViz、以后接别的导航栈、以及任何"只看中心格"的快速判定，都会
        把车使到离墙 0 的地方。给图加几 cm 余量后，"点在图上"就自动带上余量。
-       ⚠ 它会与 `footprint.safe_margin`（规划器自己的安全边）**叠加**：两个都开
-       时实际余量 = 两者之和（日志会把总值打出来，避免历史上踩过的"同一件事
-       算了两次"那种盲区）。不想要双份就把其中一个置 0。
+       ⚠ 它会与规划器自己的安全边（`pnc_2d/config/pnc_2d.yaml` 里的
+       `footprint.safe_margin`）**叠加**：两个都开时实际余量 =
+       两者之和（日志会把
+       总值打出来，避免历史上踩过的"同一件事算了两次"那种盲区）。
+       不想要双份就把其中一个置 0。
        ⚠ 只在**载图/重载时**生效（与禁行区烧入同一时机）。 */
     inflate_ = declare_parameter<double>("inflate", 0.0);
 
@@ -84,8 +91,8 @@ public:
        约定：与 map.yaml 同目录的 routes.yaml（换图四件套同源）。
        ⚠ 路网可有可无：站点没这个文件时只打一句
        INFO，**绝不报错**（很多站点还没画）。
-       本节点不做规划，但会用地图+车体轮廓校验"这条通道车能不能过"，并在 RViz
-       标红。 */
+       本节点不做规划，也不做通行性校验：路网只被当成地图资产加载、可视化、
+       并在换站点时整体替换（校验见 `loadRoutes()` 里的说明）。 */
     routes_file_ = declare_parameter<std::string>("routes_file", "");
     publish_routes_ = declare_parameter<bool>("publish_routes", true);
     topic_routes_ =
@@ -125,20 +132,18 @@ public:
           }
           return r;
         });
-    // 车体轮廓与代价语义（与 pnc_2d 同名，便于对齐；仅用于路网可行性校验）
-    fp_.enable = declare_parameter<bool>("footprint.enable", true);
-    fp_.length = declare_parameter<double>("footprint.length", 0.70);
-    fp_.width = declare_parameter<double>("footprint.width", 0.40);
-    fp_.offset_x = declare_parameter<double>("footprint.offset_x", 0.0);
-    fp_.offset_y = declare_parameter<double>("footprint.offset_y", 0.0);
-    fp_.safe_margin = declare_parameter<double>("footprint.safe_margin", 0.05);
-    fp_.check_edges = declare_parameter<bool>("footprint.check_edges", true);
-    fp_.fast_path = declare_parameter<bool>("footprint.fast_path", true);
+    /* 2026-09-30：本节点**不再持有车体轮廓**。
+       原来这里声明了 `footprint.*`（enable/length/width/offset_x/offset_y/
+       safe_margin/check_edges/fast_path）—— 它们唯一的作用是“路网可行性校验”，
+       而该职责已按用户要求移除（校验由 `route_network_planner` 负责，它自己会
+       算 `e.feasible` 并有 `reject_infeasible` 开关）。
+       ⇒ 一并删掉参数与成员，不再与 pnc_2d / perception 的 footprint 抄来抄去
+       （历史上三处数值不一致就是从这里开始的）。 */
     hard_threshold_ = declare_parameter<int>("common.hard_threshold", 80);
     unknown_as_occupied_ =
         declare_parameter<bool>("common.unknown_as_occupied", true);
 
-    /* ---------- 3D 地图（M3 接口，本期不实现内容）----------
+    /* ---------- 3D 地图（M3 接口，内容已于 2026-09-30 完成）----------
        设计：3D 地图与 2D 在**同一个地图目录**下（global.pcd），跟着同一个
        load_map
        服务一起加载（避免“换图三件套不同源”）；所以不需要单独的服务类型。 */
@@ -194,10 +199,8 @@ public:
                                     : pcd_file_.c_str(),
                   cloud_frame_id_.c_str(), cloud_voxel_leaf_,
                   static_cast<int>(require_3d_));
-      RCLCPP_WARN(
-          get_logger(),
-          "[map_server] ⚠ M3 载入/发布逻辑尚未实现（PCD 解析待做）→ 当前不会"
-          "发出任何点云；话题存在只是为了先把接口/接线固定下来");
+      /* 2026-09-30：M3 内容已完成（loadPcd 用 PCL 解码 + 这里构造
+         PointCloud2）， 原来那句 "尚未实现" 的 WARN 删掉，别再吓人。 */
     }
     load_srv_ = create_service<nav2_msgs::srv::LoadMap>(
         srv_name_, std::bind(&MapServerNode::handleLoadMap, this,
@@ -237,14 +240,36 @@ public:
        只有订阅者数量变多时才去查图（get_subscriptions_info_by_topic）。 */
     if (republish_on_new_subscriber_) {
       constexpr double kWatchPeriodS = 0.5;
+      /* ★ 2026-09-30 修 bug：以前这里**只登记了 2D 占据话题**，于是“只在
+         `global_map/cloud` 上出现的 Volatile 订阅者”（RViz 的 PointCloud2
+         显示项默认就是 Volatile）永远等不到补发 —— 表现为“2D 图能看到、点云
+         空白”，而且 `ros2 topic echo`（默认 Volatile）也收不到点云。
+         ⇒ 改成登记**本节点发布的全部 latched 话题**，每个话题独立计数。
+         ⚠ 快速路径不变：对每个已登记的发布器只做一次整数比较（`last`），
+           计数变大时才去查图（`get_subscriptions_info_by_topic`），稳态零开销。
+       */
+      auto add_watch = [this](const rclcpp::PublisherBase::SharedPtr &pub,
+                              const std::string &topic,
+                              std::function<void()> resend) {
+        latch_watchers_.push_back(LatchWatch{pub, topic, 0, std::move(resend)});
+      };
+      add_watch(occ_pub_, topic_occ_, [this] { republish(); });
+      if (cloud_pub_)
+        add_watch(cloud_pub_, topic_cloud_3d_, [this] { publishCloud3D(); });
+      if (routes_pub_)
+        add_watch(routes_pub_, topic_routes_,
+                  [this] { publishRoutes(has_routes_ ? &routes_ : nullptr); });
+      if (zones_pub_)
+        add_watch(zones_pub_, topic_zones_, [this] { publishZones(); });
+
       watch_timer_ =
           create_wall_timer(std::chrono::duration<double>(kWatchPeriodS),
                             std::bind(&MapServerNode::watchSubscribers, this));
       RCLCPP_INFO(
           get_logger(),
-          "[map_server] 按需补发已开：新订阅者出现时补发一次（轮询 %.1f s，"
-          "稳态零流量）",
-          kWatchPeriodS);
+          "[map_server] 按需补发已开：%zu 个 latched 话题的新订阅者各补发一次"
+          "（轮询 %.1f s，稳态零流量）",
+          latch_watchers_.size(), kWatchPeriodS);
     }
     if (republish_interval_ > 0.0) {
       repub_timer_ =
@@ -301,17 +326,13 @@ private:
       dilated_cells_ = dilateOccupied(map_msg_.data, m.width, m.height,
                                       m.resolution, inflate_, hard_threshold_);
       map_msg_.header.stamp = now();
-      RCLCPP_INFO(
-          get_logger(),
-          "[map_server] 地图膨胀 %.3f m（%d 格，圆形）→ 新增占据 %zu 格"
-          "（%zu → %zu）%s",
-          inflate_,
-          std::max(1,
-                   static_cast<int>(std::ceil(inflate_ / m.resolution - 1e-9))),
-          dilated_cells_, occ_before, occ_before + dilated_cells_,
-          fp_.safe_margin > 0.0
-              ? "｜⚠ 与 footprint.safe_margin 叠加：规划器实际余量 ≈ 两者之和"
-              : "");
+      RCLCPP_INFO(get_logger(),
+                  "[map_server] 地图膨胀 %.3f m（%d 格，圆形）→ 新增占据 %zu 格"
+                  "（%zu → %zu）",
+                  inflate_,
+                  std::max(1, static_cast<int>(
+                                  std::ceil(inflate_ / m.resolution - 1e-9))),
+                  dilated_cells_, occ_before, occ_before + dilated_cells_);
     }
 
     // 区域层（禁行 / 限速）：必须**发布之前**烧进图，否则下游拿到的是旧图
@@ -440,12 +461,12 @@ private:
       RCLCPP_INFO(get_logger(), "[map_server] 区域层：%s",
                   zones_.summary().c_str());
 
-      // 膨胀量：默认车体**外接圆半径**（保证任何朝向都不侵入禁行区）
+      /* 膨胀量：只认显式配置 `zones.inflate`（默认 0.05）。
+         ⚠ 2026-09-30 移除了“负值 = 用车体外接圆兜底”的老分支：车体余量已统一
+         由规划器那一层负责（本节点不再做通行性判定），这个兜底永远不会触发，
+         留着只会让人误以为这里还有几何耦合。
+         确实想按外接圆膨胀：算好数值直接配到 `zones.inflate`。 */
       double inflate = zone_inflate_;
-      if (inflate < 0.0 && fp_.enable) {
-        inflate = std::hypot(fp_.length * 0.5 + fp_.safe_margin,
-                             fp_.width * 0.5 + fp_.safe_margin);
-      }
       inflate = std::max(0.0, inflate);
       zone_inflate_used_ = inflate;
       if (zones_.forbiddenCount() == 0)
@@ -477,7 +498,8 @@ private:
   /// 发布区域层几何（latched）。与"烧进全局图"互补：全局图只解决订阅它的人
   /// （全局规划器/RViz），而局部用的是感知滑动窗 + ESDF（里面没有区域）⇒
   /// 必须单独传几何，由局部自己融合；限速区本来就只能靠这里传。
-  void publishZones() {
+  /// `log=false` 用于周期重发路径（否则每秒刷一行 INFO）。
+  void publishZones(bool log = true) {
     if (!zones_pub_)
       return;
     pnc_2d::msg::ZoneArray msg;
@@ -500,6 +522,8 @@ private:
       msg.zones.push_back(out);
     }
     zones_pub_->publish(msg);
+    if (!log)
+      return;
     RCLCPP_INFO(get_logger(),
                 "[map_server] 区域层发布：%zu 个（禁行 %zu / 限速 %zu），"
                 "inflate %.3f m",
@@ -599,7 +623,6 @@ private:
   void loadRoutes(const std::string &dir_or_yaml, const OccupancyMap &m) {
     (void)m;
     has_routes_ = false;
-    infeasible_edges_.clear();
     if (!publish_routes_)
       return;
     const std::string path = resolveRoutesFile(dir_or_yaml);
@@ -622,62 +645,17 @@ private:
     for (const std::string &w : routes_.warnings()) {
       RCLCPP_WARN(get_logger(), "[map_server] 路网：%s", w.c_str());
     }
-    checkRoutesFeasibility();
     RCLCPP_INFO(get_logger(), "[map_server] 路网已加载 %s → %s", path.c_str(),
                 routes_.summary().c_str());
-    if (!infeasible_edges_.empty()) {
-      std::string names;
-      for (const int i : infeasible_edges_) {
-        const pnc_2d::RouteEdge &e = routes_.edges()[static_cast<size_t>(i)];
-        names += (names.empty() ? "" : ", ") +
-                 routes_.nodes()[static_cast<size_t>(e.from)].name + "→" +
-                 routes_.nodes()[static_cast<size_t>(e.to)].name;
-      }
-      RCLCPP_WARN(get_logger(),
-                  "[map_server] ⚠ %zu 条通道车体过不去（RViz 里已标红）：%s",
-                  infeasible_edges_.size(), names.c_str());
-      RCLCPP_WARN(
-          get_logger(),
-          "             车体 %.2fx%.2f + margin %.2f；请挪通道或确认地图",
-          fp_.length, fp_.width, fp_.safe_margin);
-    } else {
-      RCLCPP_INFO(
-          get_logger(),
-          "[map_server] 路网全部通道车体可通过（%.2fx%.2f + margin %.2f）",
-          fp_.length, fp_.width, fp_.safe_margin);
-    }
+    /* 2026-09-30：本节点**不做**路网可通行校验（校验由 `route_network_planner`
+       负责，它自己算 `e.feasible`（`route_network_planner.cpp`）并有
+       `route_network.reject_infeasible` 开关 + 可行/不可行计数）。
+       为什么删得掉：`RouteEdge::feasible` 默认就是 true
+       （`pnc_2d/core/route_graph.hpp`），没人写它也不会被当成不可行；
+       本节点只是把 `e.feasible` 拿来给 RViz 上色（`publishRoutes`）。
+       ⇒ 原来这里的 `checkRoutesFeasibility()`、它的 `infeasible_edges_`
+       成员、以及“⚠ N 条通道车体过不去”告警全部删掉。 */
     publishRoutes(&routes_);
-  }
-
-  /// 用**发布后的地图** + 车体轮廓逐段校验通道（与 pnc_2d 规划器同一套判据）
-  void checkRoutesFeasibility() {
-    infeasible_edges_.clear();
-    pnc_2d::CostMap2D cm;
-    if (!cm.set(static_cast<int>(map_msg_.info.width),
-                static_cast<int>(map_msg_.info.height),
-                map_msg_.info.resolution, map_msg_.info.origin.position.x,
-                map_msg_.info.origin.position.y, 0.0, map_msg_.data,
-                frame_id_)) {
-      RCLCPP_WARN(get_logger(),
-                  "[map_server] 无法用当前地图校验路网（CostMap2D 构造失败）");
-      return;
-    }
-    pnc_2d::FootprintCollisionChecker chk;
-    chk.configure(fp_, hard_threshold_, unknown_as_occupied_);
-    chk.setMap(&cm);
-    std::vector<pnc_2d::RouteEdge> &edges = routes_.mutableEdges();
-    for (size_t i = 0; i < edges.size(); ++i) {
-      bool ok = true;
-      const auto &pl = edges[i].polyline;
-      for (size_t k = 0; k + 1 < pl.size() && ok; ++k) {
-        // 朝向取该段方向；车体过不去 → 这条通道标记不可行
-        if (chk.edgeInCollision(pl[k].x, pl[k].y, pl[k + 1].x, pl[k + 1].y))
-          ok = false;
-      }
-      edges[i].feasible = ok;
-      if (!ok)
-        infeasible_edges_.push_back(static_cast<int>(i));
-    }
   }
 
   /// 路网可视化：节点（按语义着色 + 名字）、通道（不可行标红）、单向箭头。
@@ -813,7 +791,10 @@ private:
       routes_pub_->publish(arr);
   }
 
-  /// 周期性重发（仅 republish_interval>0 时启用；正常不建议开）
+  /// 周期性重发（仅 republish_interval>0 时启用；正常不建议开）。
+  /// 与 `watchSubscribers()` 共用：两个路径都要求是**完整重发**（2026-09-30
+  /// 之前这里漏了
+  /// routes/zones，于是把它们当兜底手段打开时那两个话题仍然收不到）。
   void republish() {
     if (!has_map_)
       return;
@@ -823,32 +804,43 @@ private:
       meta_pub_->publish(map_msg_.info);
     if (publish_3d_ && has_cloud_3d_)
       publishCloud3D();
+    if (routes_pub_)
+      publishRoutes(has_routes_ ? &routes_ : nullptr);
+    if (zones_pub_)
+      publishZones(/*log=*/false); // 周期路径不刷日志
   }
 
-  /// 按需补发看门狗：订阅者数量变多 → 若有 Volatile 订阅者（收不到历史样本）
-  /// 就补发一次。稳态下每次只做一次整数比较，不做图查询、不发布。
+  /// 按需补发看门狗：任一 latched 话题的订阅者数量变多 → 若其中有 Volatile
+  /// 订阅者（收不到历史样本）就对**那个话题**补发一次。
+  /// 见构造函数里的说明：2026-09-30 之前只盯 2D 占据话题，点云/routes/zones
+  /// 的 Volatile 订阅者拿不到数据。
   void watchSubscribers() {
-    const auto n = occ_pub_->get_subscription_count();
-    if (n <= last_sub_count_) {
-      last_sub_count_ = n;
-      return;
-    }
-    last_sub_count_ = n;
-    if (!has_map_)
-      return;
-    bool has_volatile = false;
-    for (const auto &info : get_subscriptions_info_by_topic(topic_occ_)) {
-      if (info.qos_profile().durability() ==
-          rclcpp::DurabilityPolicy::Volatile) {
-        has_volatile = true;
-        break;
+    for (auto &w : latch_watchers_) {
+      if (!w.pub)
+        continue;
+      const auto n = w.pub->get_subscription_count();
+      if (n <= w.last) {
+        w.last = n;
+        continue;
       }
+      w.last = n;
+      bool has_volatile = false;
+      for (const auto &info : get_subscriptions_info_by_topic(w.topic)) {
+        if (info.qos_profile().durability() ==
+            rclcpp::DurabilityPolicy::Volatile) {
+          has_volatile = true;
+          break;
+        }
+      }
+      if (!has_volatile)
+        continue; // 订阅者都是 transient_local：已自动收到历史样本，不用补发
+      RCLCPP_DEBUG(
+          get_logger(),
+          "[map_server] %s 有新订阅者（共 %zu，含 Volatile）→ 补发一次",
+          w.topic.c_str(), n);
+      if (w.resend)
+        w.resend();
     }
-    if (!has_volatile)
-      return; // 订阅者都是 transient_local：已自动收到历史样本，不用补发
-    RCLCPP_DEBUG(get_logger(),
-                 "[map_server] 新订阅者（共 %zu）中有 Volatile → 补发一次", n);
-    republish();
   }
 
   /* ---------------- 3D 地图（M3 接口） ---------------- */
@@ -873,16 +865,91 @@ private:
     if (!loadPcd(path, out, err))
       return false;
 
-    /* TODO(M3)：把 out.xyz 填进 cloud_msg_（sensor_msgs/PointCloud2，xyz
-       float32）， 按 cloud_voxel_leaf_ 可选降采样，并设 has_cloud_3d_ = true。
-       发布器/lathed/重发/服务接入都已经就绪，这里填完就生效。 */
+    /* 2026-09-30：把 out.xyz 填进 PointCloud2（xyz float32 / point_step 12）。
+       降采样放在这里而不是 map_io：map_io 只负责"把文件解码成 float 数组"，
+       "发多少点"是发布策略。cloud_voxel_leaf_ <= 0 时一个点不丢。 */
+    const size_t n_in = out.n_points;
+    size_t n_out = n_in;
+    if (cloud_voxel_leaf_ > 0.0 && n_in > 0) {
+      /* 体素降采样：每个 0.05m 体素只留**质心**。
+         键打包：三轴各取 21 bit（±2^20 个体素；leaf=0.05 时覆盖 ±52 km，
+         对室内地图余量巨大）⇒ 单个 uint64_t，无碰撞之忧。 */
+      const double inv = 1.0 / cloud_voxel_leaf_;
+      const int64_t lim = 1LL << 20;
+      auto axis = [&](float v) -> uint64_t {
+        int64_t i =
+            static_cast<int64_t>(std::floor(static_cast<double>(v) * inv));
+        i = std::max(-lim, std::min(lim - 1, i)) + lim;
+        return static_cast<uint64_t>(i);
+      };
+      struct Acc {
+        double x{0}, y{0}, z{0};
+        int c{0};
+      };
+      std::unordered_map<uint64_t, Acc> voxels;
+      voxels.reserve(n_in);
+      for (size_t i = 0; i < n_in; ++i) {
+        const float x = out.xyz[3 * i], y = out.xyz[3 * i + 1],
+                    z = out.xyz[3 * i + 2];
+        const uint64_t k = (axis(x) << 42) | (axis(y) << 21) | axis(z);
+        Acc &a = voxels[k];
+        a.x += x;
+        a.y += y;
+        a.z += z;
+        ++a.c;
+      }
+      n_out = voxels.size();
+      cloud_msg_ = sensor_msgs::msg::PointCloud2{};
+      cloud_msg_.header.frame_id = cloud_frame_id_;
+      cloud_msg_.height = 1;
+      cloud_msg_.is_bigendian = false;
+      cloud_msg_.is_dense = true;
+      sensor_msgs::PointCloud2Modifier mod(cloud_msg_);
+      mod.setPointCloud2FieldsByString(1, "xyz");
+      mod.resize(n_out);
+      sensor_msgs::PointCloud2Iterator<float> ix(cloud_msg_, "x"),
+          iy(cloud_msg_, "y"), iz(cloud_msg_, "z");
+      for (const auto &kv : voxels) {
+        const Acc &a = kv.second;
+        *ix = static_cast<float>(a.x / a.c);
+        *iy = static_cast<float>(a.y / a.c);
+        *iz = static_cast<float>(a.z / a.c);
+        ++ix;
+        ++iy;
+        ++iz;
+      }
+    } else {
+      cloud_msg_ = sensor_msgs::msg::PointCloud2{};
+      cloud_msg_.header.frame_id = cloud_frame_id_;
+      cloud_msg_.height = 1;
+      cloud_msg_.is_bigendian = false;
+      cloud_msg_.is_dense = true;
+      sensor_msgs::PointCloud2Modifier mod(cloud_msg_);
+      mod.setPointCloud2FieldsByString(1, "xyz");
+      mod.resize(n_in);
+      sensor_msgs::PointCloud2Iterator<float> ix(cloud_msg_, "x"),
+          iy(cloud_msg_, "y"), iz(cloud_msg_, "z");
+      for (size_t i = 0; i < n_in; ++i) {
+        *ix = out.xyz[3 * i];
+        *iy = out.xyz[3 * i + 1];
+        *iz = out.xyz[3 * i + 2];
+        ++ix;
+        ++iy;
+        ++iz;
+      }
+    }
+    cloud_msg_.header.stamp = now();
+    has_cloud_3d_ = true;
+
     const double ms = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - t0)
                           .count();
     RCLCPP_INFO(
         get_logger(),
-        "[map_server] 3D 地图已加载 %s（%zu 点）| frame %s | 耗时 %.1f ms",
-        path.c_str(), out.n_points, cloud_frame_id_.c_str(), ms);
+        "[map_server] 3D 地图已加载 %s（%zu 点 → %zu 点，voxel_leaf %.3f）|"
+        " frame %s | 耗时 %.1f ms",
+        path.c_str(), n_in, n_out, cloud_voxel_leaf_, cloud_frame_id_.c_str(),
+        ms);
     return true;
   }
 
@@ -954,7 +1021,6 @@ private:
   std::string topic_routes_;
   pnc_2d::RouteGraph routes_;
   bool has_routes_{false};
-  std::vector<int> infeasible_edges_;
   // 地图本体的膨胀层（障碍向外扩 inflate_ 米；见 loadAndPublish 里的注释）
   double inflate_{0.0};
   std::size_t dilated_cells_{0};
@@ -969,7 +1035,7 @@ private:
   bool publish_zones_{true};
   std::string topic_zones_;
   rclcpp::Publisher<pnc_2d::msg::ZoneArray>::SharedPtr zones_pub_;
-  pnc_2d::FootprintParams fp_;
+  // 2026-09-30：删掉了 `pnc_2d::FootprintParams fp_;`（不再做通行性校验，见上）
   int hard_threshold_{80};
   bool unknown_as_occupied_{true};
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
@@ -984,7 +1050,15 @@ private:
   rclcpp::Service<nav2_msgs::srv::LoadMap>::SharedPtr load_srv_;
   rclcpp::TimerBase::SharedPtr repub_timer_;
   rclcpp::TimerBase::SharedPtr watch_timer_;
-  std::size_t last_sub_count_{0};
+
+  /// latched 话题的「按需补发」登记项（见 watchSubscribers）。
+  struct LatchWatch {
+    rclcpp::PublisherBase::SharedPtr pub; ///< 只读订阅者数，开销 = 一次整数比较
+    std::string topic;                    ///< 计数变大时才用它去查图
+    std::size_t last{0};
+    std::function<void()> resend;
+  };
+  std::vector<LatchWatch> latch_watchers_;
 
   // 状态
   nav_msgs::msg::OccupancyGrid map_msg_;
